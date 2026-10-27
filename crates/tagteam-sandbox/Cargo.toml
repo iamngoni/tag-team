@@ -13,3 +13,13 @@ workspace = true
 tagteam-core = { path = "../tagteam-core" }
 serde.workspace = true
 thiserror.workspace = true
+nix.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "sandbox_runtime"
+path = "../../tests/sandbox/runtime.rs"

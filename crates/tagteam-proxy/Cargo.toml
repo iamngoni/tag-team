@@ -10,5 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+httparse.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true

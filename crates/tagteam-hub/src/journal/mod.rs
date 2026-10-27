@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tagteam_core::{
-    Dispatch, DispatchId, Event, EventKind, GitOid, Node, NodeId, NodePolicy, NodeState, Platform,
-    RepoId, ResultSummary, Subtask, SubtaskId, SubtaskState, Timestamp, Toolchain, Usage,
+    CachedRepo, Capacity, Dispatch, DispatchId, Event, EventKind, GitOid, Node, NodeId, NodePolicy,
+    NodeState, OwnerPresence, Platform, RepoId, ResultSummary, Subtask, SubtaskId, SubtaskState,
+    Timestamp, Toolchain, Usage,
     state::{self, IllegalTransition, SubtaskInput},
 };
 use thiserror::Error;
@@ -48,6 +49,10 @@ pub enum JournalError {
     InviteExpired,
     #[error("invite has already been used")]
     InviteAlreadyUsed,
+    #[error("node name already exists")]
+    NodeNameAlreadyExists,
+    #[error("enrollment node must be in the enrolled state")]
+    InvalidEnrollmentState,
     #[error("idempotency key conflicts with an existing record: {0}")]
     IdempotencyConflict(String),
     #[error("unsupported journal schema version {0}")]
@@ -161,6 +166,75 @@ impl Journal {
         Ok(())
     }
 
+    /// Consumes an unused invite and inserts its enrolled node in one
+    /// transaction. Any insert or constraint failure rolls the invite spend
+    /// back with the node creation.
+    pub fn enroll_node(
+        &mut self,
+        code: &str,
+        now: Timestamp,
+        node: &Node,
+    ) -> Result<(), JournalError> {
+        if node.state != NodeState::Enrolled {
+            return Err(JournalError::InvalidEnrollmentState);
+        }
+        if code.is_empty() {
+            return Err(JournalError::InvalidInviteCode);
+        }
+
+        let digest = Sha256::digest(code.as_bytes());
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let invite: Option<(i64, Option<i64>)> = transaction
+            .query_row(
+                "SELECT expires_at,used_at FROM invites WHERE code_sha256=?1",
+                [digest.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((expires_at, used_at)) = invite else {
+            return Err(JournalError::InvalidInviteCode);
+        };
+        if used_at.is_some() {
+            return Err(JournalError::InviteAlreadyUsed);
+        }
+        if expires_at <= now.0 {
+            return Err(JournalError::InviteExpired);
+        }
+
+        let name_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE name=?1)",
+            [&node.name],
+            |row| row.get(0),
+        )?;
+        if name_exists {
+            return Err(JournalError::NodeNameAlreadyExists);
+        }
+
+        transaction.execute(
+            "INSERT INTO nodes (id,name,os,arch,os_version,state,trust,presence,cert_sha256,capacity,toolchains,repos,policy,last_seen_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                node.id.to_string(), node.name, enum_text(&node.platform.os)?,
+                enum_text(&node.platform.arch)?, node.platform.os_version,
+                enum_text(&node.state)?, enum_text(&node.trust)?,
+                serde_json::to_string(&node.presence)?, node.cert_sha256.as_slice(),
+                serde_json::to_string(&node.capacity)?, serde_json::to_string(&node.toolchains)?,
+                serde_json::to_string(&node.repo_heads)?, serde_json::to_string(&node.policy)?, node.last_seen.0,
+            ],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE invites SET used_at=?2,node_id=?3 WHERE code_sha256=?1 AND used_at IS NULL AND expires_at>?2",
+            params![digest.as_slice(), now.0, node.id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(JournalError::InviteAlreadyUsed);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Loads the durable node record, including presence and trust.
     pub fn load_node(&self, id: NodeId) -> Result<Option<Node>, JournalError> {
         type RawNode = (
@@ -227,6 +301,30 @@ impl Journal {
         .transpose()
     }
 
+    /// Finds an active durable node by the SHA-256 fingerprint from its TLS
+    /// client certificate. Blob RPCs carry no node ID, so this lookup keeps
+    /// certificate authorization inside the journal boundary.
+    pub fn load_node_by_certificate_sha256(
+        &self,
+        fingerprint: &[u8; 32],
+    ) -> Result<Option<Node>, JournalError> {
+        let encoded_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM nodes WHERE cert_sha256=?1 AND state<>'removed' AND revoked_at IS NULL LIMIT 1",
+                [fingerprint.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(encoded_id) = encoded_id else {
+            return Ok(None);
+        };
+        let id = NodeId::from_str(&encoded_id)
+            .map_err(|error| JournalError::IdempotencyConflict(error.to_string()))?;
+        let node = self.load_node(id)?;
+        Ok(node.filter(|node| !node.state.is_removed()))
+    }
+
     /// Activates an enrolled node; repeating approval is safe.
     pub fn approve_node(&mut self, id: NodeId) -> Result<(), JournalError> {
         self.set_node_state(id, NodeState::Active, &[NodeState::Enrolled])
@@ -251,6 +349,35 @@ impl Journal {
         let changed = self.connection.execute(
             "UPDATE nodes SET state='removed', revoked_at=COALESCE(revoked_at,?2) WHERE id=?1",
             params![id.to_string(), at.0],
+        )?;
+        if changed == 0 {
+            return Err(JournalError::NotFound(format!("node {id}")));
+        }
+        Ok(())
+    }
+
+    /// Updates heartbeat-owned fields without changing durable trust, policy,
+    /// or approval state. Removed and revoked nodes cannot heartbeat.
+    pub fn update_node_heartbeat(
+        &mut self,
+        id: NodeId,
+        capacity: &Capacity,
+        toolchains: &[Toolchain],
+        repo_heads: &[CachedRepo],
+        presence: OwnerPresence,
+        last_seen: Timestamp,
+    ) -> Result<(), JournalError> {
+        let changed = self.connection.execute(
+            "UPDATE nodes SET capacity=?2,toolchains=?3,repos=?4,presence=?5,last_seen_at=MAX(COALESCE(last_seen_at,?6),?6) \
+             WHERE id=?1 AND state<>'removed' AND revoked_at IS NULL",
+            params![
+                id.to_string(),
+                serde_json::to_string(capacity)?,
+                serde_json::to_string(toolchains)?,
+                serde_json::to_string(repo_heads)?,
+                serde_json::to_string(&presence)?,
+                last_seen.0,
+            ],
         )?;
         if changed == 0 {
             return Err(JournalError::NotFound(format!("node {id}")));

@@ -22,7 +22,7 @@ repository = "https://github.com/iamngoni/tag-team"
 anyhow = "1.0.100"
 base64 = "0.22.1"
 data-encoding = "2.9.0"
-sysinfo = "0.39.6"
+sysinfo = "0.38.4"
 nix = { version = "0.31.3", features = ["fs", "process", "resource", "sched", "signal", "user"] }
 x509-parser = "0.18.1"
 httparse = "1.10.1"
