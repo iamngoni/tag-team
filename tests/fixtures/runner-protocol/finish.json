@@ -1,5 +1,5 @@
 {
-  "v": 1,
+  "v": 2,
   "type": "tool_call",
   "call_id": "call_01",
   "call": {

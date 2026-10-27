@@ -1,3 +1,8 @@
+//! Versioned JSONL contracts between the hub and its runner process.
+//!
+//! Durable answer and steer delivery IDs remain stable across replay so the
+//! runner can acknowledge repeated writes without applying them twice.
+
 use std::{path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
@@ -5,7 +10,7 @@ use thiserror::Error;
 
 use crate::{Assumption, Check, Outcome, SubtaskId, Usage};
 
-pub const RUNNER_PROTOCOL_VERSION: u8 = 1;
+pub const RUNNER_PROTOCOL_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubToRunner {
@@ -46,10 +51,13 @@ pub enum HubToRunnerMessage {
         reason: String,
     },
     Steer {
+        delivery_id: crate::DeliveryId,
         text: String,
     },
     Answer {
+        delivery_id: crate::DeliveryId,
         question_id: crate::QuestionId,
+        question_text: String,
         call_id: String,
         text: String,
         timed_out: bool,
@@ -100,6 +108,9 @@ pub enum RunnerToHubMessage {
         error: Option<String>,
         session_id: Option<String>,
         cost_usd: Option<f64>,
+    },
+    DeliveryAck {
+        delivery_id: crate::DeliveryId,
     },
 }
 

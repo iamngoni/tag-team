@@ -39,7 +39,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::{
     blobs::BlobStore,
     config::{DataPaths, HubConfig},
-    journal::{EventFilter, EventScope, Journal, JournalError},
+    journal::{
+        AnswerDeliveryIntent, EventFilter, EventScope, Journal, JournalError, RunnerDelivery,
+    },
     nodes::{NodePlane, NodePlaneError},
     runner::{RunnerProcess, RunnerStart},
 };
@@ -277,8 +279,16 @@ impl HubService {
                 text,
                 claude_session,
             } => {
-                self.steer(subtask, text, claude_session.as_deref()).await?;
-                Ok(LocalResponseBody::Steered { subtask })
+                let delivery = self.steer(subtask, text, claude_session.as_deref()).await?;
+                let (delivered, acknowledged) = self
+                    .journal(move |journal| journal.runner_delivery_status(delivery.id))
+                    .await?;
+                Ok(LocalResponseBody::Steered {
+                    subtask,
+                    delivery_id: delivery.id,
+                    delivered,
+                    acknowledged,
+                })
             }
             LocalRequest::Brief { claude_session } => self
                 .brief(&claude_session)
@@ -1089,6 +1099,20 @@ impl HubService {
                             if !matches!(state, Some(SubtaskState::Running)) {
                                 return Ok(());
                             }
+                            let pending = self
+                                .journal(move |journal| journal.pending_runner_deliveries(id))
+                                .await?;
+                            for delivery in pending {
+                                process
+                                    .send(delivery.message)
+                                    .await
+                                    .map_err(|error| ServiceError::Runner(error.to_string()))?;
+                                let delivery_id = delivery.id;
+                                self.journal(move |journal| {
+                                    journal.mark_runner_delivery_sent(delivery_id, Timestamp::now())
+                                })
+                                .await?;
+                            }
                             self.journal(move |journal| {
                                 journal
                                     .transition(
@@ -1257,16 +1281,33 @@ impl HubService {
                                 error.map(|error| format!(": {error}")).unwrap_or_default()
                             )));
                         }
+                        RunnerToHubMessage::DeliveryAck { delivery_id } => {
+                            self.journal(move |journal| {
+                                journal.acknowledge_runner_delivery(delivery_id, Timestamp::now())
+                            })
+                            .await?;
+                        }
                     }
                 }
                 inbound = receiver.recv() => {
                     match inbound {
                         Some(message) => {
                             let cancelling = matches!(message, HubToRunnerMessage::Cancel { .. });
+                            let delivery_id = match &message {
+                                HubToRunnerMessage::Answer { delivery_id, .. }
+                                | HubToRunnerMessage::Steer { delivery_id, .. } => Some(*delivery_id),
+                                _ => None,
+                            };
                             process
                                 .send(message)
                                 .await
                                 .map_err(|error| ServiceError::Runner(error.to_string()))?;
+                            if let Some(delivery_id) = delivery_id {
+                                self.journal(move |journal| {
+                                    journal.mark_runner_delivery_sent(delivery_id, Timestamp::now())
+                                })
+                                .await?;
+                            }
                             if cancelling {
                                 return Ok(());
                             }
@@ -1881,40 +1922,40 @@ impl HubService {
         let by = author.answered_by();
         let answer_text = text.clone();
         let answer_by = by.clone();
-        self.journal(move |journal| {
-            journal
-                .transition(
+        let question_text = stored.question.text.clone();
+        let call_id = stored.call_id.clone();
+        let delivery = self
+            .journal(move |journal| {
+                journal.answer_with_delivery(
                     subtask,
-                    SubtaskInput::Answer {
+                    AnswerDeliveryIntent {
                         question: open_id,
-                        by: answer_by,
+                        question_text,
+                        call_id,
                         text: answer_text,
+                        by: answer_by,
+                        timed_out: false,
                     },
                     Timestamp::now(),
                 )
-                .map(|_| ())
-        })
-        .await?;
+            })
+            .await?;
         let runner = self.runners.lock().await.get(&subtask).cloned();
-        let delivered = if let Some(runner) = runner {
-            runner
-                .send(HubToRunnerMessage::Answer {
-                    question_id: open_id,
-                    call_id: stored.call_id,
-                    text: text.clone(),
-                    timed_out: false,
-                })
-                .await
-                .is_ok()
-        } else {
-            false
-        };
+        if let Some(runner) = runner {
+            let _ = runner.send(delivery.message.clone()).await;
+        }
+        let delivery_id = delivery.id;
+        let (delivered, acknowledged) = self
+            .journal(move |journal| journal.runner_delivery_status(delivery_id))
+            .await?;
         Ok(AnswerReply {
+            delivery_id,
             subtask,
             question: open_id,
             text,
             by,
             delivered,
+            acknowledged,
         })
     }
 
@@ -1923,7 +1964,7 @@ impl HubService {
         subtask: SubtaskId,
         text: String,
         claude_session: Option<&str>,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<RunnerDelivery, ServiceError> {
         let text = text.trim().to_owned();
         if text.is_empty() {
             return Err(ServiceError::Invalid(
@@ -1941,23 +1982,13 @@ impl HubService {
                 "cannot steer a terminal subtask".into(),
             ));
         }
-        let runner = self
-            .runners
-            .lock()
-            .await
-            .get(&subtask)
-            .cloned()
-            .ok_or_else(|| ServiceError::Unsupported("runner is not connected".into()))?;
-        runner
-            .send(HubToRunnerMessage::Steer { text: text.clone() })
-            .await
-            .map_err(|error| ServiceError::Runner(error.to_string()))?;
-        self.journal(move |journal| {
-            journal
-                .record_event(subtask, EventKind::Steered { text }, Timestamp::now())
-                .map(|_| ())
-        })
-        .await
+        let delivery = self
+            .journal(move |journal| journal.steer_with_delivery(subtask, text, Timestamp::now()))
+            .await?;
+        if let Some(runner) = self.runners.lock().await.get(&subtask).cloned() {
+            let _ = runner.send(delivery.message.clone()).await;
+        }
+        Ok(delivery)
     }
 
     /// Expires unanswered questions and wakes their runners with the documented
@@ -1985,24 +2016,27 @@ impl HubService {
             let guidance = "No main-session answer arrived before the deadline. Continue using your best judgment, make the smallest safe assumption, and record it in the Finish assumptions with from_timeout=true.";
             let question = stored.question.id;
             let subtask = stored.question.subtask;
+            let question_text = stored.question.text.clone();
+            let call_id = stored.call_id.clone();
             let result = self
                 .journal(move |journal| {
-                    journal.transition(
+                    journal.answer_with_delivery(
                         subtask,
-                        SubtaskInput::Answer {
+                        AnswerDeliveryIntent {
                             question,
+                            question_text,
+                            call_id,
+                            text: guidance.into(),
                             by: AnsweredBy::Timeout {
                                 guess: guidance.into(),
                             },
-                            text: guidance.into(),
+                            timed_out: true,
                         },
                         Timestamp::now(),
                     )
                 })
                 .await;
-            if result.is_err() {
-                continue;
-            }
+            let Ok(delivery) = result else { continue };
             expired += 1;
             let runner = self
                 .runners
@@ -2011,14 +2045,7 @@ impl HubService {
                 .get(&stored.question.subtask)
                 .cloned();
             if let Some(runner) = runner {
-                let _ = runner
-                    .send(HubToRunnerMessage::Answer {
-                        question_id: stored.question.id,
-                        call_id: stored.call_id,
-                        text: guidance.into(),
-                        timed_out: true,
-                    })
-                    .await;
+                let _ = runner.send(delivery.message).await;
             }
         }
         Ok(expired)

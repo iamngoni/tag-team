@@ -1,3 +1,8 @@
+//! Request and response types for the local hub API.
+//!
+//! Delivery status distinguishes durable queueing from a confirmed runner write
+//! and acknowledgement.
+
 use std::{path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +13,7 @@ use crate::{
 };
 
 /// Version carried by the private CLI/MCP attach handshake.
-pub const LOCAL_PROTOCOL_VERSION: u8 = 1;
+pub const LOCAL_PROTOCOL_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "scope", content = "id", rename_all = "snake_case")]
@@ -119,11 +124,16 @@ impl AnswerAuthor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnswerReply {
+    /// Stable journal ID used to replay and acknowledge this runner delivery.
+    pub delivery_id: crate::DeliveryId,
     pub subtask: SubtaskId,
     pub question: QuestionId,
     pub text: String,
     pub by: AnsweredBy,
+    /// True only after the hub successfully writes the message to the runner.
     pub delivered: bool,
+    /// True only after the runner confirms it processed this delivery.
+    pub acknowledged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,20 +226,34 @@ pub enum LocalRequest {
 #[serde(tag = "type", content = "body", rename_all = "snake_case")]
 pub enum LocalResponseBody {
     Pong,
-    Attached { session: MainSessionId },
+    Attached {
+        session: MainSessionId,
+    },
     Bound,
     Nodes(Vec<NodeView>),
     Dispatched(DispatchReply),
     Status(StatusReply),
     Events(Vec<Event>),
     Logs(LogsReply),
-    Cancelled { subtask: SubtaskId },
+    Cancelled {
+        subtask: SubtaskId,
+    },
     Collected(CollectReply),
     Answered(AnswerReply),
-    Steered { subtask: SubtaskId },
+    Steered {
+        subtask: SubtaskId,
+        /// Stable journal ID used to replay and acknowledge this runner delivery.
+        delivery_id: crate::DeliveryId,
+        /// True only after the hub successfully writes the message to the runner.
+        delivered: bool,
+        /// True only after the runner confirms it processed this delivery.
+        acknowledged: bool,
+    },
     Brief(BriefReply),
     Invited(InviteReply),
-    NodeChanged { name: String },
+    NodeChanged {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

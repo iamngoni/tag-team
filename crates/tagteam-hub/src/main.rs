@@ -413,7 +413,15 @@ async fn run_client(command: Command, client: &mut LocalClient) -> Result<()> {
                 LocalResponseBody::Answered(reply) => {
                     println!("answered {}: {}", reply.question, reply.text);
                     if !reply.delivered {
-                        eprintln!("warning: runner was not connected when the answer was saved");
+                        eprintln!(
+                            "delivery {} is queued and has not been written to the runner yet",
+                            reply.delivery_id
+                        );
+                    } else if !reply.acknowledged {
+                        eprintln!(
+                            "delivery {} was sent and is awaiting runner acknowledgement",
+                            reply.delivery_id
+                        );
                     }
                 }
                 other => bail!("unexpected reply: {other:?}"),
@@ -430,7 +438,16 @@ async fn run_client(command: Command, client: &mut LocalClient) -> Result<()> {
             )
             .await?
             {
-                LocalResponseBody::Steered { subtask } => println!("steered {subtask}"),
+                LocalResponseBody::Steered {
+                    subtask,
+                    delivered,
+                    acknowledged,
+                    ..
+                } => {
+                    println!(
+                        "steered {subtask} (delivered: {delivered}, acknowledged: {acknowledged})"
+                    )
+                }
                 other => bail!("unexpected reply: {other:?}"),
             }
         }

@@ -1,3 +1,8 @@
+//! Shared domain types and identifiers for durable Tag Team state.
+//!
+//! This module owns canonical wire and journal values; callers validate external
+//! input before constructing state transitions.
+
 use std::{
     fmt,
     path::PathBuf,
@@ -58,6 +63,7 @@ ulid_id!(NodeId);
 ulid_id!(SubtaskId);
 ulid_id!(DispatchId);
 ulid_id!(QuestionId);
+ulid_id!(DeliveryId);
 ulid_id!(CommandId);
 ulid_id!(MainSessionId);
 

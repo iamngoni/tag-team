@@ -10,15 +10,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tagteam_core::{
-    AnsweredBy, CachedRepo, Capacity, Dispatch, DispatchId, Event, EventKind, GitOid,
+    AnsweredBy, CachedRepo, Capacity, DeliveryId, Dispatch, DispatchId, Event, EventKind, GitOid,
     MainSessionId, Node, NodeId, NodePolicy, NodeState, OwnerPresence, Platform, Question,
     QuestionId, RepoId, ResultSummary, Subtask, SubtaskId, SubtaskState, Timestamp, Toolchain,
     Usage,
+    runner_proto::HubToRunnerMessage,
     state::{self, IllegalTransition, SubtaskInput},
 };
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 type ResultRow = (
     String,
@@ -112,6 +113,49 @@ pub struct StoredQuestion {
     pub closed_at: Option<Timestamp>,
 }
 
+/// A durable runner message that remains replayable until acknowledged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerDelivery {
+    /// Stable ID sent to the runner and returned by its acknowledgement.
+    pub id: tagteam_core::DeliveryId,
+    /// Owner subtask for replay and ordering.
+    pub subtask: SubtaskId,
+    /// Whether this delivery resolves a question or adds steering.
+    pub kind: RunnerDeliveryKind,
+    /// Exact protocol payload resent until acknowledgement.
+    pub message: tagteam_core::runner_proto::HubToRunnerMessage,
+    /// Journal insertion time in milliseconds since the Unix epoch.
+    pub created_at: Timestamp,
+    /// First successful write to the runner process, if any.
+    pub sent_at: Option<Timestamp>,
+    /// First runner acknowledgement, if any.
+    pub acknowledged_at: Option<Timestamp>,
+}
+
+/// Validated answer data committed with its subtask transition and delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerDeliveryIntent {
+    /// The open question resolved by this answer.
+    pub question: QuestionId,
+    /// Original prompt text for a resumed runner with no live tool call.
+    pub question_text: String,
+    /// Original runner-side AskMain call ID.
+    pub call_id: String,
+    /// Answer text stored in state and sent in the protocol payload.
+    pub text: String,
+    /// Main-session or timeout author recorded in the question state.
+    pub by: AnsweredBy,
+    /// Whether the deadline produced this answer automatically.
+    pub timed_out: bool,
+}
+
+/// Durable delivery category, with answer idempotency scoped to its question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerDeliveryKind {
+    Answer,
+    Steer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 /// Optional event scope for one subtask or a watch set.
 pub enum EventScope<'a> {
@@ -155,6 +199,13 @@ impl Journal {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(include_str!("../../migrations/0002_questions.sql"))?;
             transaction.pragma_update(None, "user_version", 2)?;
+            transaction.commit()?;
+        }
+        if version < 3 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction
+                .execute_batch(include_str!("../../migrations/0003_runner_deliveries.sql"))?;
+            transaction.pragma_update(None, "user_version", 3)?;
             transaction.commit()?;
         }
         Ok(Self { connection })
@@ -710,6 +761,164 @@ impl Journal {
         Ok(result)
     }
 
+    /// Commits an answer transition and its runner delivery intent atomically.
+    pub fn answer_with_delivery(
+        &mut self,
+        subtask: SubtaskId,
+        intent: AnswerDeliveryIntent,
+        at: Timestamp,
+    ) -> Result<RunnerDelivery, JournalError> {
+        let transaction = self.connection.transaction()?;
+        let id = DeliveryId::new();
+        let message = HubToRunnerMessage::Answer {
+            delivery_id: id,
+            question_id: intent.question,
+            question_text: intent.question_text,
+            call_id: intent.call_id,
+            text: intent.text.clone(),
+            timed_out: intent.timed_out,
+        };
+        transition_in_transaction(
+            &transaction,
+            subtask,
+            SubtaskInput::Answer {
+                question: intent.question,
+                by: intent.by,
+                text: intent.text,
+            },
+            at,
+        )?;
+        let delivery = insert_delivery(
+            &transaction,
+            id,
+            subtask,
+            RunnerDeliveryKind::Answer,
+            intent.question.to_string(),
+            &message,
+            at,
+        )?;
+        transaction.commit()?;
+        Ok(delivery)
+    }
+
+    /// Commits a steering event and its runner delivery intent atomically.
+    pub fn steer_with_delivery(
+        &mut self,
+        subtask: SubtaskId,
+        text: String,
+        at: Timestamp,
+    ) -> Result<RunnerDelivery, JournalError> {
+        let transaction = self.connection.transaction()?;
+        let id = DeliveryId::new();
+        let message = HubToRunnerMessage::Steer {
+            delivery_id: id,
+            text: text.clone(),
+        };
+        let state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM subtasks WHERE id=?1",
+                [subtask.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let state = state
+            .as_deref()
+            .ok_or_else(|| JournalError::NotFound(format!("subtask {subtask}")))?;
+        let state: SubtaskState = parse_json(state)?;
+        if state.is_terminal() {
+            return Err(JournalError::Invalid(
+                "cannot steer a terminal subtask".into(),
+            ));
+        }
+        insert_event(&transaction, subtask, at, &EventKind::Steered { text })?;
+        let delivery = insert_delivery(
+            &transaction,
+            id,
+            subtask,
+            RunnerDeliveryKind::Steer,
+            id.to_string(),
+            &message,
+            at,
+        )?;
+        transaction.commit()?;
+        Ok(delivery)
+    }
+
+    /// Loads every unacknowledged delivery for replay, including previously sent rows.
+    pub fn pending_runner_deliveries(
+        &self,
+        subtask: SubtaskId,
+    ) -> Result<Vec<RunnerDelivery>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,kind,payload,created_at,sent_at,acknowledged_at FROM runner_deliveries WHERE subtask_id=?1 AND acknowledged_at IS NULL ORDER BY created_at,id",
+        )?;
+        let rows = statement.query_map([subtask.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, kind, payload, created_at, sent_at, acknowledged_at) = row?;
+            Ok(RunnerDelivery {
+                id: DeliveryId::from_str(&id)
+                    .map_err(|error| JournalError::IdempotencyConflict(error.to_string()))?,
+                subtask,
+                kind: parse_delivery_kind(&kind)?,
+                message: serde_json::from_str(&payload)?,
+                created_at: Timestamp(created_at),
+                sent_at: sent_at.map(Timestamp),
+                acknowledged_at: acknowledged_at.map(Timestamp),
+            })
+        })
+        .collect()
+    }
+
+    /// Marks a delivery as sent after the runner process accepts the message.
+    pub fn mark_runner_delivery_sent(
+        &mut self,
+        id: DeliveryId,
+        at: Timestamp,
+    ) -> Result<(), JournalError> {
+        self.connection.execute(
+            "UPDATE runner_deliveries SET sent_at=COALESCE(sent_at,?2) WHERE id=?1 AND acknowledged_at IS NULL",
+            params![id.to_string(), at.0],
+        )?;
+        Ok(())
+    }
+
+    /// Returns whether the hub recorded a successful runner write and acknowledgement.
+    pub fn runner_delivery_status(&self, id: DeliveryId) -> Result<(bool, bool), JournalError> {
+        let status: Option<(Option<i64>, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT sent_at,acknowledged_at FROM runner_deliveries WHERE id=?1",
+                [id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        status
+            .map(|(sent, acknowledged)| (sent.is_some(), acknowledged.is_some()))
+            .ok_or_else(|| JournalError::NotFound(format!("runner delivery {id}")))
+    }
+
+    /// Marks a delivery acknowledged by the runner; duplicate acknowledgements are harmless.
+    pub fn acknowledge_runner_delivery(
+        &mut self,
+        id: DeliveryId,
+        at: Timestamp,
+    ) -> Result<(), JournalError> {
+        self.connection.execute(
+            "UPDATE runner_deliveries SET acknowledged_at=COALESCE(acknowledged_at,?2) WHERE id=?1",
+            params![id.to_string(), at.0],
+        )?;
+        Ok(())
+    }
+
     /// Loads one question by its durable ID.
     pub fn load_question(&self, id: QuestionId) -> Result<Option<StoredQuestion>, JournalError> {
         self.connection
@@ -943,6 +1152,54 @@ fn transition_in_transaction(
             kind: event_kind,
         },
     })
+}
+
+fn insert_delivery(
+    transaction: &Transaction<'_>,
+    id: DeliveryId,
+    subtask: SubtaskId,
+    kind: RunnerDeliveryKind,
+    idempotency_key: String,
+    message: &HubToRunnerMessage,
+    at: Timestamp,
+) -> Result<RunnerDelivery, JournalError> {
+    transaction.execute(
+        "INSERT INTO runner_deliveries(id,subtask_id,kind,idempotency_key,payload,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            id.to_string(),
+            subtask.to_string(),
+            delivery_kind_text(kind),
+            idempotency_key,
+            serde_json::to_string(message)?,
+            at.0,
+        ],
+    )?;
+    Ok(RunnerDelivery {
+        id,
+        subtask,
+        kind,
+        message: message.clone(),
+        created_at: at,
+        sent_at: None,
+        acknowledged_at: None,
+    })
+}
+
+fn delivery_kind_text(kind: RunnerDeliveryKind) -> &'static str {
+    match kind {
+        RunnerDeliveryKind::Answer => "answer",
+        RunnerDeliveryKind::Steer => "steer",
+    }
+}
+
+fn parse_delivery_kind(value: &str) -> Result<RunnerDeliveryKind, JournalError> {
+    match value {
+        "answer" => Ok(RunnerDeliveryKind::Answer),
+        "steer" => Ok(RunnerDeliveryKind::Steer),
+        other => Err(JournalError::Invalid(format!(
+            "unknown runner delivery kind {other}"
+        ))),
+    }
 }
 
 impl Journal {

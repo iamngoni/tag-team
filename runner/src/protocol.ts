@@ -1,6 +1,7 @@
+/** Versioned JSONL contracts; durable deliveries are identified and acknowledged explicitly. */
 import { z } from "zod";
 
-export const RUNNER_PROTOCOL_VERSION = 1 as const;
+export const RUNNER_PROTOCOL_VERSION = 2 as const;
 
 const optionalNullable = <T extends z.ZodType>(schema: T) => schema.nullable().optional();
 
@@ -33,17 +34,18 @@ export const hubToRunnerSchema = z.discriminatedUnion("type", [
   z.object({ v: z.literal(RUNNER_PROTOCOL_VERSION), type: z.literal("start"), subtask: z.string(), prompt: z.string(), system_append: z.string(), cwd: z.string(), max_turns: z.number().int().nonnegative(), wall_clock_ms: z.number().int().nonnegative(), tool_timeout_ms: z.number().int().nonnegative(), resume: optionalNullable(z.string()) }),
   z.object({ v: z.literal(RUNNER_PROTOCOL_VERSION), type: z.literal("tool_result"), call_id: z.string(), text: z.string(), is_error: z.boolean() }),
   z.object({ v: z.literal(RUNNER_PROTOCOL_VERSION), type: z.literal("cancel"), reason: z.string() }),
-  z.object({ v: z.literal(RUNNER_PROTOCOL_VERSION), type: z.literal("steer"), text: z.string() }),
-  z.object({ v: z.literal(RUNNER_PROTOCOL_VERSION), type: z.literal("answer"), question_id: z.string(), call_id: z.string(), text: z.string(), timed_out: z.boolean() }),
+  z.object({ v: z.literal(RUNNER_PROTOCOL_VERSION), type: z.literal("steer"), delivery_id: z.string().min(1), text: z.string() }),
+  z.object({ v: z.literal(RUNNER_PROTOCOL_VERSION), type: z.literal("answer"), delivery_id: z.string().min(1), question_id: z.string(), question_text: z.string(), call_id: z.string(), text: z.string(), timed_out: z.boolean() }),
 ]);
 
 export type HubToRunner = z.infer<typeof hubToRunnerSchema>;
 export type RemoteCall = z.infer<typeof remoteCallSchema>;
 
 export type RunnerToHub =
-  | { v: 1; type: "ready"; session_id: string; claude_code_version: string; tools: string[]; mcp_servers: string[] }
-  | { v: 1; type: "tool_call"; call_id: string; call: RemoteCall }
-  | { v: 1; type: "usage"; usage: { input_tokens: number; output_tokens: number; cache_read_tokens: number; turns: number; commands: number } }
-  | { v: 1; type: "note"; text: string }
-  | { v: 1; type: "rate_limited"; detail: string }
-  | { v: 1; type: "exited"; subtype: string; error: string | null; session_id: string | null; cost_usd: number | null };
+  | { v: 2; type: "ready"; session_id: string; claude_code_version: string; tools: string[]; mcp_servers: string[] }
+  | { v: 2; type: "tool_call"; call_id: string; call: RemoteCall }
+  | { v: 2; type: "usage"; usage: { input_tokens: number; output_tokens: number; cache_read_tokens: number; turns: number; commands: number } }
+  | { v: 2; type: "note"; text: string }
+  | { v: 2; type: "rate_limited"; detail: string }
+  | { v: 2; type: "exited"; subtype: string; error: string | null; session_id: string | null; cost_usd: number | null }
+  | { v: 2; type: "delivery_ack"; delivery_id: string };

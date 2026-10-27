@@ -844,7 +844,8 @@ async fn answer_commits_state_then_delivers_the_pending_tool_result() {
     let LocalResponseBody::Answered(reply) = response else {
         panic!("unexpected answer response: {response:?}");
     };
-    assert!(reply.delivered);
+    assert!(!reply.delivered);
+    assert!(!reply.acknowledged);
     assert_eq!(reply.question, question);
     assert_eq!(
         load_subtask(&service, subtask).await.state,
@@ -862,6 +863,7 @@ async fn answer_commits_state_then_delivers_the_pending_tool_result() {
             call_id,
             text,
             timed_out: false,
+            ..
         } if question_id == question
             && call_id == "ask-call-1"
             && text == "Keep the old path for one release."
@@ -906,6 +908,155 @@ async fn question_expiry_resumes_the_runner_with_timeout_guidance() {
         } if question_id == question && call_id == "ask-call-1"
     ));
     assert_eq!(service.expire_due_questions().await.expect("idempotent"), 0);
+}
+
+#[tokio::test]
+async fn answer_without_runner_is_durable_replayable_and_cleared_by_acknowledgement() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let service = service(&directory).await;
+    let deadline = Timestamp::now().checked_add(Duration::from_secs(60));
+    let (subtask, question, _old_runner) = seed_question(&service, "claude-a", deadline).await;
+    service.runners.lock().await.remove(&subtask);
+
+    let response = service
+        .handle(LocalRequest::Answer {
+            subtask,
+            question: Some(question),
+            text: "Keep the adapter.".into(),
+            author: tagteam_core::local_api::AnswerAuthor::You,
+            claude_session: Some("claude-a".into()),
+        })
+        .await
+        .expect("answer should be durable without a runner");
+    let LocalResponseBody::Answered(reply) = response else {
+        panic!("unexpected answer response: {response:?}");
+    };
+    assert!(!reply.delivered);
+    assert!(!reply.acknowledged);
+
+    let pending = service
+        .journal(move |journal| journal.pending_runner_deliveries(subtask))
+        .await
+        .expect("pending deliveries");
+    assert_eq!(pending.len(), 1);
+    let delivery = pending.into_iter().next().expect("one delivery");
+    assert_eq!(delivery.id, reply.delivery_id);
+    assert!(delivery.sent_at.is_none());
+    assert!(matches!(
+        &delivery.message,
+        HubToRunnerMessage::Answer {
+            question_id,
+            question_text,
+            call_id,
+            text,
+            timed_out: false,
+            ..
+        } if *question_id == question
+            && question_text == "Which compatibility path should I keep?"
+            && call_id == "ask-call-1"
+            && text == "Keep the adapter."
+    ));
+
+    let (attached_sender, mut attached_receiver) = tokio::sync::mpsc::channel(1);
+    service
+        .runners
+        .lock()
+        .await
+        .insert(subtask, attached_sender.clone());
+    attached_sender
+        .send(delivery.message)
+        .await
+        .expect("replay on runner attach");
+    let replayed = attached_receiver.recv().await.expect("replayed delivery");
+    assert!(matches!(
+        replayed,
+        HubToRunnerMessage::Answer { delivery_id, .. } if delivery_id == reply.delivery_id
+    ));
+    service
+        .journal(move |journal| {
+            journal.mark_runner_delivery_sent(reply.delivery_id, Timestamp::now())
+        })
+        .await
+        .expect("mark sent");
+    service
+        .journal(move |journal| {
+            journal.acknowledge_runner_delivery(reply.delivery_id, Timestamp::now())
+        })
+        .await
+        .expect("acknowledge");
+    service
+        .journal(move |journal| {
+            journal.acknowledge_runner_delivery(reply.delivery_id, Timestamp::now())
+        })
+        .await
+        .expect("duplicate ack is idempotent");
+    assert!(
+        service
+            .journal(move |journal| journal.pending_runner_deliveries(subtask))
+            .await
+            .expect("pending after ack")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn steer_without_runner_is_durably_replayed_on_attach() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let service = service(&directory).await;
+    let deadline = Timestamp::now().checked_add(Duration::from_secs(60));
+    let (subtask, _, _runner) = seed_question(&service, "claude-a", deadline).await;
+    service.runners.lock().await.remove(&subtask);
+
+    let response = service
+        .handle(LocalRequest::Steer {
+            subtask,
+            text: "Keep the compatibility layer small.".into(),
+            claude_session: Some("claude-a".into()),
+        })
+        .await
+        .expect("steer is queued without a runner");
+    let LocalResponseBody::Steered {
+        delivery_id,
+        delivered,
+        acknowledged,
+        ..
+    } = response
+    else {
+        panic!("unexpected steer response: {response:?}");
+    };
+    assert!(!delivered);
+    assert!(!acknowledged);
+    let pending = service
+        .journal(move |journal| journal.pending_runner_deliveries(subtask))
+        .await
+        .expect("pending deliveries");
+    assert!(matches!(
+        pending.as_slice(),
+        [delivery] if delivery.id == delivery_id
+            && matches!(&delivery.message, HubToRunnerMessage::Steer { text, .. } if text == "Keep the compatibility layer small.")
+    ));
+}
+
+#[tokio::test]
+async fn expired_question_answer_is_persisted_for_later_runner_replay() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let service = service(&directory).await;
+    let deadline = Timestamp::now().checked_add(Duration::from_millis(20));
+    let (subtask, question, _runner) = seed_question(&service, "claude-a", deadline).await;
+    service.runners.lock().await.remove(&subtask);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    assert_eq!(service.expire_due_questions().await.expect("expire"), 1);
+    let pending = service
+        .journal(move |journal| journal.pending_runner_deliveries(subtask))
+        .await
+        .expect("pending timeout delivery");
+    assert!(matches!(
+        pending.as_slice(),
+        [delivery] if matches!(&delivery.message, HubToRunnerMessage::Answer {
+            question_id, timed_out: true, ..
+        } if *question_id == question)
+    ));
 }
 
 #[tokio::test]

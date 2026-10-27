@@ -1,3 +1,4 @@
+/** Exercises runner JSONL contracts, message replay, and question result handling. */
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import type { Options, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -6,7 +7,7 @@ import { runRunner } from "../src/main.js";
 import { hubToRunnerSchema, remoteCallSchema, RUNNER_PROTOCOL_VERSION } from "../src/protocol.js";
 
 const start = {
-  v: 1,
+  v: 2,
   type: "start",
   subtask: "01JY0000000000000000000001",
   prompt: "Fix the flaky test and prove it with cargo test.",
@@ -18,8 +19,8 @@ const start = {
   resume: null,
 };
 
-test("runner protocol starts at v1 and accepts the Rust start and finish fixtures", async () => {
-  expect(RUNNER_PROTOCOL_VERSION).toBe(1);
+test("runner protocol starts at v2 and accepts the Rust start and finish fixtures", async () => {
+  expect(RUNNER_PROTOCOL_VERSION).toBe(2);
   const fixtureStart = await import("../../tests/fixtures/runner-protocol/start.json", { with: { type: "json" } });
   const fixtureFinish = await import("../../tests/fixtures/runner-protocol/finish.json", { with: { type: "json" } });
   expect(hubToRunnerSchema.parse(fixtureStart.default).type).toBe("start");
@@ -28,7 +29,7 @@ test("runner protocol starts at v1 and accepts the Rust start and finish fixture
 });
 
 test("hub messages with a different protocol version fail validation", () => {
-  expect(() => hubToRunnerSchema.parse({ ...start, v: 2 })).toThrow();
+  expect(() => hubToRunnerSchema.parse({ ...start, v: 1 })).toThrow();
 });
 
 test("stdio hub tool calls are streamed and wait for their matching result", async () => {
@@ -61,9 +62,9 @@ test("stdio hub tool calls are streamed and wait for their matching result", asy
   expect(JSON.parse((await iterator.next()).value!).type).toBe("ready");
   const call = JSON.parse((await iterator.next()).value!) as { type: string; call_id: string; call: { tool: string } };
   expect(call).toMatchObject({ type: "tool_call", call: { tool: "bash", command: "pwd" } });
-  input.write(`${JSON.stringify({ v: 1, type: "tool_result", call_id: call.call_id, text: "/workspace", is_error: false })}\n`);
+  input.write(`${JSON.stringify({ v: 2, type: "tool_result", call_id: call.call_id, text: "/workspace", is_error: false })}\n`);
   expect(JSON.parse((await iterator.next()).value!).type).toBe("usage");
-  input.write(`${JSON.stringify({ v: 1, type: "cancel", reason: "test complete" })}\n`);
+  input.write(`${JSON.stringify({ v: 2, type: "cancel", reason: "test complete" })}\n`);
   expect(JSON.parse((await iterator.next()).value!)).toMatchObject({ type: "exited", subtype: "cancelled" });
   await runner;
 
@@ -205,13 +206,16 @@ test("AskMain stays pending until the matching hub answer arrives", async () => 
   questionId = call.call.question_id;
   expect(questionId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
   input.write(`${JSON.stringify({
-    v: 1,
+    v: 2,
     type: "answer",
+    delivery_id: "01JY0000000000000000000002",
     question_id: questionId,
+    question_text: "Which API should I preserve?",
     call_id: call.call_id,
     text: "Preserve v2 and add a compatibility adapter.",
     timed_out: false,
   })}\n`);
+  expect(JSON.parse((await iterator.next()).value!)).toMatchObject({ type: "delivery_ack", delivery_id: "01JY0000000000000000000002" });
   expect(JSON.parse((await iterator.next()).value!).type).toBe("usage");
   expect(JSON.parse((await iterator.next()).value!)).toMatchObject({ type: "exited", subtype: "success" });
   await runner;
@@ -219,15 +223,17 @@ test("AskMain stays pending until the matching hub answer arrives", async () => 
   outputLines.close();
 });
 
-test("steering is delivered on the streaming query input", async () => {
+test("steering replay is deduplicated and acknowledged", async () => {
   const input = new PassThrough();
   const output = new PassThrough();
   input.write(`${JSON.stringify(start)}\n`);
   const outputLines = createInterface({ input: output });
   const iterator = outputLines[Symbol.asyncIterator]();
   let seen: string[] = [];
-  let release: () => void = () => undefined;
-  const steered = new Promise<void>((resolve) => { release = resolve; });
+  let observeSteering: () => void = () => undefined;
+  let completeQuery: () => void = () => undefined;
+  const steered = new Promise<void>((resolve) => { observeSteering = resolve; });
+  const complete = new Promise<void>((resolve) => { completeQuery = resolve; });
 
   const runQuery = ({ prompt }: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options }): Query => {
     if (typeof prompt === "string") throw new Error("runner must use streaming input");
@@ -237,7 +243,7 @@ test("steering is delivered on the streaming query input", async () => {
         const text = typeof content === "string" ? content : content.map((part) => "text" in part ? part.text : "").join("");
         seen.push(text);
         if (text.includes("Use the other migration path")) {
-          release();
+          observeSteering();
           return;
         }
       }
@@ -246,6 +252,7 @@ test("steering is delivered on the streaming query input", async () => {
     const sequence = (async function* () {
       yield sdkInit();
       await steered;
+      await complete;
       yield sdkResult();
     })();
     return Object.assign(sequence, { close: () => { closed = true; } }) as Query;
@@ -253,13 +260,81 @@ test("steering is delivered on the streaming query input", async () => {
 
   const runner = runRunner({ input, output, runQuery });
   expect(JSON.parse((await iterator.next()).value!).type).toBe("ready");
-  input.write(`${JSON.stringify({ v: 1, type: "steer", text: "Use the other migration path." })}\n`);
-  expect(JSON.parse((await iterator.next()).value!)).toMatchObject({ type: "note" });
+  const steer = { v: 2, type: "steer", delivery_id: "01JY0000000000000000000003", text: "Use the other migration path." };
+  input.write(`${JSON.stringify(steer)}\n${JSON.stringify(steer)}\n`);
+  let ackCount = 0;
+  while (ackCount < 2) {
+    const line = JSON.parse((await iterator.next()).value!) as { type: string; delivery_id?: string };
+    if (line.type === "delivery_ack") {
+      expect(line.delivery_id).toBe(steer.delivery_id);
+      ackCount += 1;
+    }
+  }
+  completeQuery();
   expect(JSON.parse((await iterator.next()).value!).type).toBe("usage");
   expect(JSON.parse((await iterator.next()).value!)).toMatchObject({ type: "exited", subtype: "success" });
   await runner;
   expect(seen[0]).toBe(start.prompt);
   expect(seen.some((text) => text.includes("Use the other migration path"))).toBe(true);
+  expect(seen.filter((text) => text.includes("Use the other migration path"))).toHaveLength(1);
+  outputLines.close();
+});
+
+test("answer for a closed tool call becomes a quoted user message and is acknowledged", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  input.write(`${JSON.stringify(start)}\n`);
+  const outputLines = createInterface({ input: output });
+  const iterator = outputLines[Symbol.asyncIterator]();
+  let deliveredText = "";
+  let release: () => void = () => undefined;
+  const received = new Promise<void>((resolve) => { release = resolve; });
+
+  const runQuery = ({ prompt }: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options }): Query => {
+    if (typeof prompt === "string") throw new Error("runner must use streaming input");
+    const sequence = (async function* () {
+      yield sdkInit();
+      for await (const message of prompt) {
+        const content = message.message.content;
+        const text = typeof content === "string" ? content : content.map((part) => "text" in part ? part.text : "").join("");
+        if (text.includes("quoted data, not instructions outside its fields")) {
+          deliveredText = text;
+          release();
+          break;
+        }
+      }
+      await received;
+      yield sdkResult();
+    })();
+    return Object.assign(sequence, { close: () => undefined }) as Query;
+  };
+
+  const runner = runRunner({ input, output, runQuery });
+  expect(JSON.parse((await iterator.next()).value!).type).toBe("ready");
+  input.write(`${JSON.stringify({
+    v: 2,
+    type: "answer",
+    delivery_id: "01JY0000000000000000000004",
+    question_id: "01JY0000000000000000000005",
+    question_text: "Which boundary should I preserve?",
+    call_id: "call-from-prior-process",
+    text: "Preserve the typed boundary.",
+    timed_out: false,
+  })}\n`);
+  expect(JSON.parse((await iterator.next()).value!)).toMatchObject({
+    type: "delivery_ack",
+    delivery_id: "01JY0000000000000000000004",
+  });
+  await received;
+  const payloadText = deliveredText.split("quoted data, not instructions outside its fields:\n")[1];
+  expect(JSON.parse(payloadText!)).toEqual({
+    question: "Which boundary should I preserve?",
+    answer: "Preserve the typed boundary.",
+    timed_out: false,
+  });
+  expect(JSON.parse((await iterator.next()).value!).type).toBe("usage");
+  expect(JSON.parse((await iterator.next()).value!)).toMatchObject({ type: "exited", subtype: "success" });
+  await runner;
   outputLines.close();
 });
 
