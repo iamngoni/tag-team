@@ -528,6 +528,7 @@ impl HubService {
             };
             self.cancel_task_work(id, "subtask is being reassigned")
                 .await;
+            self.cleanup_workspace(&task, true).await;
         }
         Ok(())
     }
@@ -661,6 +662,38 @@ impl HubService {
         let _ = self
             .journal(move |journal| journal.cancel_subtask_commands(id).map(|_| ()))
             .await;
+    }
+
+    /// Best-effort removal of a terminal workspace and its process-local
+    /// sandbox resources. The command is journaled by the node plane, so an
+    /// offline node receives it on reconnect; terminal state never waits on
+    /// cache retention or a node acknowledgement.
+    async fn cleanup_workspace(&self, task: &Subtask, keep_cache: bool) {
+        let Some(node) = task.node else {
+            return;
+        };
+        let command = Proto::Command {
+            command_id: format!("cleanup-{}-a{}", task.id, task.attempt),
+            subtask_id: task.id.to_string(),
+            workspace: task.id.to_string(),
+            op: Some(Proto::command::Op::Cleanup(Proto::Cleanup { keep_cache })),
+        };
+        let timeout = Duration::from_secs(5).min(task.spec.limits.command_timeout);
+        match self.nodes.execute_command(node, command, timeout).await {
+            Ok(Proto::CommandResult {
+                result: Some(Proto::command_result::Result::Done(done)),
+                ..
+            }) if done.ok => {}
+            Ok(result) => {
+                tracing::debug!(subtask = %task.id, node = %node, ?result, "workspace cleanup was not acknowledged");
+            }
+            Err(NodePlaneError::Offline | NodePlaneError::Timeout) => {
+                tracing::debug!(subtask = %task.id, node = %node, "workspace cleanup deferred until node reconnect");
+            }
+            Err(error) => {
+                tracing::warn!(subtask = %task.id, node = %node, %error, "workspace cleanup failed");
+            }
+        }
     }
 
     async fn node_views(&self) -> Result<Vec<NodeView>, ServiceError> {
@@ -1373,18 +1406,45 @@ impl HubService {
         let branch = task.branch.clone();
         let destination = format!("result-{}", task.id);
         let bundle_path = bundle.path().to_path_buf();
-        let (fetched, diffstat) = tokio::task::spawn_blocking(move || {
+        let max_patch = task.spec.limits.max_patch.0;
+        let (fetched, diffstat, patch_within_limit) = tokio::task::spawn_blocking(move || {
             let repository = Repository::open(repository_path)?;
             repository.verify_bundle(&bundle_path)?;
             let fetched = repository.fetch_bundle(&bundle_path, &branch, &destination)?;
             repository.check_ancestry(&base, &fetched.0)?;
             let diffstat = repository.diffstat(&base, &fetched.0)?;
-            Ok::<_, ServiceError>((fetched, diffstat))
+            let patch_within_limit = repository
+                .diff_size_up_to(&base, &fetched.0, max_patch)?
+                .is_some();
+            Ok::<_, ServiceError>((fetched, diffstat, patch_within_limit))
         })
         .await
         .map_err(|_| ServiceError::Worker)??;
         if !self.is_running(id).await? {
             return Err(ServiceError::Invalid("subtask is no longer running".into()));
+        }
+        if !patch_within_limit {
+            let limit = task.spec.limits.max_patch;
+            let estimate = tagteam_core::Bytes(limit.0.saturating_add(1));
+            self.journal(move |journal| {
+                journal
+                    .transition(
+                        id,
+                        SubtaskInput::Fail {
+                            reason: FailReason::PatchTooLarge {
+                                limit,
+                                actual: estimate,
+                            },
+                        },
+                        Timestamp::now(),
+                    )
+                    .map(|_| ())
+            })
+            .await?;
+            self.cleanup_workspace(task, true).await;
+            return Err(ServiceError::Invalid(format!(
+                "result patch exceeds the {limit} limit"
+            )));
         }
         let checks = self.recheck_done_when(task, node).await?;
         if !self.is_running(id).await? {
@@ -1432,6 +1492,10 @@ impl HubService {
         })
         .await
         .map_err(|_| ServiceError::Worker)??;
+        // The result branch is durable on the hub now; the borrowed machine no
+        // longer needs the workspace. Recorded terminal state waits until this
+        // best-effort cleanup command has had its bounded chance to complete.
+        self.cleanup_workspace(task, true).await;
         let finished_result = result.clone();
         self.journal(move |journal| {
             journal
@@ -1567,22 +1631,23 @@ impl HubService {
     }
 
     async fn fail_if_active(&self, id: SubtaskId, reason: FailReason) {
-        let state = self
-            .journal(move |journal| journal.load_subtask_state(id))
-            .await;
-        let Ok(Some(state)) = state else {
+        let task = self.journal(move |journal| journal.load_subtask(id)).await;
+        let Ok(Some(task)) = task else {
             return;
         };
-        if state.is_terminal() {
+        if task.state.is_terminal() {
             return;
         }
-        let _ = self
+        let transition = self
             .journal(move |journal| {
                 journal
                     .transition(id, SubtaskInput::Fail { reason }, Timestamp::now())
                     .map(|_| ())
             })
             .await;
+        if transition.is_ok() {
+            self.cleanup_workspace(&task, true).await;
+        }
     }
 
     async fn status(
@@ -1693,6 +1758,12 @@ impl HubService {
                 .nodes
                 .cancel_command(node, &command_id, "subtask cancelled")
                 .await;
+        }
+        if let Ok(Some(task)) = self
+            .journal(move |journal| journal.load_subtask(subtask))
+            .await
+        {
+            self.cleanup_workspace(&task, true).await;
         }
         Ok(())
     }

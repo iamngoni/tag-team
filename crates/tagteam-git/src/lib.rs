@@ -512,6 +512,86 @@ impl Repository {
         Ok(())
     }
 
+    /// Counts the textual/ binary patch bytes between two commits without
+    /// buffering an unbounded diff. Returns `None` once the patch exceeds
+    /// `limit`; Git is killed as soon as the overage is observed.
+    pub fn diff_size_up_to(&self, base: &str, head: &str, limit: u64) -> Result<Option<u64>> {
+        use std::io::Read as _;
+        use std::process::Stdio;
+
+        let base = self.resolve_commit(base)?;
+        let head = self.resolve_commit(head)?;
+        let mut child = Command::new("git")
+            .args([
+                "diff",
+                "--binary",
+                "--no-color",
+                "--no-ext-diff",
+                "--full-index",
+                &base,
+                &head,
+                "--",
+            ])
+            .current_dir(&self.path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|source| GitError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GitError::Command {
+                operation: "measure diff",
+                repo: self.path.clone(),
+                message: "Git did not provide diff output".into(),
+            });
+        };
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        let exceeded = loop {
+            let read = match stdout.read(&mut buffer) {
+                Ok(read) => read,
+                Err(source) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(GitError::Io {
+                        path: self.path.clone(),
+                        source,
+                    });
+                }
+            };
+            if read == 0 {
+                break false;
+            }
+            total = total.saturating_add(read as u64);
+            if total > limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                break true;
+            }
+        };
+        if exceeded {
+            return Ok(None);
+        }
+        let status = child.wait().map_err(|source| GitError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        if !status.success() {
+            return Err(GitError::Command {
+                operation: "measure diff",
+                repo: self.path.clone(),
+                message: "git diff exited unsuccessfully".into(),
+            });
+        }
+        Ok(Some(total))
+    }
+
     /// Diff summary between two commits, suitable for a landed branch report.
     pub fn diffstat(&self, base: &str, head: &str) -> Result<DiffStat> {
         let base = self.resolve_commit(base)?;
@@ -1034,6 +1114,32 @@ mod tests {
                 insertions: 3,
                 deletions: 2
             }
+        );
+    }
+
+    #[test]
+    fn patch_measurement_is_bounded_and_stops_at_the_limit() {
+        let fixture = TempRepo::new("git-patch-size");
+        fixture.write("a.txt", "base\n");
+        let base = fixture.commit_all("base");
+        fixture.write("a.txt", "changed\n");
+        fixture.write("binary.bin", "\0\x01\x02\x03");
+        let head = fixture.commit_all("head");
+        let repo = Repository::open(&fixture.0).expect("repo");
+        let measured = repo
+            .diff_size_up_to(&base, &head, 1024 * 1024)
+            .expect("measure patch")
+            .expect("patch fits");
+        assert!(measured > 0);
+        assert_eq!(
+            repo.diff_size_up_to(&base, &head, measured)
+                .expect("exact limit is allowed"),
+            Some(measured)
+        );
+        assert_eq!(
+            repo.diff_size_up_to(&base, &head, measured.saturating_sub(1))
+                .expect("over-limit patch is reported"),
+            None
         );
     }
 

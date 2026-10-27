@@ -341,6 +341,18 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
         git_output(&repository, &["show", &format!("{branch}:result.txt")]),
         "written by fake runner\n"
     );
+    assert_eq!(
+        git_output(
+            &repository,
+            &["cat-file", "-s", &format!("{branch}:large.bin")]
+        )
+        .trim(),
+        LARGE_FIXTURE_BYTES.to_string()
+    );
+    assert_eq!(
+        git_output(&repository, &["show", &format!("{branch}:tracked.txt")]),
+        "prepared on the node\n"
+    );
     let branch_head = git_output(
         &repository,
         &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
@@ -581,20 +593,24 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
         "cancellation during done_when must not create a review branch"
     );
 
-    let workspace = node_data
-        .join("workspaces")
-        .join(subtask.to_string())
-        .join("repo");
-    assert_eq!(
-        fs::read(workspace.join("tracked.txt")).expect("prepared file"),
-        b"prepared on the node\n"
+    let workspace_root = node_data.join("workspaces").join(subtask.to_string());
+    assert!(
+        !workspace_root.exists(),
+        "successful terminal work must remove its borrowed-machine workspace"
     );
-    assert_eq!(
-        fs::read(workspace.join("large.bin")).expect("large prepared file"),
-        large_fixture()
-    );
-    assert!(workspace.join(".git").is_dir());
-    assert!(!workspace.join(".tagteam-input.bundle").exists());
+    for cancelled_id in [cancel_subtask, check_subtask] {
+        let cancelled_workspace = node_data.join("workspaces").join(cancelled_id.to_string());
+        for _ in 0..200 {
+            if !cancelled_workspace.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !cancelled_workspace.exists(),
+            "cancelled terminal work must remove its borrowed-machine workspace"
+        );
+    }
 
     node_loop.abort();
     let _ = shutdown.send(());
