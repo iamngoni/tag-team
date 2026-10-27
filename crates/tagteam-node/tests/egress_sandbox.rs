@@ -19,10 +19,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tagteam_core::{Bytes, Limits};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use tagteam_proxy::ProxyServer;
-#[cfg(target_os = "linux")]
-use tagteam_proxy::UnixProxyServer;
 use tagteam_proxy::{
     AllowedHost, ConnectionOutcome, Connector, DenyReason, ProxyConfig, ProxyIo, Resolver,
 };
