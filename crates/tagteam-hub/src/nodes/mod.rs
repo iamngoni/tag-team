@@ -916,6 +916,17 @@ fn capacity_from_proto(value: proto::Capacity) -> Result<Capacity, Status> {
             ));
         }
     };
+    let local_minute_of_day = value
+        .local_minute_of_day
+        .map(|minute| {
+            u16::try_from(minute)
+                .ok()
+                .filter(|minute| *minute < 1_440)
+                .ok_or_else(|| {
+                    Status::invalid_argument("heartbeat local minute-of-day is out of range")
+                })
+        })
+        .transpose()?;
     Ok(Capacity {
         cores_total: u16::try_from(value.cores_total)
             .map_err(|_| Status::invalid_argument("heartbeat core count is out of range"))?,
@@ -925,6 +936,8 @@ fn capacity_from_proto(value: proto::Capacity) -> Result<Capacity, Status> {
         running: u16::try_from(value.running)
             .map_err(|_| Status::invalid_argument("heartbeat running count is out of range"))?,
         on_battery: value.on_battery,
+        battery_known: value.battery_known,
+        local_minute_of_day,
         thermal,
     })
 }

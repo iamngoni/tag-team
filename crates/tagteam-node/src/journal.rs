@@ -75,10 +75,16 @@ impl CommandJournal {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(_) => return Err(JournalError::Io),
         };
-        Ok(Self {
+        let journal = Self {
             path,
             entries: std::sync::Arc::new(Mutex::new(entries)),
-        })
+        };
+        // A receipt with no result belongs to a command that was executing in
+        // an earlier process. Returning `InProgress` forever would strand the
+        // hub, so convert it to an authoritative non-retryable failure before
+        // exposing the journal to the new session.
+        journal.recover_interrupted()?;
+        Ok(journal)
     }
 
     pub fn begin(&self, command_id: &str) -> Result<BeginCommand, JournalError> {
@@ -188,6 +194,23 @@ impl CommandJournal {
             .collect()
     }
 
+    fn recover_interrupted(&self) -> Result<(), JournalError> {
+        let mut entries = self.entries.lock().map_err(|_| JournalError::Io)?;
+        let mut updated = entries.clone();
+        let mut changed = false;
+        for (command_id, entry) in &mut updated {
+            if entry.result.is_none() && !entry.cancelled {
+                entry.result = Some(STANDARD.encode(interrupted_ack(command_id).encode_to_vec()));
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist(&updated)?;
+            *entries = updated;
+        }
+        Ok(())
+    }
+
     fn persist(&self, entries: &BTreeMap<String, Entry>) -> Result<(), JournalError> {
         reject_symlink(&self.path)?;
         let contents = serde_json::to_vec(&JournalFile {
@@ -233,6 +256,22 @@ fn cancelled_ack(command_id: &str) -> Ack {
                 tagteam_proto::v1::Error {
                     code: tagteam_proto::v1::ErrorCode::Cancelled as i32,
                     message: "command was cancelled".into(),
+                    retryable: false,
+                },
+            )),
+        }),
+    }
+}
+
+fn interrupted_ack(command_id: &str) -> Ack {
+    Ack {
+        command_id: command_id.to_owned(),
+        result: Some(tagteam_proto::v1::CommandResult {
+            command_id: command_id.to_owned(),
+            result: Some(tagteam_proto::v1::command_result::Result::Error(
+                tagteam_proto::v1::Error {
+                    code: tagteam_proto::v1::ErrorCode::Unavailable as i32,
+                    message: "node restarted before command completion; outcome is unknown and the command was not replayed".into(),
                     retryable: false,
                 },
             )),
@@ -355,5 +394,42 @@ mod tests {
             panic!("completed command must replay its result");
         };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn interrupted_command_becomes_a_terminal_failure_on_reopen() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("commands.json");
+        let journal = CommandJournal::open(&path).expect("journal opens");
+        assert!(matches!(
+            journal.begin("interrupted-command"),
+            Ok(BeginCommand::Execute)
+        ));
+        drop(journal);
+
+        let reopened = CommandJournal::open(&path).expect("journal reopens");
+        let pending = reopened.pending().expect("recovered receipts");
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].result.as_ref().and_then(|result| result.result.as_ref()),
+            Some(tagteam_proto::v1::command_result::Result::Error(error))
+                if error.code == tagteam_proto::v1::ErrorCode::Unavailable as i32
+                    && !error.retryable
+        ));
+        let BeginCommand::Completed(replayed) = reopened
+            .begin("interrupted-command")
+            .expect("interrupted command receipt loads")
+        else {
+            panic!("an interrupted command must not execute after restart");
+        };
+        assert_eq!(replayed, pending[0]);
+
+        drop(reopened);
+        let reopened_again = CommandJournal::open(path).expect("journal reopens again");
+        assert_eq!(
+            reopened_again.pending().expect("receipt remains"),
+            pending,
+            "interrupted result must survive another restart"
+        );
     }
 }

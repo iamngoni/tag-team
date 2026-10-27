@@ -93,6 +93,12 @@ message Capacity {
   uint32 running = 5;
   bool on_battery = 6;
   string thermal = 7;
+  // False means the host could not produce a trustworthy power-source sample.
+  // A node with never_on_battery=true must then fail closed.
+  bool battery_known = 8;
+  // The node's current local minute-of-day. The hub schedules owner hours in
+  // the node's local wall-clock time, not the hub's or UTC's.
+  optional uint32 local_minute_of_day = 9;
 }
 
 message Toolchain {

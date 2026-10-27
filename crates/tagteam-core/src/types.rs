@@ -281,6 +281,13 @@ pub struct Capacity {
     pub disk_free: Bytes,
     pub running: u16,
     pub on_battery: bool,
+    /// False when the host could not provide a trustworthy power-source sample.
+    #[serde(default)]
+    pub battery_known: bool,
+    /// Minute-of-day from the node's local timezone; `None` fails closed for
+    /// policies that declare allowed hours.
+    #[serde(default)]
+    pub local_minute_of_day: Option<u16>,
     pub thermal: Thermal,
 }
 
@@ -293,6 +300,8 @@ impl Default for Capacity {
             disk_free: Bytes::gib(1),
             running: 0,
             on_battery: false,
+            battery_known: false,
+            local_minute_of_day: None,
             thermal: Thermal::Nominal,
         }
     }
@@ -378,14 +387,17 @@ impl Default for NodePolicy {
 
 impl NodePolicy {
     #[must_use]
-    pub fn allows_now(&self, presence: OwnerPresence, minute_of_day: u16) -> bool {
+    pub fn allows_now(&self, presence: OwnerPresence, minute_of_day: Option<u16>) -> bool {
         if self.only_when_idle && matches!(presence, OwnerPresence::Present) {
             return false;
         }
-        if let Some(hours) = &self.hours
-            && !hours.iter().any(|range| range.contains(minute_of_day))
-        {
-            return false;
+        if let Some(hours) = &self.hours {
+            let Some(minute_of_day) = minute_of_day else {
+                return false;
+            };
+            if !hours.iter().any(|range| range.contains(minute_of_day)) {
+                return false;
+            }
         }
         true
     }
@@ -587,6 +599,19 @@ impl SubtaskState {
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
         matches!(self, Self::Done | Self::Failed { .. } | Self::Cancelled)
+    }
+
+    /// Whether this state holds a runner/workspace slot for the account.
+    ///
+    /// `Placing` is intentionally excluded: it has not acquired a node yet, and
+    /// treating an interrupted transition as active would permanently consume
+    /// capacity until startup recovery repairs it.
+    #[must_use]
+    pub const fn occupies_worker_slot(&self) -> bool {
+        matches!(
+            self,
+            Self::Preparing | Self::Running | Self::WaitingOnMain { .. } | Self::Collecting
+        )
     }
 }
 

@@ -21,6 +21,7 @@ repository = "https://github.com/iamngoni/tag-team"
 [workspace.dependencies]
 anyhow = "1.0.100"
 base64 = "0.22.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 data-encoding = "2.9.0"
 getrandom = "0.4.3"
 sysinfo = "0.38.4"

@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    Arch, Bytes, Node, NodeId, NodeState, Os, OwnerPresence, RepoId, SubtaskSpec, Timestamp,
-};
+use crate::{Arch, Bytes, Node, NodeId, NodeState, Os, OwnerPresence, RepoId, SubtaskSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
@@ -21,6 +19,12 @@ pub enum NoFitReason {
     OnBattery {
         node: NodeId,
     },
+    /// The owner account already has the configured number of active subtasks.
+    ///
+    /// This is deliberately account-wide rather than node-specific: each
+    /// active subtask can keep a runner and a prepared workspace alive, even
+    /// while it is waiting on main or collecting its result.
+    AccountAtCapacity,
     NodeAtCapacity {
         node: NodeId,
     },
@@ -75,15 +79,7 @@ impl Placement {
 }
 
 #[must_use]
-pub fn place(
-    spec: &SubtaskSpec,
-    repo: &RepoId,
-    nodes: &[Node],
-    siblings: &[NodeId],
-    now: Timestamp,
-) -> Placement {
-    let minute_of_day = u16::try_from((now.0 / 60_000).rem_euclid(1_440)).unwrap_or(0);
-
+pub fn place(spec: &SubtaskSpec, repo: &RepoId, nodes: &[Node], siblings: &[NodeId]) -> Placement {
     if nodes.is_empty() {
         return Placement::Queued(vec![NoFitReason::NoNodes]);
     }
@@ -91,7 +87,7 @@ pub fn place(
     let mut rejected = Vec::new();
     let mut viable = Vec::new();
     for node in nodes {
-        match rejection(spec, node, minute_of_day) {
+        match rejection(spec, node) {
             Some(reason) => rejected.push(reason),
             None => viable.push(node),
         }
@@ -106,14 +102,17 @@ pub fn place(
         )
 }
 
-fn rejection(spec: &SubtaskSpec, node: &Node, minute_of_day: u16) -> Option<NoFitReason> {
+fn rejection(spec: &SubtaskSpec, node: &Node) -> Option<NoFitReason> {
     if node.state != NodeState::Active {
         return Some(NoFitReason::NodeNotActive {
             node: node.id,
             state: node.state,
         });
     }
-    if !node.policy.allows_now(node.presence, minute_of_day) {
+    if !node
+        .policy
+        .allows_now(node.presence, node.capacity.local_minute_of_day)
+    {
         return Some(
             if node.policy.only_when_idle && matches!(node.presence, OwnerPresence::Present) {
                 NoFitReason::OwnerPresent { node: node.id }
@@ -122,7 +121,7 @@ fn rejection(spec: &SubtaskSpec, node: &Node, minute_of_day: u16) -> Option<NoFi
             },
         );
     }
-    if node.policy.never_on_battery && node.capacity.on_battery {
+    if node.policy.never_on_battery && (!node.capacity.battery_known || node.capacity.on_battery) {
         return Some(NoFitReason::OnBattery { node: node.id });
     }
     if node.capacity.running >= node.policy.max_subtasks {
@@ -211,8 +210,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        CachedRepo, Capacity, GitOid, Limits, Needs, NodePolicy, Platform, Thermal, Toolchain,
-        Trust,
+        CachedRepo, Capacity, GitOid, HourRange, Limits, Needs, NodePolicy, Platform, Thermal,
+        Timestamp, Toolchain, Trust,
     };
 
     fn spec() -> SubtaskSpec {
@@ -248,6 +247,8 @@ mod tests {
                 disk_free: Bytes::gib(50),
                 running: 0,
                 on_battery: false,
+                battery_known: true,
+                local_minute_of_day: Some(10 * 60),
                 thermal: Thermal::Nominal,
             },
             toolchains: vec![],
@@ -273,7 +274,6 @@ mod tests {
             &RepoId(GitOid::zero()),
             &[small, large.clone()],
             &[],
-            Timestamp::now(),
         );
         assert_eq!(placement, Placement::Placed(large.id));
     }
@@ -290,13 +290,7 @@ mod tests {
         spec.needs
             .toolchains
             .push(("cargo".into(), VersionReq::parse(">=1.80").unwrap()));
-        let placement = place(
-            &spec,
-            &RepoId(GitOid::zero()),
-            &[node.clone()],
-            &[],
-            Timestamp::now(),
-        );
+        let placement = place(&spec, &RepoId(GitOid::zero()), &[node.clone()], &[]);
         assert!(matches!(
             placement,
             Placement::Queued(ref reasons)
@@ -314,13 +308,7 @@ mod tests {
             heads: vec![],
         });
         plain.capacity.cores_free = 4.0;
-        let placement = place(
-            &spec(),
-            &repo,
-            &[plain, cached.clone()],
-            &[],
-            Timestamp::now(),
-        );
+        let placement = place(&spec(), &repo, &[plain, cached.clone()], &[]);
         assert_eq!(placement, Placement::Placed(cached.id));
     }
 
@@ -328,7 +316,7 @@ mod tests {
     fn no_match_reports_every_specific_reason() {
         let repo = RepoId(GitOid::zero());
         assert_eq!(
-            place(&spec(), &repo, &[], &[], Timestamp::now()),
+            place(&spec(), &repo, &[], &[]),
             Placement::Queued(vec![NoFitReason::NoNodes])
         );
 
@@ -338,13 +326,7 @@ mod tests {
         present.policy.only_when_idle = true;
         present.presence = OwnerPresence::Present;
         assert_eq!(
-            place(
-                &spec(),
-                &repo,
-                &[paused.clone(), present.clone()],
-                &[],
-                Timestamp::now()
-            ),
+            place(&spec(), &repo, &[paused.clone(), present.clone()], &[],),
             Placement::Queued(vec![
                 NoFitReason::NodeNotActive {
                     node: paused.id,
@@ -352,6 +334,51 @@ mod tests {
                 },
                 NoFitReason::OwnerPresent { node: present.id },
             ])
+        );
+    }
+
+    #[test]
+    fn node_local_clock_controls_owner_hours_and_unknown_evidence_fails_closed() {
+        let repo = RepoId(GitOid::zero());
+        let mut node = node("local-clock", 4.0);
+        node.policy.hours = Some(vec![HourRange {
+            start_minutes: 9 * 60,
+            end_minutes: 17 * 60,
+        }]);
+
+        node.capacity.local_minute_of_day = Some(10 * 60);
+        assert_eq!(
+            place(&spec(), &repo, &[node.clone()], &[]),
+            Placement::Placed(node.id)
+        );
+
+        node.capacity.local_minute_of_day = Some(22 * 60);
+        assert_eq!(
+            place(&spec(), &repo, &[node.clone()], &[]),
+            Placement::Queued(vec![NoFitReason::OutsideAllowedHours { node: node.id }])
+        );
+
+        node.capacity.local_minute_of_day = None;
+        assert_eq!(
+            place(&spec(), &repo, &[node.clone()], &[]),
+            Placement::Queued(vec![NoFitReason::OutsideAllowedHours { node: node.id }])
+        );
+    }
+
+    #[test]
+    fn unknown_battery_evidence_fails_closed_when_battery_is_forbidden() {
+        let repo = RepoId(GitOid::zero());
+        let mut node = node("battery-unknown", 4.0);
+        node.capacity.battery_known = false;
+        assert_eq!(
+            place(&spec(), &repo, &[node.clone()], &[]),
+            Placement::Queued(vec![NoFitReason::OnBattery { node: node.id }])
+        );
+        node.capacity.battery_known = true;
+        node.capacity.on_battery = false;
+        assert_eq!(
+            place(&spec(), &repo, &[node.clone()], &[]),
+            Placement::Placed(node.id)
         );
     }
 }

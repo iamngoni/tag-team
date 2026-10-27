@@ -6,6 +6,7 @@
 
 use std::{path::PathBuf, process::Command, sync::OnceLock};
 
+use chrono::Timelike as _;
 use sysinfo::{Disks, System};
 use tagteam_core::NodePolicy;
 
@@ -17,6 +18,7 @@ static TOOLCHAINS: OnceLock<Vec<tagteam_proto::v1::Toolchain>> = OnceLock::new()
 #[derive(Default)]
 pub struct HostHeartbeat {
     policy: Option<NodePolicy>,
+    workspace_root: Option<PathBuf>,
 }
 
 impl HostHeartbeat {
@@ -24,6 +26,17 @@ impl HostHeartbeat {
     pub fn with_policy(policy: NodePolicy) -> Self {
         Self {
             policy: Some(policy),
+            workspace_root: None,
+        }
+    }
+
+    /// Measure free space on the volume that actually backs borrowed
+    /// workspaces. Falling back to the largest mounted volume can overstate
+    /// capacity when the workspace lives on a smaller or external disk.
+    pub fn with_policy_and_workspace(policy: NodePolicy, workspace_root: PathBuf) -> Self {
+        Self {
+            policy: Some(policy),
+            workspace_root: Some(workspace_root),
         }
     }
 }
@@ -44,14 +57,13 @@ impl HeartbeatSource for HostHeartbeat {
         // Load average is available immediately without waiting for a second CPU sample.
         let load = System::load_average().one as f32;
         let disks = Disks::new_with_refreshed_list();
-        let free_disk = disks
-            .list()
-            .iter()
-            .map(|disk| disk.available_space())
-            .max()
+        let free_disk = self
+            .workspace_root
+            .as_deref()
+            .and_then(|workspace| free_disk_for(workspace, &disks))
             .unwrap_or(0);
         let (presence, idle_for_ms) = owner_presence(self.policy.as_ref());
-        let on_battery = detect_on_battery().unwrap_or(false);
+        let battery = detect_on_battery();
         tagteam_proto::v1::Heartbeat {
             capacity: Some(tagteam_proto::v1::Capacity {
                 cores_total: u32::try_from(cores).unwrap_or(u32::MAX),
@@ -67,7 +79,9 @@ impl HeartbeatSource for HostHeartbeat {
                 // CommandRunner does not expose active worker state to the heartbeat source.
                 // Keep the wire value explicitly zero until a shared runner status API exists.
                 running: 0,
-                on_battery,
+                on_battery: battery.unwrap_or(false),
+                battery_known: battery.is_some(),
+                local_minute_of_day: local_minute_of_day().map(u32::from),
                 // The protocol rejects an empty thermal state; nominal is the fallback when no
                 // platform thermal sensor is available.
                 thermal: "nominal".into(),
@@ -81,8 +95,26 @@ impl HeartbeatSource for HostHeartbeat {
     }
 }
 
+fn free_disk_for(workspace: &std::path::Path, disks: &Disks) -> Option<u64> {
+    disks
+        .list()
+        .iter()
+        .filter(|disk| workspace.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(sysinfo::Disk::available_space)
+}
+
 fn owner_presence(policy: Option<&NodePolicy>) -> (tagteam_proto::v1::OwnerPresence, u64) {
     owner_presence_from_idle(policy, detect_idle_ms())
+}
+
+/// Returns the node's current wall-clock minute, independent of the hub's
+/// timezone. `None` lets the scheduler fail closed for policies with hours.
+fn local_minute_of_day() -> Option<u16> {
+    let now = chrono::Local::now();
+    let hour = u16::try_from(now.hour()).ok()?;
+    let minute = u16::try_from(now.minute()).ok()?;
+    hour.checked_mul(60)?.checked_add(minute)
 }
 
 fn owner_presence_from_idle(
@@ -210,7 +242,9 @@ fn detect_on_battery() -> Option<bool> {
             );
         }
     }
-    None
+    // A readable power-supply tree with no battery describes an AC-powered
+    // machine, not unknown evidence. Keep `None` for an unreadable host.
+    Some(false)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -220,7 +254,7 @@ fn detect_on_battery() -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{owner_presence_from_idle, parse_tool_version};
+    use super::{local_minute_of_day, owner_presence_from_idle, parse_tool_version};
     use tagteam_core::NodePolicy;
 
     #[test]
@@ -275,5 +309,10 @@ mod tests {
             owner_presence_from_idle(None, Some(600_000)).0,
             tagteam_proto::v1::OwnerPresence::Away
         );
+    }
+
+    #[test]
+    fn local_clock_stays_within_a_day() {
+        assert!(local_minute_of_day().is_some_and(|minute| minute < 24 * 60));
     }
 }

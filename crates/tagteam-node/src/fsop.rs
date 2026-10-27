@@ -10,6 +10,19 @@ use std::{
     process::{Command, Stdio},
 };
 
+#[cfg(target_os = "linux")]
+use std::{
+    io,
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    os::unix::net::UnixStream,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -17,6 +30,19 @@ use tagteam_core::MAX_BLOB_BYTES;
 
 /// The encoded helper envelope can exceed the blob limit by base64 and JSON overhead.
 const MAX_HELPER_REQUEST_BYTES: u64 = MAX_BLOB_BYTES * 2;
+#[cfg(target_os = "linux")]
+const PROXY_BRIDGE_PORT: u16 = 38_417;
+
+const PROXY_ENV_NAMES: [&str; 8] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -85,6 +111,144 @@ pub struct ExecRequest {
     pub stdin: String,
 }
 
+#[cfg(target_os = "linux")]
+struct ProxyBridge {
+    address: SocketAddr,
+    stopping: Arc<AtomicBool>,
+    task: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProxyBridge {
+    fn start(socket: PathBuf, address: SocketAddr) -> Result<Self, String> {
+        if !address.ip().is_loopback() {
+            return Err("sandbox proxy bridge address is invalid".into());
+        }
+        let listener = TcpListener::bind(address)
+            .map_err(|_| "sandbox proxy bridge could not bind its loopback endpoint")?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| "sandbox proxy bridge could not configure its listener")?;
+        let address = listener
+            .local_addr()
+            .map_err(|_| "sandbox proxy bridge address is unavailable")?;
+        let stopping = Arc::new(AtomicBool::new(false));
+        let thread_stopping = Arc::clone(&stopping);
+        let task = thread::Builder::new()
+            .name("tagteam-proxy-bridge".into())
+            .spawn(move || {
+                while !thread_stopping.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((client, _)) if !thread_stopping.load(Ordering::Acquire) => {
+                            let socket = socket.clone();
+                            let _ = thread::Builder::new()
+                                .name("tagteam-proxy-bridge-client".into())
+                                .spawn(move || relay_proxy_stream(client, socket));
+                        }
+                        Ok((client, _)) => drop(client),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(|_| "sandbox proxy bridge could not start")?;
+        Ok(Self {
+            address,
+            stopping,
+            task: Some(task),
+        })
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ProxyBridge {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        let _ = TcpStream::connect_timeout(&self.address, Duration::from_millis(100));
+        if let Some(task) = self.task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn relay_proxy_stream(mut client: TcpStream, socket: PathBuf) {
+    let Ok(mut upstream) = UnixStream::connect(socket) else {
+        return;
+    };
+    let Ok(mut upstream_reader) = upstream.try_clone() else {
+        return;
+    };
+    let Ok(mut client_writer) = client.try_clone() else {
+        return;
+    };
+    let writer = thread::spawn(move || {
+        let _ = io::copy(&mut upstream_reader, &mut client_writer);
+        let _ = client_writer.shutdown(Shutdown::Write);
+    });
+    let _ = io::copy(&mut client, &mut upstream);
+    let _ = upstream.shutdown(Shutdown::Write);
+    let _ = writer.join();
+}
+
+fn normalize_proxy_url(value: &str) -> Result<String, String> {
+    let address = value
+        .strip_prefix("http://")
+        .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+        .filter(|address| address.ip().is_loopback() && address.port() != 0)
+        .ok_or("sandbox proxy environment is invalid")?;
+    Ok(format!("http://{address}"))
+}
+
+fn trusted_proxy_url() -> Result<String, String> {
+    let value = std::env::var("HTTP_PROXY").map_err(|_| "sandbox proxy environment is missing")?;
+    #[cfg(target_os = "linux")]
+    {
+        if value != "http://unix:/run/proxy.sock" {
+            return Err("sandbox Unix proxy environment is invalid".into());
+        }
+        Ok(format!("http://127.0.0.1:{PROXY_BRIDGE_PORT}"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        normalize_proxy_url(&value)
+    }
+}
+
+fn apply_proxy_environment(
+    command: &mut Command,
+    env: &std::collections::BTreeMap<String, String>,
+    url: &str,
+) {
+    for (key, value) in env {
+        if !PROXY_ENV_NAMES
+            .iter()
+            .any(|reserved| key.eq_ignore_ascii_case(reserved))
+        {
+            command.env(key, value);
+        }
+    }
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env(key, url);
+    }
+    for key in ["NO_PROXY", "no_proxy"] {
+        command.env(key, "");
+    }
+}
+
 /// Reads one bounded, base64-encoded command request from stdin and executes it.
 pub fn run_exec_encoded_from_reader(reader: impl Read) -> Result<i32, String> {
     let encoded = read_encoded_request(reader)?;
@@ -116,6 +280,28 @@ pub fn run_exec_encoded(encoded: &str) -> Result<i32, String> {
     {
         return Err("invalid command environment".into());
     }
+    let input = STANDARD
+        .decode(request.stdin)
+        .map_err(|_| "invalid command input")?;
+    let trusted_proxy_url = trusted_proxy_url()?;
+    #[cfg(target_os = "linux")]
+    let _proxy_bridge = {
+        let socket = std::env::var_os("TAGTEAM_PROXY_SOCKET")
+            .filter(|socket| socket == "/run/proxy.sock")
+            .ok_or("sandbox proxy socket is unavailable")?;
+        let address = trusted_proxy_url
+            .strip_prefix("http://")
+            .and_then(|value| value.parse::<SocketAddr>().ok())
+            .ok_or("sandbox proxy environment is invalid")?;
+        if address.port() != PROXY_BRIDGE_PORT {
+            return Err("sandbox proxy bridge port does not match its policy".into());
+        }
+        let bridge = ProxyBridge::start(PathBuf::from(socket), address)?;
+        if bridge.url() != trusted_proxy_url {
+            return Err("sandbox proxy bridge endpoint does not match its policy".into());
+        }
+        bridge
+    };
     let mut command = Command::new(&request.argv[0]);
     command
         .args(&request.argv[1..])
@@ -127,13 +313,10 @@ pub fn run_exec_encoded(encoded: &str) -> Result<i32, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.envs(request.env);
+    apply_proxy_environment(&mut command, &request.env, &trusted_proxy_url);
     let mut child = command
         .spawn()
         .map_err(|_| "command could not be started")?;
-    let input = STANDARD
-        .decode(request.stdin)
-        .map_err(|_| "invalid command input")?;
     let mut stdin = child.stdin.take().ok_or("command input unavailable")?;
     let writer = std::thread::spawn(move || stdin.write_all(&input));
     let stdout = child.stdout.take().ok_or("command output unavailable")?;
@@ -596,6 +779,92 @@ pub fn encode_request(request: &FsRequest) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_proxy_environment_wins_over_all_caller_proxy_values() {
+        let caller = std::collections::BTreeMap::from([
+            ("hTtP_PrOxY".into(), "http://outside.invalid:8080".into()),
+            ("NO_PROXY".into(), "*".into()),
+            ("no_proxy".into(), "localhost".into()),
+            ("BUILD_FLAG".into(), "kept".into()),
+        ]);
+        let mut command = Command::new("true");
+        command.env_clear();
+        apply_proxy_environment(&mut command, &caller, "http://127.0.0.1:38417");
+        let values = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((key.to_str()?.to_owned(), value?.to_str()?.to_owned()))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert_eq!(
+                values.get(key).map(String::as_str),
+                Some("http://127.0.0.1:38417")
+            );
+        }
+        assert_eq!(values.get("NO_PROXY").map(String::as_str), Some(""));
+        assert_eq!(values.get("no_proxy").map(String::as_str), Some(""));
+        assert_eq!(values.get("BUILD_FLAG").map(String::as_str), Some("kept"));
+    }
+
+    #[test]
+    fn proxy_url_must_resolve_to_a_nonzero_loopback_endpoint() {
+        assert_eq!(
+            normalize_proxy_url("http://127.0.0.1:38417").expect("valid loopback proxy"),
+            "http://127.0.0.1:38417"
+        );
+        for value in [
+            "http://8.8.8.8:8080",
+            "http://localhost:8080",
+            "http://127.0.0.1:0",
+            "http://user@127.0.0.1:8080",
+            "http://127.0.0.1:8080/path",
+        ] {
+            assert!(normalize_proxy_url(value).is_err(), "{value}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn loopback_bridge_relays_to_unix_proxy_and_stops_cleanly() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let socket = directory.path().join("proxy.sock");
+        let server = UnixListener::bind(&socket).expect("fixture socket binds");
+        let server_task = thread::spawn(move || {
+            let (mut stream, _) = server.accept().expect("bridge connects");
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).expect("request arrives");
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").expect("response sends");
+        });
+        let bridge = ProxyBridge::start(
+            socket,
+            "127.0.0.1:0".parse().expect("loopback endpoint parses"),
+        )
+        .expect("bridge starts");
+        let bridge_address = bridge.address;
+        let mut client = TcpStream::connect(bridge.address).expect("TCP client connects");
+        client.write_all(b"ping").expect("request sends");
+        let mut response = [0; 4];
+        client
+            .read_exact(&mut response)
+            .expect("proxy response arrives");
+        assert_eq!(&response, b"pong");
+        drop(client);
+        drop(bridge);
+        server_task.join().expect("fixture server exits");
+        assert!(TcpListener::bind(bridge_address).is_ok());
+    }
 
     fn git(root: &Path, args: &[&str]) -> Vec<u8> {
         let output = Command::new("git")

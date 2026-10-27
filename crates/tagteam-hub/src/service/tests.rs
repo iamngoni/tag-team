@@ -119,6 +119,8 @@ fn active_node() -> Node {
             disk_free: Bytes::gib(50),
             running: 0,
             on_battery: false,
+            battery_known: true,
+            local_minute_of_day: Some(10 * 60),
             thermal: Thermal::Nominal,
         },
         toolchains: Vec::new(),
@@ -241,6 +243,89 @@ async fn dispatch_without_nodes_is_queued_with_an_explicit_reason() {
     let task = load_subtask(&service, reply.subtasks[0].0).await;
     assert_eq!(task.state, SubtaskState::Queued);
     assert_eq!(task.node, None);
+}
+
+#[tokio::test]
+async fn account_capacity_is_enforced_across_dispatches() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (repository, _) = init_repository(&directory);
+    let mut config = config(&directory);
+    config.max_concurrent_per_account = 1;
+    let ca = Arc::new(HubCa::generate().expect("CA"));
+    let service = HubService::open(&config, ca).await.expect("service");
+    let mut node = active_node();
+    node.policy.max_subtasks = 1;
+    let node_id = node.id;
+    service
+        .journal(move |journal| journal.create_node(&node))
+        .await
+        .expect("node");
+
+    let first = dispatch(
+        &service,
+        &repository,
+        vec![spec(&repository, "First worker", false)],
+    )
+    .await;
+    assert_eq!(first.subtasks[0].1, Placement::Placed(node_id));
+
+    let second = dispatch(
+        &service,
+        &repository,
+        vec![spec(&repository, "Second worker", false)],
+    )
+    .await;
+    assert_eq!(
+        second.subtasks[0].1,
+        Placement::Queued(vec![NoFitReason::AccountAtCapacity])
+    );
+
+    let third = dispatch(
+        &service,
+        &repository,
+        vec![spec(&repository, "Third worker", false)],
+    )
+    .await;
+    assert_eq!(
+        third.subtasks[0].1,
+        Placement::Queued(vec![NoFitReason::AccountAtCapacity])
+    );
+}
+
+#[tokio::test]
+async fn node_subtask_limit_is_enforced_across_dispatches() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (repository, _) = init_repository(&directory);
+    let mut config = config(&directory);
+    config.max_concurrent_per_account = 4;
+    let ca = Arc::new(HubCa::generate().expect("CA"));
+    let service = HubService::open(&config, ca).await.expect("service");
+    let mut node = active_node();
+    node.policy.max_subtasks = 1;
+    let node_id = node.id;
+    service
+        .journal(move |journal| journal.create_node(&node))
+        .await
+        .expect("node");
+
+    let first = dispatch(
+        &service,
+        &repository,
+        vec![spec(&repository, "Node slot", false)],
+    )
+    .await;
+    assert_eq!(first.subtasks[0].1, Placement::Placed(node_id));
+
+    let second = dispatch(
+        &service,
+        &repository,
+        vec![spec(&repository, "No node slot", false)],
+    )
+    .await;
+    assert_eq!(
+        second.subtasks[0].1,
+        Placement::Queued(vec![NoFitReason::NodeAtCapacity { node: node_id }])
+    );
 }
 
 #[tokio::test]

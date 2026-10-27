@@ -27,7 +27,7 @@ use tagteam_core::{
     runner_proto::{
         HubToRunnerMessage, RemoteCall, RunnerToHubMessage, mcp_timeout_ms, wall_clock_ms,
     },
-    schedule::{Placement, place},
+    schedule::{NoFitReason, Placement, place},
     state::SubtaskInput,
 };
 use tagteam_git::Repository;
@@ -100,6 +100,8 @@ pub struct HubService {
     node_observations: Arc<AsyncMutex<HashMap<tagteam_core::NodeId, NodeObservation>>>,
     drivers: Arc<AsyncMutex<HashSet<SubtaskId>>>,
     landing: Arc<AsyncMutex<()>>,
+    placement: Arc<AsyncMutex<()>>,
+    max_concurrent_per_account: usize,
 }
 
 impl HubService {
@@ -146,6 +148,8 @@ impl HubService {
             node_observations: Arc::new(AsyncMutex::new(node_observations)),
             drivers: Arc::new(AsyncMutex::new(HashSet::new())),
             landing: Arc::new(AsyncMutex::new(())),
+            placement: Arc::new(AsyncMutex::new(())),
+            max_concurrent_per_account: config.max_concurrent_per_account,
         })
     }
 
@@ -490,7 +494,7 @@ impl HubService {
             }
         }
 
-        self.schedule_pending_work(now).await
+        self.schedule_pending_work().await
     }
 
     /// Moves unfinished work off a node and cancels local and remote activity
@@ -535,20 +539,15 @@ impl HubService {
 
     /// Attempts to place queued/reassigning work and restarts any durable
     /// Preparing or Running task whose in-memory driver disappeared.
-    async fn schedule_pending_work(&self, now: Timestamp) -> Result<(), ServiceError> {
+    async fn schedule_pending_work(&self) -> Result<(), ServiceError> {
+        let _placement = self.placement.lock().await;
         let mut nodes = self.journal(|journal| journal.list_nodes()).await?;
         let tasks = self.journal(|journal| journal.list_subtasks()).await?;
-        for node in &mut nodes {
-            let running = tasks
-                .iter()
-                .filter(|task| {
-                    task.node == Some(node.id)
-                        && !task.state.is_terminal()
-                        && !matches!(task.state, SubtaskState::Reassigning { .. })
-                })
-                .count();
-            node.capacity.running = u16::try_from(running).unwrap_or(u16::MAX);
-        }
+        refresh_node_running(&mut nodes, &tasks);
+        let mut account_used = tasks
+            .iter()
+            .filter(|task| task.state.occupies_worker_slot())
+            .count();
         let online_nodes = nodes
             .iter()
             .filter(|node| self.nodes.is_online(node.id))
@@ -558,11 +557,15 @@ impl HubService {
         for task in &tasks {
             match task.state {
                 SubtaskState::Queued | SubtaskState::Reassigning { .. } => {
+                    if account_used >= self.max_concurrent_per_account {
+                        continue;
+                    }
                     let Placement::Placed(node) =
-                        place(&task.spec, &task.repo_id, &online_nodes, &[], now)
+                        place(&task.spec, &task.repo_id, &online_nodes, &[])
                     else {
                         continue;
                     };
+                    account_used = account_used.saturating_add(1);
                     let id = task.id;
                     self.journal(move |journal| {
                         journal
@@ -790,7 +793,14 @@ impl HubService {
         self.journal(move |journal| journal.create_dispatch(&dispatch))
             .await?;
 
+        let _placement = self.placement.lock().await;
         let mut nodes = self.journal(|journal| journal.list_nodes()).await?;
+        let existing_tasks = self.journal(|journal| journal.list_subtasks()).await?;
+        refresh_node_running(&mut nodes, &existing_tasks);
+        let mut account_used = existing_tasks
+            .iter()
+            .filter(|task| task.state.occupies_worker_slot())
+            .count();
         let mut siblings = Vec::new();
         let mut placements = Vec::with_capacity(subtasks.len());
         let mut excluded_paths = HashSet::new();
@@ -825,9 +835,14 @@ impl HubService {
                 .await?;
 
             let sibling_scope = if spread { siblings.as_slice() } else { &[] };
-            let placement = place(&spec, &snapshot.repo_id, &nodes, sibling_scope, created);
+            let placement = if account_used >= self.max_concurrent_per_account {
+                Placement::Queued(vec![NoFitReason::AccountAtCapacity])
+            } else {
+                place(&spec, &snapshot.repo_id, &nodes, sibling_scope)
+            };
             let transition = match &placement {
                 Placement::Placed(node) => {
+                    account_used = account_used.saturating_add(1);
                     siblings.push(*node);
                     if let Some(selected) = nodes.iter_mut().find(|node_view| node_view.id == *node)
                     {
@@ -2306,6 +2321,19 @@ fn ensure_prepare_succeeded(result: &Proto::CommandResult) -> Result<(), Service
         None => Err(ServiceError::Invalid(
             "node returned no result for workspace preparation".into(),
         )),
+    }
+}
+
+/// Replaces heartbeat's process-local running count with the durable account of
+/// work that still holds a node slot. Heartbeats cannot know about work queued
+/// between process restarts; the scheduler must use durable state instead.
+fn refresh_node_running(nodes: &mut [tagteam_core::Node], tasks: &[Subtask]) {
+    for node in nodes {
+        let running = tasks
+            .iter()
+            .filter(|task| task.node == Some(node.id) && task.state.occupies_worker_slot())
+            .count();
+        node.capacity.running = u16::try_from(running).unwrap_or(u16::MAX);
     }
 }
 

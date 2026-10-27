@@ -104,7 +104,11 @@ async fn main() -> anyhow::Result<()> {
             println!("local reconnect disabled; node identity retained");
         }
         Command::Probe => {
-            let heartbeat = HostHeartbeat::with_policy(config.policy()).heartbeat();
+            let heartbeat = HostHeartbeat::with_policy_and_workspace(
+                config.policy(),
+                config.data_dir.join("workspaces"),
+            )
+            .heartbeat();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&heartbeat_json(heartbeat))?
@@ -168,7 +172,11 @@ async fn run(config: tagteam_node::config::NodeConfig) -> anyhow::Result<()> {
     let runner = CommandRunner::new(&config.data_dir, journal.clone(), bundles);
     let policy = config.policy();
     let runner = runner.with_policy(policy.clone(), config.allowed_repo_ids.clone());
-    let session = NodeSession::new(identity, HostHeartbeat::with_policy(policy.clone()))
+    let heartbeat = HostHeartbeat::with_policy_and_workspace(
+        policy.clone(),
+        config.data_dir.join("workspaces"),
+    );
+    let session = NodeSession::new(identity, heartbeat)
         .pending_source(journal)
         .policy(policy)
         .start();

@@ -100,6 +100,8 @@ fn heartbeat_updates_live_fields_without_changing_state_trust_or_policy() {
     let capacity = Capacity {
         cores_total: 8,
         cores_free: 3.5,
+        battery_known: true,
+        local_minute_of_day: Some(22 * 60 + 15),
         thermal: Thermal::Fair,
         ..Capacity::default()
     };
@@ -625,6 +627,8 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
                     disk_free: 4096,
                     running: 2,
                     on_battery: false,
+                    battery_known: true,
+                    local_minute_of_day: Some(10 * 60),
                     thermal: "fair".into(),
                 }),
                 presence: proto::OwnerPresence::Away as i32,

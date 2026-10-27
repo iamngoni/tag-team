@@ -28,6 +28,8 @@ impl HeartbeatSource for StaticHeartbeat {
                 disk_free: 8192,
                 running: 0,
                 on_battery: false,
+                battery_known: true,
+                local_minute_of_day: Some(10 * 60),
                 thermal: "fair".into(),
             }),
             presence: tagteam_proto::v1::OwnerPresence::Away as i32,

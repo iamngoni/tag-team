@@ -3,11 +3,13 @@
 //! The supervisor persists receipts and launches every workspace operation through the
 //! sandbox crate; helper subprocesses alone inspect or modify workspace contents.
 
+#[cfg(target_os = "linux")]
+use std::net::{IpAddr, Ipv4Addr};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     future::Future,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -18,11 +20,15 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use serde_json::Value;
 use tagteam_core::{Bytes, Limits, MAX_BLOB_BYTES, NodePolicy};
+#[cfg(target_os = "macos")]
+use tagteam_proxy::ProxyServer;
+#[cfg(target_os = "linux")]
+use tagteam_proxy::UnixProxyServer;
+use tagteam_proxy::{AllowedHost, DEFAULT_EGRESS, ProxyConfig, TcpConnector, TokioResolver};
 use tagteam_sandbox::{
     CancellationHandle, CancellationToken, JobHint, ProxyEndpoint, ResourceLimits, SandboxProfile,
     spawn_confined,
 };
-use tokio::net::UnixListener;
 
 use crate::{
     BeginCommand, CommandJournal, SessionSender,
@@ -67,6 +73,7 @@ pub struct CommandRunner {
     git_toolchain: Option<GitToolchain>,
     running: Arc<Mutex<HashMap<String, CommandCancellation>>>,
     workspace_limits: Arc<Mutex<HashMap<String, WorkspaceLimits>>>,
+    workspace_egress: Arc<Mutex<HashMap<String, Vec<AllowedHost>>>>,
     policy: NodePolicy,
     allowed_repo_ids: Option<Vec<String>>,
     execution_lock: Arc<tokio::sync::Mutex<()>>,
@@ -92,6 +99,28 @@ impl CommandCancellation {
 struct WorkspaceLimits {
     resources: ResourceLimits,
     jobs: u32,
+}
+
+const MAX_EGRESS_HOSTS: usize = 256;
+#[cfg(target_os = "linux")]
+const LINUX_PROXY_BRIDGE_PORT: u16 = 38_417;
+
+enum RunningProxy {
+    #[cfg(target_os = "macos")]
+    Tcp(ProxyServer),
+    #[cfg(target_os = "linux")]
+    Unix(UnixProxyServer),
+}
+
+impl RunningProxy {
+    async fn shutdown(self) {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Tcp(proxy) => proxy.shutdown().await,
+            #[cfg(target_os = "linux")]
+            Self::Unix(proxy) => proxy.shutdown().await,
+        }
+    }
 }
 
 /// The active macOS developer toolchain used to avoid the Xcode command shim.
@@ -136,6 +165,7 @@ impl CommandRunner {
             git_toolchain: host_git_toolchain(),
             running: Arc::default(),
             workspace_limits: Arc::default(),
+            workspace_egress: Arc::default(),
             policy: NodePolicy::default(),
             allowed_repo_ids: None,
             execution_lock: Arc::default(),
@@ -332,6 +362,7 @@ impl CommandRunner {
         match op {
             Proto::command::Op::Prepare(prepare) => {
                 self.check_prepare_policy(prepare)?;
+                let egress_hosts = self.allowed_egress_hosts(prepare)?;
                 let reference = prepare
                     .bundle
                     .as_ref()
@@ -351,6 +382,10 @@ impl CommandRunner {
                     )
                     .await?;
                 check_response(response)?;
+                self.workspace_egress
+                    .lock()
+                    .map_err(|_| "workspace egress policy is unavailable")?
+                    .insert(command.workspace.clone(), egress_hosts);
                 if let Some(profile) = &prepare.profile {
                     let resources = ResourceLimits::new(
                         Bytes(profile.memory),
@@ -399,7 +434,7 @@ impl CommandRunner {
                     )
                 );
                 let limits = limits_for(exec.timeout_ms, exec.output_cap);
-                let (outcome, _listener) = self
+                let outcome = self
                     .spawn(
                         &workspace,
                         command_line,
@@ -694,6 +729,14 @@ impl CommandRunner {
             }
             Proto::command::Op::Cleanup(cleanup) => {
                 let workspace = self.workspace(&command.workspace)?;
+                self.workspace_egress
+                    .lock()
+                    .map_err(|_| "workspace egress policy is unavailable")?
+                    .remove(&command.workspace);
+                self.workspace_limits
+                    .lock()
+                    .map_err(|_| "workspace limits are unavailable")?
+                    .remove(&command.workspace);
                 if fs::symlink_metadata(&workspace).is_ok() {
                     let data_dir = self
                         .data_dir
@@ -720,6 +763,7 @@ impl CommandRunner {
     }
 
     fn check_prepare_policy(&self, prepare: &Proto::PrepareWorkspace) -> Result<(), String> {
+        self.allowed_egress_hosts(prepare)?;
         if let Some(allowed) = &self.allowed_repo_ids {
             let repo = prepare.repo_id.to_ascii_lowercase();
             if repo.is_empty() || !allowed.iter().any(|candidate| candidate == &repo) {
@@ -750,6 +794,23 @@ impl CommandRunner {
             }
         }
         Ok(())
+    }
+
+    fn allowed_egress_hosts(
+        &self,
+        prepare: &Proto::PrepareWorkspace,
+    ) -> Result<Vec<AllowedHost>, String> {
+        let profile_hosts = prepare
+            .profile
+            .as_ref()
+            .map(|profile| profile.egress.as_slice())
+            .unwrap_or_default();
+        self.normalized_egress_hosts(
+            profile_hosts
+                .iter()
+                .map(String::as_str)
+                .chain(self.policy.extra_hosts.iter().map(String::as_str)),
+        )
     }
 
     fn workspace(&self, id: &str) -> Result<PathBuf, String> {
@@ -812,7 +873,7 @@ impl CommandRunner {
             .and_then(|toolchain| toolchain.executable.to_str())
             .map(|path| vec![("TAGTEAM_GIT_BIN".into(), path.to_owned())])
             .unwrap_or_default();
-        let (outcome, _listener) = self
+        let outcome = self
             .spawn(
                 workspace,
                 command,
@@ -854,24 +915,28 @@ impl CommandRunner {
         limits: Limits,
         environment: Vec<(String, String)>,
         stdin: Vec<u8>,
-    ) -> Result<(tagteam_sandbox::SandboxOutcome, UnixListener), String> {
+    ) -> Result<tagteam_sandbox::SandboxOutcome, String> {
         self.ensure_workspace(workspace)?;
         let executable = self
             .executable
             .as_ref()
             .ok_or("node executable unavailable")?;
         let socket = workspace.join("tmp/proxy.sock");
-        if fs::symlink_metadata(&socket).is_ok() {
-            fs::remove_file(&socket).map_err(|_| "sandbox proxy socket is unavailable")?;
-        }
-        let listener =
-            UnixListener::bind(&socket).map_err(|_| "sandbox proxy socket is unavailable")?;
-        let proxy = ProxyEndpoint::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1), socket)
-            .map_err(|_| "sandbox proxy profile is invalid")?;
         let id = workspace
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or_default();
+        let allowed_hosts = self
+            .workspace_egress
+            .lock()
+            .map_err(|_| "workspace egress policy is unavailable")?
+            .get(id)
+            .cloned()
+            .unwrap_or(self.local_egress_hosts()?);
+        let config = ProxyConfig::new(allowed_hosts);
+        let (running_proxy, address) = start_workspace_proxy(&socket, config).await?;
+        let proxy =
+            ProxyEndpoint::new(address, socket).map_err(|_| "sandbox proxy profile is invalid")?;
         let configured = self
             .workspace_limits
             .lock()
@@ -914,10 +979,78 @@ impl CommandRunner {
                 .with_environment(key, value)
                 .map_err(|_| "command environment is invalid")?;
         }
-        let result = spawn_confined(profile, token)
-            .await
-            .map_err(|_| "confined command could not run")?;
-        Ok((result, listener))
+        #[cfg(target_os = "linux")]
+        {
+            profile = profile
+                .with_environment("TAGTEAM_PROXY_SOCKET".into(), "/run/proxy.sock".into())
+                .map_err(|_| "proxy environment is invalid")?;
+        }
+        let result = spawn_confined(profile, token).await;
+        running_proxy.shutdown().await;
+        result.map_err(|_| "confined command could not run".to_owned())
+    }
+
+    fn local_egress_hosts(&self) -> Result<Vec<AllowedHost>, String> {
+        self.normalized_egress_hosts(self.policy.extra_hosts.iter().map(String::as_str))
+    }
+
+    /// The product contract always permits the package registries; a task and
+    /// the node owner may only add exact hostnames. Starting from the defaults
+    /// here keeps a missing preparation profile from silently disabling package
+    /// installs while still keeping every request behind the proxy allow-list.
+    fn normalized_egress_hosts<'a>(
+        &self,
+        additional: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<AllowedHost>, String> {
+        let mut hosts = Vec::new();
+        let mut seen = HashSet::new();
+        for raw_host in DEFAULT_EGRESS.iter().copied().chain(additional) {
+            if raw_host.len() > 253 || raw_host.trim() != raw_host {
+                return Err("egress host is malformed".into());
+            }
+            let host = AllowedHost::new(raw_host)
+                .map_err(|_| format!("egress host is invalid: {raw_host}"))?;
+            if seen.insert(host.as_str().to_owned()) {
+                if hosts.len() >= MAX_EGRESS_HOSTS {
+                    return Err("egress host list exceeds the node limit".into());
+                }
+                hosts.push(host);
+            }
+        }
+        Ok(hosts)
+    }
+}
+
+async fn start_workspace_proxy(
+    _socket: &Path,
+    config: ProxyConfig,
+) -> Result<(RunningProxy, SocketAddr), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let (proxy, _outcomes) = UnixProxyServer::start_unix(
+            _socket,
+            config,
+            Arc::new(TokioResolver),
+            Arc::new(TcpConnector),
+        )
+        .await
+        .map_err(|error| format!("sandbox egress proxy could not start: {error}"))?;
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), LINUX_PROXY_BRIDGE_PORT);
+        Ok((RunningProxy::Unix(proxy), address))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (proxy, _outcomes) =
+            ProxyServer::start(config, Arc::new(TokioResolver), Arc::new(TcpConnector))
+                .await
+                .map_err(|error| format!("sandbox egress proxy could not start: {error}"))?;
+        let address = proxy.addr();
+        Ok((RunningProxy::Tcp(proxy), address))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (_socket, config);
+        Err("sandbox egress proxy is unsupported on this platform".into())
     }
 }
 
@@ -1080,6 +1213,61 @@ mod tests {
                 disk: 1024,
             }),
         }
+    }
+
+    #[test]
+    fn egress_profile_and_owner_hosts_are_normalized_exact_and_bounded() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let journal =
+            CommandJournal::open(directory.path().join("commands.json")).expect("journal opens");
+        let runner = CommandRunner::new(directory.path(), journal, NoBundleSource).with_policy(
+            NodePolicy {
+                extra_hosts: vec!["Git.Example.".into()],
+                ..NodePolicy::default()
+            },
+            None,
+        );
+        let mut prepare = prepare_request("repo", 1.0, 1024);
+        prepare.profile.as_mut().expect("profile exists").egress =
+            vec!["Crates.io".into(), "git.example".into()];
+        let hosts = runner
+            .allowed_egress_hosts(&prepare)
+            .expect("valid exact hosts normalize");
+        assert!(hosts.iter().any(|host| host.as_str() == "git.example"));
+        for default_host in DEFAULT_EGRESS {
+            assert!(hosts.iter().any(|host| host.as_str() == *default_host));
+        }
+
+        for invalid in [
+            "*.example.com",
+            "127.0.0.1",
+            "example.com:443",
+            " example.com",
+        ] {
+            prepare.profile.as_mut().expect("profile exists").egress = vec![invalid.into()];
+            assert!(runner.allowed_egress_hosts(&prepare).is_err(), "{invalid}");
+        }
+
+        prepare.profile.as_mut().expect("profile exists").egress = (0..=MAX_EGRESS_HOSTS)
+            .map(|index| format!("host{index}.example"))
+            .collect();
+        assert!(runner.allowed_egress_hosts(&prepare).is_err());
+    }
+
+    #[tokio::test]
+    async fn per_command_proxy_shutdown_removes_its_socket() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let socket = directory.path().join("proxy.sock");
+        let config = ProxyConfig::new(vec![AllowedHost::new("allowed.example").expect("host")]);
+        let (server, address) = start_workspace_proxy(&socket, config)
+            .await
+            .expect("real egress proxy starts");
+        assert!(address.ip().is_loopback());
+        #[cfg(target_os = "linux")]
+        assert!(fs::symlink_metadata(&socket).is_ok());
+        server.shutdown().await;
+        #[cfg(target_os = "linux")]
+        assert!(!socket.exists());
     }
 
     #[test]
