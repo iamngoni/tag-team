@@ -1128,13 +1128,17 @@ fn os_args<const N: usize>(values: [&str; N]) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProxyEndpoint, ResourceLimitKind, ResourceLimits, ResourceUsage, SandboxProfile,
-        build_seatbelt_profile, evaluate_resource_limits,
+        CancellationToken, JobHint, MAX_ENVIRONMENT_ENTRIES, NiceHint, OutputCapture,
+        ProxyEndpoint, ResourceLimitKind, ResourceLimits, ResourceUsage, SandboxProfile, Stream,
+        build_linux_launch_plan, build_seatbelt_profile, evaluate_resource_limits, exit_fields,
+        sbpl_string, workspace_size,
     };
     use std::{
         fs,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         num::NonZeroU32,
+        os::unix::{ffi::OsStrExt, fs::symlink, net::UnixListener},
+        path::PathBuf,
         time::Duration,
     };
     use tagteam_core::{Bytes, Limits};
@@ -1243,5 +1247,321 @@ mod tests {
             assert_eq!(network_rules, [expected_rule]);
             assert!(!policy.contains("remote ip \"localhost:18765\""));
         }
+    }
+
+    #[test]
+    fn public_constructors_and_builder_hints_validate_input() {
+        let processes = NonZeroU32::new(2).expect("nonzero process limit");
+        assert!(ResourceLimits::new(Bytes(1), processes, Bytes(1), Duration::ZERO).is_err());
+        let resources =
+            ResourceLimits::new(Bytes(10), processes, Bytes(20), Duration::from_millis(10))
+                .expect("valid resource limits");
+        assert_eq!(resources.memory, Bytes(10));
+
+        assert!(NiceHint::new(20).is_err());
+        let nice = NiceHint::new(19).expect("maximum nice hint");
+        assert_eq!(nice.0, 19);
+        let jobs = JobHint::new(NonZeroU32::new(1).expect("one job"));
+
+        let workspace = tempdir().expect("temporary workspace");
+        for directory in ["repo", "home", "tmp"] {
+            fs::create_dir(workspace.path().join(directory)).expect("workspace directory");
+        }
+        let proxy = ProxyEndpoint::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_765),
+            workspace.path().join("tmp/proxy.sock"),
+        )
+        .expect("proxy endpoint");
+        let profile = SandboxProfile::new(
+            workspace.path(),
+            "true",
+            proxy,
+            Limits::default(),
+            resources,
+        )
+        .expect("sandbox profile")
+        .with_nice_hint(nice)
+        .with_job_hint(jobs);
+        assert_eq!(profile.nice_hint.0, 19);
+        assert_eq!(profile.job_hint.0.get(), 1);
+    }
+
+    #[test]
+    fn invalid_workspace_and_command_inputs_are_rejected() {
+        let workspace = tempdir().expect("temporary workspace");
+        for directory in ["repo", "home", "tmp"] {
+            fs::create_dir(workspace.path().join(directory)).expect("workspace directory");
+        }
+        let proxy = ProxyEndpoint::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_765),
+            workspace.path().join("tmp/proxy.sock"),
+        )
+        .expect("proxy endpoint");
+        let resources = limits();
+        assert!(
+            SandboxProfile::new(
+                "relative",
+                "true",
+                proxy.clone(),
+                Limits::default(),
+                resources.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            SandboxProfile::new(
+                workspace.path().join(".."),
+                "true",
+                proxy.clone(),
+                Limits::default(),
+                resources.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            SandboxProfile::new(
+                workspace.path().join("missing"),
+                "true",
+                proxy.clone(),
+                Limits::default(),
+                resources.clone(),
+            )
+            .is_err()
+        );
+        let link = workspace.path().join("linked-workspace");
+        symlink(workspace.path(), &link).expect("workspace symlink");
+        assert!(
+            SandboxProfile::new(
+                &link,
+                "true",
+                proxy.clone(),
+                Limits::default(),
+                resources.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            SandboxProfile::new(
+                workspace.path(),
+                "",
+                proxy.clone(),
+                Limits::default(),
+                resources.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            SandboxProfile::new(
+                workspace.path(),
+                "true\0false",
+                proxy.clone(),
+                Limits::default(),
+                resources.clone(),
+            )
+            .is_err()
+        );
+        let no_sampling = ResourceLimits {
+            sample_interval: Duration::ZERO,
+            ..resources
+        };
+        assert!(
+            SandboxProfile::new(
+                workspace.path(),
+                "true",
+                proxy,
+                Limits::default(),
+                no_sampling,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn toolchain_and_environment_builders_enforce_their_invariants() {
+        let workspace = tempdir().expect("temporary workspace");
+        for directory in ["repo", "home", "tmp"] {
+            fs::create_dir(workspace.path().join(directory)).expect("workspace directory");
+        }
+        let toolchain = tempdir().expect("temporary toolchain");
+        let proxy = ProxyEndpoint::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_765),
+            workspace.path().join("tmp/proxy.sock"),
+        )
+        .expect("proxy endpoint");
+        let profile =
+            SandboxProfile::new(workspace.path(), "true", proxy, Limits::default(), limits())
+                .expect("profile")
+                .with_toolchain_root(toolchain.path().to_path_buf())
+                .expect("toolchain root");
+        assert!(
+            profile
+                .clone()
+                .with_toolchain_root(toolchain.path().to_path_buf())
+                .is_err()
+        );
+        let with_env = profile
+            .clone()
+            .with_environment("FOO".into(), "bar".into())
+            .expect("environment");
+        assert!(
+            with_env
+                .clone()
+                .with_environment("FOO".into(), "baz".into())
+                .is_err()
+        );
+        for key in [
+            "foo",
+            "1FOO",
+            "HOME",
+            "DYLD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "BASH_FUNC_x",
+        ] {
+            assert!(
+                profile
+                    .clone()
+                    .with_environment(key.into(), "value".into())
+                    .is_err()
+            );
+        }
+        assert!(
+            profile
+                .clone()
+                .with_environment("FOO".into(), "bad\0value".into())
+                .is_err()
+        );
+        let mut full = profile;
+        for index in 0..MAX_ENVIRONMENT_ENTRIES {
+            full = full
+                .with_environment(format!("VAR_{index}"), "value".into())
+                .expect("environment entry");
+        }
+        assert!(
+            full.with_environment("OVERFLOW".into(), "value".into())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn proxy_endpoint_rejects_unsafe_addresses_and_paths() {
+        let directory = tempdir().expect("temporary directory");
+        let absolute = directory.path().join("proxy.sock");
+        assert!(
+            ProxyEndpoint::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 18_765),
+                absolute.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            ProxyEndpoint::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                absolute.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            ProxyEndpoint::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_765),
+                PathBuf::from("relative.sock"),
+            )
+            .is_err()
+        );
+        let target = directory.path().join("target.sock");
+        fs::write(&target, b"not a socket").expect("target file");
+        symlink(&target, &absolute).expect("socket symlink");
+        assert!(
+            ProxyEndpoint::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_765),
+                absolute,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_size_counts_files_without_following_symlinks() {
+        let workspace = tempdir().expect("temporary workspace");
+        let nested = workspace.path().join("nested");
+        fs::create_dir(&nested).expect("nested directory");
+        fs::write(workspace.path().join("one"), b"12345").expect("first file");
+        fs::write(nested.join("two"), b"123").expect("second file");
+        let outside = tempdir().expect("outside directory");
+        let secret = outside.path().join("secret");
+        fs::write(&secret, vec![0_u8; 4_096]).expect("outside file");
+        symlink(&secret, workspace.path().join("link")).expect("outside symlink");
+
+        let total = workspace_size(workspace.path()).expect("workspace size");
+        assert!(total >= 8);
+        assert!(total < 4_096);
+    }
+
+    #[test]
+    fn output_capture_preserves_streams_and_head_tail_on_truncation() {
+        let mut capture = OutputCapture::new(8);
+        capture.push(Stream::Stdout, b"ab");
+        capture.push(Stream::Stderr, b"cd");
+        assert_eq!(capture.finish(), (b"ab".to_vec(), b"cd".to_vec(), false));
+
+        let mut capture = OutputCapture::new(5);
+        capture.push(Stream::Stdout, b"abcdef");
+        assert_eq!(capture.finish(), (b"abcef".to_vec(), Vec::new(), true));
+    }
+
+    #[test]
+    fn linux_launch_requires_a_live_socket_inside_the_workspace() {
+        let workspace = tempdir().expect("temporary workspace");
+        for directory in ["repo", "home", "tmp"] {
+            fs::create_dir(workspace.path().join(directory)).expect("workspace directory");
+        }
+        let socket = workspace.path().join("tmp/proxy.sock");
+        let proxy = ProxyEndpoint::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_765),
+            socket.clone(),
+        )
+        .expect("proxy endpoint");
+        let profile =
+            SandboxProfile::new(workspace.path(), "true", proxy, Limits::default(), limits())
+                .expect("sandbox profile");
+        assert!(build_linux_launch_plan(&profile).is_err());
+        fs::write(&socket, b"not a socket").expect("non-socket path");
+        assert!(build_linux_launch_plan(&profile).is_err());
+        fs::remove_file(&socket).expect("remove non-socket path");
+        let _listener = UnixListener::bind(&socket).expect("proxy socket");
+        assert!(build_linux_launch_plan(&profile).is_ok());
+
+        let outside = tempdir().expect("outside directory");
+        let outside_socket = outside.path().join("proxy.sock");
+        let _outside_listener = UnixListener::bind(&outside_socket).expect("outside socket");
+        let outside_proxy = ProxyEndpoint::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_765),
+            outside_socket,
+        )
+        .expect("outside proxy endpoint");
+        let outside_profile = SandboxProfile::new(
+            workspace.path(),
+            "true",
+            outside_proxy,
+            Limits::default(),
+            limits(),
+        )
+        .expect("outside profile");
+        assert!(build_linux_launch_plan(&outside_profile).is_err());
+    }
+
+    #[test]
+    fn cancellation_and_sbpl_helpers_fail_closed() {
+        let (handle, token) = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        handle.cancel();
+        assert!(token.is_cancelled());
+        assert_eq!(exit_fields(None), (None, None));
+        let bytes = [0xff_u8];
+        let invalid = std::ffi::OsStr::from_bytes(&bytes);
+        assert!(sbpl_string(invalid).is_err());
+        assert_eq!(
+            sbpl_string(std::ffi::OsStr::new("a\nb")).unwrap(),
+            "\"a\\012b\""
+        );
     }
 }
