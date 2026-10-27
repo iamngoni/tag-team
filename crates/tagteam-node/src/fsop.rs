@@ -56,6 +56,10 @@ pub enum FsRequest {
     },
     Collect {
         base: String,
+        message: String,
+    },
+    Delete {
+        path: String,
     },
 }
 
@@ -526,23 +530,61 @@ fn run_request(encoded: &str) -> Result<Value, String> {
                 .to_owned();
             json!({"oid": oid})
         }
-        FsRequest::Collect { base } => {
-            let bundle_path = root.join(".tagteam-output.bundle");
-            run_git(
-                &root,
-                &[
-                    "bundle",
-                    "create",
-                    bundle_path.to_str().ok_or("invalid bundle path")?,
-                    "--all",
-                ],
-            )?;
-            let bytes = fs::read(&bundle_path).map_err(|_| "git bundle could not be read")?;
-            let _ = fs::remove_file(bundle_path);
-            json!({"base": base, "data": STANDARD.encode(bytes)})
+        FsRequest::Collect { base, message } => {
+            let (path, size) = collect_workspace(&root, &message)?;
+            json!({"base": base, "path": path, "size": size})
+        }
+        FsRequest::Delete { path } => {
+            let target = safe_path(&root, &path)?;
+            fs::remove_file(target).map_err(|_| "workspace file could not be removed")?;
+            json!({"deleted": path})
         }
     };
     Ok(result)
+}
+
+fn collect_workspace(root: &Path, message: &str) -> Result<(String, u64), String> {
+    if message.chars().count() > 512 {
+        return Err("collect commit message exceeds 512 characters".into());
+    }
+    run_git(root, &["add", "-A"])?;
+    run_git(
+        root,
+        &[
+            "-c",
+            "user.name=Tag Team Node",
+            "-c",
+            "user.email=tagteam-node@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+        ],
+    )?;
+    let path = create_bundle(root)?;
+    let size = fs::metadata(&path)
+        .map_err(|_| "git bundle could not be inspected")?
+        .len();
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| "git bundle path is invalid")?
+        .to_string_lossy()
+        .into_owned();
+    Ok((relative, size))
+}
+
+fn create_bundle(root: &Path) -> Result<PathBuf, String> {
+    let bundle_path = root.join(".tagteam-output.bundle");
+    run_git(
+        root,
+        &[
+            "bundle",
+            "create",
+            bundle_path.to_str().ok_or("invalid bundle path")?,
+            "--all",
+        ],
+    )?;
+    Ok(bundle_path)
 }
 
 /// Encodes helper requests into the single argument accepted by the hidden CLI mode.
@@ -555,12 +597,96 @@ pub fn encode_request(request: &FsRequest) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    fn git(root: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
     #[test]
     fn rejects_parent_traversal() {
         let root = tempfile::tempdir().expect("root directory");
         let canonical = root.path().canonicalize().expect("canonical root");
         assert!(safe_path(&canonical, "../outside.txt").is_err());
         assert!(safe_path(&canonical, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn collect_commits_workspace_changes_before_bundling() {
+        let root = tempfile::tempdir().expect("root directory");
+        git(root.path(), &["init", "-q"]);
+        fs::write(root.path().join("result.txt"), "collected result\n").expect("write result");
+
+        let (bundle, size) =
+            collect_workspace(root.path(), "collect result").expect("bundle created");
+        assert!(size > 0);
+        let head = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"]))
+            .expect("commit ID is UTF-8");
+        let bundle_path = root.path().join(bundle);
+        assert_eq!(
+            String::from_utf8(git(root.path(), &["log", "-1", "--format=%s"]))
+                .expect("commit subject is UTF-8")
+                .trim(),
+            "collect result"
+        );
+        let bundle_heads = git(
+            root.path(),
+            &[
+                "bundle",
+                "list-heads",
+                bundle_path.to_str().expect("UTF-8 path"),
+            ],
+        );
+        assert!(
+            String::from_utf8(bundle_heads)
+                .expect("bundle heads are UTF-8")
+                .contains(head.trim())
+        );
+        assert!(
+            bundle_path.is_file(),
+            "the bounded bundle stays in the workspace for chunked upload"
+        );
+        assert_eq!(
+            String::from_utf8(git(
+                root.path(),
+                &["status", "--porcelain", "--untracked-files=no"],
+            ))
+            .expect("status is UTF-8"),
+            ""
+        );
+    }
+
+    #[test]
+    fn collect_creates_empty_commit_when_workspace_has_no_changes() {
+        let root = tempfile::tempdir().expect("root directory");
+        git(root.path(), &["init", "-q"]);
+
+        let (bundle, _) = collect_workspace(root.path(), "collect empty result")
+            .expect("empty workspace is committed and bundled");
+        let bundle_path = root.path().join(bundle);
+        let bundle_heads = git(
+            root.path(),
+            &[
+                "bundle",
+                "list-heads",
+                bundle_path.to_str().expect("UTF-8 path"),
+            ],
+        );
+        assert!(!bundle_heads.is_empty());
+        assert_eq!(
+            String::from_utf8(git(root.path(), &["log", "-1", "--format=%s"]))
+                .expect("commit subject is UTF-8")
+                .trim(),
+            "collect empty result"
+        );
     }
 
     #[cfg(unix)]

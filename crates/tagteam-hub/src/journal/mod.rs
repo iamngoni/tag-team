@@ -810,6 +810,36 @@ impl Journal {
         Ok(())
     }
 
+    /// Appends an event without changing subtask state.
+    ///
+    /// Progress, tool observations, and runner notes are audit evidence rather
+    /// than transitions. The subtask must still exist; terminal history remains
+    /// immutable except for events that were already in flight.
+    pub fn record_event(
+        &mut self,
+        id: SubtaskId,
+        kind: EventKind,
+        at: Timestamp,
+    ) -> Result<Event, JournalError> {
+        let transaction = self.connection.transaction()?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM subtasks WHERE id=?1)",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(JournalError::NotFound(format!("subtask {id}")));
+        }
+        let seq = insert_event(&transaction, id, at, &kind)?;
+        transaction.commit()?;
+        Ok(Event {
+            seq,
+            subtask: id,
+            at,
+            kind,
+        })
+    }
+
     /// Loads the separately persisted result summary for a finished subtask.
     pub fn load_result_summary(
         &self,
@@ -876,6 +906,29 @@ impl Journal {
         Ok(())
     }
 
+    /// Marks an unfinished command as cancelled so node reconnects do not replay
+    /// it. A later real result remains storable if the node had already started.
+    pub fn cancel_command(&mut self, command_id: &str) -> Result<(), JournalError> {
+        let exists: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT result FROM commands WHERE id=?1",
+                [command_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(result) = exists else {
+            return Err(JournalError::NotFound(format!("command {command_id}")));
+        };
+        if result.is_none() {
+            self.connection.execute(
+                "UPDATE commands SET state='cancelled' WHERE id=?1 AND result IS NULL",
+                [command_id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Stores the first result for a command ID; identical retries are safe.
     pub fn store_command_result(
         &mut self,
@@ -909,7 +962,7 @@ impl Journal {
 
     /// Lists unfinished commands in stable send order for node reconnect.
     pub fn pending_commands(&self, node_id: NodeId) -> Result<Vec<Command>, JournalError> {
-        let mut statement = self.connection.prepare("SELECT id,node_id,subtask_id,op,state,result,sent_at,done_at FROM commands WHERE node_id=?1 AND result IS NULL ORDER BY sent_at,id")?;
+        let mut statement = self.connection.prepare("SELECT id,node_id,subtask_id,op,state,result,sent_at,done_at FROM commands WHERE node_id=?1 AND result IS NULL AND state!='cancelled' ORDER BY sent_at,id")?;
         let rows = statement.query_map([node_id.to_string()], read_command)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }

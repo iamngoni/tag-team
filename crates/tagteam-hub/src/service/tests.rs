@@ -404,6 +404,143 @@ fn prepare_command_requires_a_positive_done_result() {
     );
 }
 
+#[test]
+fn runner_tool_calls_map_to_bounded_node_commands() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let repository = directory.path().join("repo");
+    fs::create_dir_all(&repository).expect("repo directory");
+    let task = tagteam_core::Subtask {
+        id: SubtaskId::new(),
+        dispatch: tagteam_core::DispatchId::new(),
+        spec: spec(&repository, "Remote tools", false),
+        state: SubtaskState::Running,
+        node: Some(NodeId::new()),
+        attempt: 0,
+        base: tagteam_core::GitOid::zero(),
+        repo_id: tagteam_core::RepoId(tagteam_core::GitOid::zero()),
+        branch: "tagteam/remote-tools".into(),
+        runner_session: None,
+        created: Timestamp::now(),
+        started: None,
+        finished: None,
+        usage: tagteam_core::Usage::default(),
+    };
+
+    let bash = super::remote_command(
+        &task,
+        "call-1",
+        &tagteam_core::runner_proto::RemoteCall::Bash {
+            command: "true".into(),
+            timeout_ms: Some(u64::MAX),
+        },
+    )
+    .expect("bash maps");
+    assert!(matches!(
+        bash.op,
+        Some(tagteam_proto::v1::command::Op::Exec(ref exec))
+            if exec.argv == ["bash", "-lc", "true"]
+                && exec.timeout_ms == u32::try_from(task.spec.limits.command_timeout.as_millis()).unwrap_or(u32::MAX)
+    ));
+
+    let read = super::remote_command(
+        &task,
+        "call-2",
+        &tagteam_core::runner_proto::RemoteCall::Read {
+            path: "src/lib.rs".into(),
+            offset: Some(4),
+            limit: Some(8),
+        },
+    )
+    .expect("read maps");
+    assert!(matches!(
+        read.op,
+        Some(tagteam_proto::v1::command::Op::Read(ref read))
+            if read.files.len() == 1 && read.files[0].offset == 4 && read.files[0].limit == 8
+    ));
+
+    let write = super::remote_command(
+        &task,
+        "call-3",
+        &tagteam_core::runner_proto::RemoteCall::Write {
+            path: "result.txt".into(),
+            content: "result\n".into(),
+        },
+    )
+    .expect("write maps");
+    assert!(matches!(
+        write.op,
+        Some(tagteam_proto::v1::command::Op::Write(ref write))
+            if write.files.len() == 1 && write.files[0].data == b"result\n"
+    ));
+
+    let edit = super::remote_command(
+        &task,
+        "call-4",
+        &tagteam_core::runner_proto::RemoteCall::Edit {
+            path: "result.txt".into(),
+            old: "old".into(),
+            new: "new".into(),
+            replace_all: true,
+        },
+    )
+    .expect("edit maps");
+    assert!(matches!(
+        edit.op,
+        Some(tagteam_proto::v1::command::Op::Edit(ref edit))
+            if edit.old == "old" && edit.new == "new" && edit.replace_all
+    ));
+
+    let glob = super::remote_command(
+        &task,
+        "call-5",
+        &tagteam_core::runner_proto::RemoteCall::Glob {
+            pattern: "*.rs".into(),
+            path: Some("src".into()),
+        },
+    )
+    .expect("glob maps");
+    assert!(matches!(
+        glob.op,
+        Some(tagteam_proto::v1::command::Op::Glob(ref glob))
+            if glob.pattern == "*.rs" && glob.cwd == "src"
+    ));
+
+    let grep = super::remote_command(
+        &task,
+        "call-6",
+        &tagteam_core::runner_proto::RemoteCall::Grep {
+            pattern: "needle".into(),
+            path: Some("src".into()),
+            glob: Some("*.rs".into()),
+            ignore_case: true,
+            context: Some(u32::MAX),
+            limit: Some(u32::MAX),
+        },
+    )
+    .expect("grep maps");
+    assert!(matches!(
+        grep.op,
+        Some(tagteam_proto::v1::command::Op::Grep(ref grep))
+            if grep.path == "src" && grep.context == 100 && grep.limit == 10_000
+    ));
+    assert!(
+        super::remote_command(
+            &task,
+            "call-7",
+            &tagteam_core::runner_proto::RemoteCall::Finish {
+                outcome: tagteam_core::Outcome::Completed,
+                summary: "done".into(),
+                assumptions: Vec::new(),
+                checks: Vec::new(),
+            },
+        )
+        .is_err()
+    );
+    assert!(super::allowed_runner_tool("mcp__tagteam__Bash"));
+    assert!(!super::allowed_runner_tool("mcp__tagteam__Agent"));
+    assert!(super::runner_system_append(&task).contains("cargo test"));
+}
+
 #[tokio::test]
 async fn dispatch_reports_the_exact_missing_toolchain() {
     let directory = tempfile::tempdir().expect("tempdir");

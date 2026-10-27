@@ -362,8 +362,16 @@ impl Repository {
     pub fn create_review_branch(&self, branch: &str, commit: &str) -> Result<GitOid> {
         validate_ref_component(branch)?;
         let reference = format!("refs/heads/{branch}");
-        self.validate_git_ref(&reference)?;
         let commit = self.resolve_commit(commit)?;
+        if let Ok(existing) = self.resolve_commit(&reference) {
+            if existing == commit {
+                return Ok(GitOid(commit));
+            }
+            return Err(GitError::InvalidInput(format!(
+                "review branch {branch:?} already points at a different commit"
+            )));
+        }
+        self.validate_git_ref(&reference)?;
         self.command_named(
             "create review branch",
             [
@@ -1026,6 +1034,34 @@ mod tests {
                 insertions: 3,
                 deletions: 2
             }
+        );
+    }
+
+    #[test]
+    fn review_branch_creation_is_idempotent_and_rejects_another_commit() {
+        let fixture = TempRepo::new("git-review-branch");
+        fixture.write("a.txt", "base\n");
+        let base = fixture.commit_all("base");
+        fixture.write("a.txt", "result\n");
+        let result = fixture.commit_all("result");
+        let repo = Repository::open(&fixture.0).expect("repo");
+        let original_head = fixture.git(["symbolic-ref", "--short", "HEAD"]).stdout;
+
+        let created = repo
+            .create_review_branch("tagteam/review-idempotent", &result)
+            .expect("create review branch");
+        assert_eq!(created, GitOid(result.clone()));
+        let repeated = repo
+            .create_review_branch("tagteam/review-idempotent", &result)
+            .expect("repeat review branch");
+        assert_eq!(repeated, created);
+        assert!(matches!(
+            repo.create_review_branch("tagteam/review-idempotent", &base),
+            Err(GitError::InvalidInput(_))
+        ));
+        assert_eq!(
+            fixture.git(["symbolic-ref", "--short", "HEAD"]).stdout,
+            original_head
         );
     }
 }

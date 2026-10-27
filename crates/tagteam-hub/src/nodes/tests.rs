@@ -900,3 +900,58 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
     assert_eq!(removed_session.code(), Code::Unauthenticated);
     let _ = shutdown.send(());
 }
+
+#[tokio::test]
+async fn cancellation_before_journal_insertion_prevents_command_dispatch() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let plane = NodePlane::new(
+        directory.path().join("journal.sqlite"),
+        directory.path().join("blobs"),
+        HubCa::generate().expect("CA"),
+    )
+    .await
+    .expect("node plane");
+    let node_id = NodeId::new();
+    let command_id = "cancel-before-command-journal-insert";
+
+    // The node is offline, so only the in-process cancellation intent can close
+    // the gap before execute_command stores its durable row.
+    assert!(matches!(
+        plane
+            .cancel_command(node_id, command_id, "subtask cancelled")
+            .await,
+        Err(super::NodePlaneError::Offline)
+    ));
+    let result = plane
+        .execute_command(
+            node_id,
+            proto::Command {
+                command_id: command_id.into(),
+                subtask_id: tagteam_core::SubtaskId::new().to_string(),
+                workspace: "workspace".into(),
+                op: Some(proto::command::Op::Cleanup(proto::Cleanup {
+                    keep_cache: false,
+                })),
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("cancelled command returns before any session lookup");
+    assert!(matches!(
+        result.result,
+        Some(proto::command_result::Result::Error(error))
+            if error.code == proto::ErrorCode::Cancelled as i32
+    ));
+    let journal = plane
+        .inner
+        .journal
+        .lock()
+        .expect("journal lock remains available");
+    assert!(
+        journal
+            .pending_commands(node_id)
+            .expect("pending commands")
+            .is_empty(),
+        "a cancellation intent must prevent a replayable command row"
+    );
+}

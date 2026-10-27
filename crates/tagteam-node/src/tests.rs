@@ -215,6 +215,20 @@ async fn authenticated_bundle_source_downloads_and_rejects_wrong_references() {
         bytes
     );
 
+    let upload_bytes = vec![0x5a; 2 * 1024 * 1024 + 17];
+    let uploaded = source
+        .store_bundle(upload_bytes.clone())
+        .await
+        .expect("bundle uploads over authenticated hub transport");
+    assert_eq!(uploaded.size, upload_bytes.len() as u64);
+    assert_eq!(
+        source
+            .bundle_bytes(&uploaded)
+            .await
+            .expect("uploaded bundle downloads and verifies"),
+        upload_bytes
+    );
+
     let mut wrong_digest = wire_reference.clone();
     wrong_digest.sha256[0] ^= 1;
     assert!(source.bundle_bytes(&wrong_digest).await.is_err());

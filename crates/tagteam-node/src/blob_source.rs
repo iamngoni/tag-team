@@ -12,6 +12,9 @@ use tonic::transport::Channel;
 
 use crate::{BundleSource, NodeIdentity, transport};
 
+/// Hub's streamed blob endpoint accepts data frames up to one mebibyte each.
+const MAX_CHUNK_BYTES: usize = 1024 * 1024;
+
 /// Fetches and verifies workspace bundles from the hub over the enrolled node identity.
 pub struct HubBundleSource {
     channel: Channel,
@@ -117,6 +120,47 @@ impl BundleSource for HubBundleSource {
                 return Err("hub bundle digest does not match the reference".to_owned());
             }
             Ok(bytes)
+        })
+    }
+
+    fn store_bundle(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<proto::BlobRef, String>> + Send + '_>> {
+        let channel = self.channel.clone();
+        Box::pin(async move {
+            if u64::try_from(bytes.len()).map_or(true, |size| size > MAX_BLOB_BYTES) {
+                return Err("bundle exceeds the allowed size".to_owned());
+            }
+            let size =
+                u64::try_from(bytes.len()).map_err(|_| "bundle size is invalid".to_owned())?;
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            let header = proto::Chunk {
+                body: Some(Body::Header(proto::BlobHeader {
+                    sha256: digest.to_vec(),
+                    size,
+                })),
+            };
+            let mut chunks = Vec::with_capacity(bytes.len().div_ceil(MAX_CHUNK_BYTES) + 1);
+            chunks.push(header);
+            chunks.extend(bytes.chunks(MAX_CHUNK_BYTES).map(|data| proto::Chunk {
+                body: Some(Body::Data(data.to_vec())),
+            }));
+            let mut client = proto::hub_client::HubClient::new(channel);
+            let reference = client
+                .put_blob(tokio_stream::iter(chunks))
+                .await
+                .map_err(|_| "hub bundle upload failed".to_owned())?
+                .into_inner();
+            let returned_digest: [u8; 32] = reference
+                .sha256
+                .as_slice()
+                .try_into()
+                .map_err(|_| "hub returned an invalid bundle reference".to_owned())?;
+            if returned_digest != digest || reference.size != size {
+                return Err("hub returned a mismatched bundle reference".to_owned());
+            }
+            Ok(reference)
         })
     }
 }

@@ -326,6 +326,43 @@ fn command_redelivery_and_result_are_idempotent() {
 }
 
 #[test]
+fn cancelled_command_is_not_replayed_but_its_result_remains_storable() {
+    let (_dir, mut journal, _dispatch, task) = setup();
+    let node = node();
+    journal.create_node(&node).expect("node");
+    let command = Command {
+        id: "cancelled-command".into(),
+        node_id: node.id,
+        subtask_id: task.id,
+        operation: serde_json::json!({"exec":"pwd"}),
+        state: "pending".into(),
+        result: None,
+        sent_at: None,
+        done_at: None,
+    };
+    journal.store_command(&command).expect("store command");
+    journal.cancel_command(&command.id).expect("cancel command");
+    assert!(
+        journal
+            .pending_commands(node.id)
+            .expect("pending")
+            .is_empty(),
+        "a cancelled command must not be replayed after reconnect"
+    );
+
+    let result = serde_json::json!({"exit_code":0});
+    journal
+        .store_command_result(&command.id, &result, Timestamp(30))
+        .expect("a result already produced by the node remains storable");
+    let loaded = journal
+        .load_command(&command.id)
+        .expect("load command")
+        .expect("stored command");
+    assert_eq!(loaded.state, "complete");
+    assert_eq!(loaded.result, Some(result));
+}
+
+#[test]
 fn subtask_idempotency_compares_every_immutable_creation_field() {
     let (_dir, mut journal, dispatch, task) = setup();
     let assigned_node = node();

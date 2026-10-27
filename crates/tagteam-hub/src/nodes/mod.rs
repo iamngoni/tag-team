@@ -1,7 +1,7 @@
 //! Tonic node control plane, durable node authentication, and blob transport.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
@@ -59,6 +59,7 @@ struct Inner {
     ca: Arc<HubCa>,
     sessions: Mutex<HashMap<NodeId, SessionHandle>>,
     pending: Mutex<HashMap<String, oneshot::Sender<proto::CommandResult>>>,
+    cancelled: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -100,6 +101,7 @@ impl NodePlane {
                 ca,
                 sessions: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
+                cancelled: Mutex::new(HashSet::new()),
             }),
         })
     }
@@ -146,18 +148,31 @@ impl NodePlane {
             done_at: None,
         };
         let journal = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let mut journal = journal
+        let stored_id = command_id.clone();
+        let cancelled = tokio::task::spawn_blocking(move || {
+            // Serialize journal insertion with cancellation intent so a cancel
+            // cannot land after this check but before the command row exists.
+            let mut cancelled = journal
+                .cancelled
+                .lock()
+                .map_err(|_| NodePlaneError::Internal)?;
+            if cancelled.remove(&stored_id) {
+                return Ok::<_, NodePlaneError>(true);
+            }
+            let mut store = journal
                 .journal
                 .lock()
                 .map_err(|_| NodePlaneError::Protocol("journal lock is unavailable".into()))?;
-            journal
+            store
                 .store_command(&journal_command)
                 .map_err(NodePlaneError::Journal)?;
-            Ok::<_, NodePlaneError>(())
+            Ok(false)
         })
         .await
         .map_err(|_| NodePlaneError::Internal)??;
+        if cancelled {
+            return Ok(cancelled_command_result(&command_id));
+        }
 
         let (completion, receiver) = oneshot::channel();
         self.inner
@@ -201,6 +216,68 @@ impl NodePlane {
                     .remove(&command_id);
                 Err(NodePlaneError::Timeout)
             }
+        }
+    }
+
+    /// Asks the node to stop one in-flight command. Cancellation is best effort:
+    /// the durable command journal still owns replay and idempotency.
+    pub async fn cancel_command(
+        &self,
+        node_id: NodeId,
+        command_id: &str,
+        reason: &str,
+    ) -> Result<(), NodePlaneError> {
+        if command_id.is_empty() {
+            return Err(NodePlaneError::Protocol(
+                "command_id must not be empty".into(),
+            ));
+        }
+        let journal = Arc::clone(&self.inner);
+        let stored_id = command_id.to_owned();
+        let outcome = tokio::task::spawn_blocking(move || {
+            // This lock pairs with execute_command's journal insertion. A
+            // command that has not reached its durable row is cancelled when
+            // its future insertion observes this intent.
+            let mut cancelled = journal
+                .cancelled
+                .lock()
+                .map_err(|_| NodePlaneError::Internal)?;
+            cancelled.insert(stored_id.clone());
+            drop(cancelled);
+            let mut store = journal
+                .journal
+                .lock()
+                .map_err(|_| NodePlaneError::Internal)?;
+            store
+                .cancel_command(&stored_id)
+                .map_err(NodePlaneError::Journal)
+        })
+        .await
+        .map_err(|_| NodePlaneError::Internal)?;
+        let outbound = {
+            let sessions = self
+                .inner
+                .sessions
+                .lock()
+                .map_err(|_| NodePlaneError::Internal)?;
+            sessions
+                .get(&node_id)
+                .map(|session| session.outbound.clone())
+                .ok_or(NodePlaneError::Offline)?
+        };
+        let sent = outbound
+            .send(Ok(HubMessage {
+                msg: Some(hub_message::Msg::Cancel(proto::Cancel {
+                    command_id: command_id.to_owned(),
+                    reason: reason.chars().take(512).collect(),
+                })),
+            }))
+            .await
+            .map_err(|_| NodePlaneError::Offline);
+        match outcome {
+            Ok(()) => sent,
+            Err(NodePlaneError::Journal(JournalError::NotFound(_))) => sent,
+            Err(error) => Err(error),
         }
     }
 
@@ -864,6 +941,17 @@ async fn record_command_result(
         let _ = completion.send(result);
     }
     Ok(())
+}
+
+fn cancelled_command_result(command_id: &str) -> proto::CommandResult {
+    proto::CommandResult {
+        command_id: command_id.to_owned(),
+        result: Some(proto::command_result::Result::Error(proto::Error {
+            code: proto::ErrorCode::Cancelled as i32,
+            message: "command was cancelled before dispatch".into(),
+            retryable: false,
+        })),
+    }
 }
 
 fn json_command(command: &proto::Command) -> Result<serde_json::Value, NodePlaneError> {

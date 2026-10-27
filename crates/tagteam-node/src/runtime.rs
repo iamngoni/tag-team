@@ -17,8 +17,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::Digest;
-use tagteam_core::{Bytes, Limits};
+use tagteam_core::{Bytes, Limits, MAX_BLOB_BYTES};
 use tagteam_sandbox::{
     CancellationHandle, CancellationToken, JobHint, ProxyEndpoint, ResourceLimits, SandboxProfile,
     spawn_confined,
@@ -38,6 +37,14 @@ pub trait BundleSource: Send + Sync + 'static {
         &self,
         reference: &Proto::BlobRef,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>>;
+
+    /// Stores a bounded result bundle and returns its verified hub reference.
+    fn store_bundle(
+        &self,
+        _bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<Proto::BlobRef, String>> + Send + '_>> {
+        Box::pin(async { Err("bundle source does not support uploads".into()) })
+    }
 }
 
 pub struct NoBundleSource;
@@ -58,9 +65,25 @@ pub struct CommandRunner {
     journal: CommandJournal,
     bundles: Arc<dyn BundleSource>,
     git_toolchain: Option<GitToolchain>,
-    running: Arc<Mutex<HashMap<String, CancellationHandle>>>,
+    running: Arc<Mutex<HashMap<String, CommandCancellation>>>,
     workspace_limits: Arc<Mutex<HashMap<String, WorkspaceLimits>>>,
     execution_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Tracks whether a command has a live cancellation token or was cancelled
+/// before its dispatch task could register one. Pending entries deliberately do
+/// not expire: a delayed replay of the command must still be suppressed.
+enum CommandCancellation {
+    Pending,
+    Active(CancellationHandle),
+}
+
+impl CommandCancellation {
+    fn request(&self) {
+        if let Self::Active(handle) = self {
+            handle.cancel();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -141,6 +164,9 @@ impl CommandRunner {
         }
         match self.journal.begin(&command.command_id) {
             Ok(BeginCommand::Completed(ack)) => {
+                if let Ok(mut running) = self.running.lock() {
+                    running.remove(&command.command_id);
+                }
                 tokio::spawn(async move {
                     let _ = sender.send_ack(ack).await;
                 });
@@ -160,16 +186,61 @@ impl CommandRunner {
                 let runner = self.clone();
                 let id = command.command_id.clone();
                 let (handle, token) = CancellationToken::new();
-                if let Ok(mut running) = self.running.lock() {
-                    running.insert(id.clone(), handle);
+                let registration = match self.running.lock() {
+                    Ok(mut running) => match running.entry(id.clone()) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(CommandCancellation::Active(handle));
+                            Ok(())
+                        }
+                        std::collections::hash_map::Entry::Occupied(entry)
+                            if matches!(entry.get(), CommandCancellation::Pending) =>
+                        {
+                            entry.remove();
+                            Err(true)
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => Err(false),
+                    },
+                    Err(_) => Err(false),
+                };
+                match registration {
+                    Ok(()) => {}
+                    Err(cancelled_before_dispatch) => {
+                        let message = if cancelled_before_dispatch {
+                            "command was cancelled before dispatch"
+                        } else {
+                            "command cancellation state is unavailable"
+                        };
+                        let result = if cancelled_before_dispatch {
+                            cancelled_result(&id)
+                        } else {
+                            error_result(&id, message)
+                        };
+                        tokio::spawn(async move {
+                            let ack = Proto::CommandAck {
+                                command_id: id.clone(),
+                                result: Some(result.clone()),
+                            };
+                            if runner.journal.complete(&ack).is_ok() {
+                                let _ = sender.send_result(result).await;
+                            }
+                        });
+                        return;
+                    }
                 }
                 tokio::spawn(async move {
                     let _execution = runner.execution_lock.lock().await;
                     let started = Instant::now();
-                    let mut result = runner
-                        .execute(&command, token)
-                        .await
-                        .unwrap_or_else(|error| error_result(&id, &error));
+                    // A cancellation that wins the registration race after the
+                    // journal receipt was written still prevents this task from
+                    // starting any workspace operation.
+                    let mut result = if token.is_cancelled() {
+                        cancelled_result(&id)
+                    } else {
+                        runner
+                            .execute(&command, token)
+                            .await
+                            .unwrap_or_else(|error| error_result(&id, &error))
+                    };
                     if let Some(Proto::command_result::Result::Exec(ref mut value)) = result.result
                     {
                         value.took_ms =
@@ -210,11 +281,25 @@ impl CommandRunner {
         }
     }
 
+    /// Requests cancellation and records it durably before a command can be
+    /// dispatched, including across a node restart.
     pub fn cancel(&self, command_id: &str) {
-        if let Ok(running) = self.running.lock()
-            && let Some(handle) = running.get(command_id)
-        {
-            handle.cancel();
+        if command_id.is_empty() {
+            return;
+        }
+        if let Ok(mut running) = self.running.lock() {
+            // Keep the in-memory registration lock while persisting the marker.
+            // Dispatch takes the same lock after its receipt lookup, so it sees
+            // either Pending or the durable Completed acknowledgement.
+            if let Err(error) = self.journal.cancel(command_id) {
+                tracing::error!(%error, "command cancellation could not be persisted");
+            }
+            match running.entry(command_id.to_owned()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.get().request(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(CommandCancellation::Pending);
+                }
+            }
         }
     }
 
@@ -493,31 +578,97 @@ impl CommandRunner {
             }
             Proto::command::Op::Collect(collect) => {
                 let workspace = self.workspace(&command.workspace)?;
+                let message = collect.message.chars().take(512).collect::<String>();
                 let response = self
                     .run_fsop(
                         &workspace,
                         FsRequest::Collect {
                             base: collect.base.clone(),
+                            message,
                         },
-                        token,
+                        token.clone(),
                         Limits::default(),
                     )
                     .await?;
-                let encoded = response
-                    .get("data")
+                let path = response
+                    .get("path")
                     .and_then(Value::as_str)
-                    .ok_or("git helper returned invalid bundle")?;
-                let bytes = STANDARD
-                    .decode(encoded)
-                    .map_err(|_| "git helper returned invalid bundle")?;
-                let digest = sha2::Sha256::digest(&bytes);
-                self.store_blob(&digest, &bytes)?;
+                    .ok_or("git helper returned an invalid bundle path")?;
+                let size = response
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .ok_or("git helper returned an invalid bundle size")?;
+                if size > tagteam_core::MAX_BLOB_BYTES {
+                    let _ = self
+                        .run_fsop(
+                            &workspace,
+                            FsRequest::Delete {
+                                path: path.to_owned(),
+                            },
+                            token.clone(),
+                            Limits::default(),
+                        )
+                        .await;
+                    return Err("result bundle exceeds the allowed size".into());
+                }
+                const READ_CHUNK: u64 = 128 * 1024;
+                let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+                let mut offset = 0;
+                while offset < size {
+                    let limit = READ_CHUNK.min(size - offset);
+                    let response = self
+                        .run_fsop(
+                            &workspace,
+                            FsRequest::Read {
+                                files: vec![FileRead {
+                                    path: path.to_owned(),
+                                    offset,
+                                    limit,
+                                }],
+                            },
+                            token.clone(),
+                            Limits::default(),
+                        )
+                        .await?;
+                    let encoded = response
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .and_then(|files| files.first())
+                        .and_then(|file| file.get("data"))
+                        .and_then(Value::as_str)
+                        .ok_or("git helper returned invalid bundle data")?;
+                    let chunk = STANDARD
+                        .decode(encoded)
+                        .map_err(|_| "git helper returned invalid bundle data")?;
+                    if chunk.is_empty() {
+                        return Err("result bundle read was empty".into());
+                    }
+                    let next = offset
+                        .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                        .ok_or("result bundle read exceeded its size")?;
+                    if next > size
+                        || u64::try_from(bytes.len().saturating_add(chunk.len()))
+                            .map_or(true, |total| total > MAX_BLOB_BYTES)
+                    {
+                        return Err("result bundle read exceeded its declared size".into());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                    offset = next;
+                }
+                let _ = self
+                    .run_fsop(
+                        &workspace,
+                        FsRequest::Delete {
+                            path: path.to_owned(),
+                        },
+                        token.clone(),
+                        Limits::default(),
+                    )
+                    .await;
+                let reference = self.bundles.store_bundle(bytes).await?;
                 Ok(Proto::CommandResult {
                     command_id: command.command_id.clone(),
-                    result: Some(Proto::command_result::Result::Collected(Proto::BlobRef {
-                        sha256: digest.to_vec(),
-                        size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                    })),
+                    result: Some(Proto::command_result::Result::Collected(reference)),
                 })
             }
             Proto::command::Op::Cleanup(cleanup) => {
@@ -582,31 +733,6 @@ impl CommandRunner {
         let workspace = self.workspace(id)?;
         self.ensure_workspace(&workspace)?;
         Ok(workspace)
-    }
-
-    fn store_blob(&self, digest: &[u8], bytes: &[u8]) -> Result<(), String> {
-        let directory = self.data_dir.join("blob-cache");
-        fs::create_dir_all(&directory).map_err(|_| "blob cache is unavailable")?;
-        let path = directory.join(data_encoding::HEXLOWER.encode(digest));
-        if !path.exists() {
-            let temp = directory.join(format!(".blob-{}.tmp", std::process::id()));
-            use std::io::Write;
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options
-                .open(&temp)
-                .map_err(|_| "blob cache is unavailable")?;
-            file.write_all(bytes)
-                .map_err(|_| "blob cache is unavailable")?;
-            file.sync_all().map_err(|_| "blob cache is unavailable")?;
-            fs::rename(temp, path).map_err(|_| "blob cache is unavailable")?;
-        }
-        Ok(())
     }
 
     async fn run_fsop(
@@ -801,6 +927,17 @@ fn error_result(command_id: &str, message: &str) -> Proto::CommandResult {
     }
 }
 
+fn cancelled_result(command_id: &str) -> Proto::CommandResult {
+    Proto::CommandResult {
+        command_id: command_id.to_owned(),
+        result: Some(Proto::command_result::Result::Error(Proto::Error {
+            code: Proto::ErrorCode::Cancelled as i32,
+            message: "command was cancelled".into(),
+            retryable: false,
+        })),
+    }
+}
+
 fn check_response(value: Value) -> Result<(), String> {
     if value.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(())
@@ -841,3 +978,148 @@ fn matches_result(command_id: &str, value: Value) -> Proto::CommandResult {
 
 #[allow(dead_code)]
 fn _assert_request_serializable<T: Serialize>(_value: &T) {}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    use super::*;
+
+    struct MarkerBundleSource {
+        marker: PathBuf,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl BundleSource for MarkerBundleSource {
+        fn bundle_bytes(
+            &self,
+            _reference: &Proto::BlobRef,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                fs::write(&self.marker, b"bundle source was reached")
+                    .map_err(|_| "marker could not be written".to_owned())?;
+                Ok(Vec::new())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_dispatch_prevents_execution_and_journals_result() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let journal =
+            CommandJournal::open(directory.path().join("commands.json")).expect("journal opens");
+        let marker = directory.path().join("executed");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = MarkerBundleSource {
+            marker: marker.clone(),
+            calls: Arc::clone(&calls),
+        };
+        let runner = CommandRunner::new(directory.path(), journal.clone(), source);
+        let id = "cancel-before-dispatch";
+
+        // Simulate a node restart after Cancel but before the command arrives.
+        // The durable marker, not an in-memory entry, must suppress execution.
+        runner.cancel(id);
+        drop(runner);
+        let runner = CommandRunner::new(
+            directory.path(),
+            journal.clone(),
+            MarkerBundleSource {
+                marker: marker.clone(),
+                calls: Arc::clone(&calls),
+            },
+        );
+        let (sender, mut messages) = SessionSender::test_pair(4);
+        runner.dispatch(
+            Proto::Command {
+                command_id: id.into(),
+                subtask_id: "cancel-before-dispatch".into(),
+                workspace: "cancel-before-dispatch".into(),
+                op: Some(Proto::command::Op::Prepare(Proto::PrepareWorkspace {
+                    bundle: Some(Proto::BlobRef {
+                        sha256: vec![0x11; 32],
+                        size: 1,
+                    }),
+                    repo_id: "repository".into(),
+                    base: "main".into(),
+                    branch: "result".into(),
+                    profile: None,
+                })),
+            },
+            sender,
+        );
+
+        let ack = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match journal.begin(id).expect("journal remains available") {
+                    BeginCommand::Completed(ack) => break ack,
+                    BeginCommand::Execute | BeginCommand::InProgress => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("cancelled command must complete its journal receipt");
+
+        let journaled = ack
+            .result
+            .as_ref()
+            .and_then(|result| result.result.as_ref());
+        assert!(
+            matches!(
+                journaled,
+                Some(Proto::command_result::Result::Error(error))
+                    if error.code == Proto::ErrorCode::Cancelled as i32
+            ),
+            "cancellation must be journaled as a terminal error: {ack:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "cancelled command must not reach execution"
+        );
+        assert!(
+            !marker.exists(),
+            "cancelled command must not run a side effect"
+        );
+
+        let sent = tokio::time::timeout(Duration::from_secs(2), messages.recv())
+            .await
+            .expect("cancelled result must be sent")
+            .expect("session channel remains open");
+        let Some(Proto::node_message::Msg::Result(result)) = sent.msg else {
+            panic!("expected a command result message");
+        };
+        assert_eq!(result.command_id, id);
+        assert!(matches!(
+            result.result,
+            Some(Proto::command_result::Result::Error(error))
+                if error.code == Proto::ErrorCode::Cancelled as i32
+        ));
+
+        for _ in 0..100 {
+            if runner
+                .running
+                .lock()
+                .expect("cancellation map remains usable")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            runner
+                .running
+                .lock()
+                .expect("cancellation map remains usable")
+                .is_empty(),
+            "terminal command must release its cancellation entry"
+        );
+    }
+}

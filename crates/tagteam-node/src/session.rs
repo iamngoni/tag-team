@@ -303,6 +303,14 @@ impl SessionSender {
         self.send_result(result).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_pair(
+        capacity: usize,
+    ) -> (Self, mpsc::Receiver<tagteam_proto::v1::NodeMessage>) {
+        let (messages, receiver) = mpsc::channel(capacity);
+        (Self { messages }, receiver)
+    }
+
     async fn send(
         &self,
         message: tagteam_proto::v1::node_message::Msg,

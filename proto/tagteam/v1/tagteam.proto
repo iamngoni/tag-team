@@ -220,7 +220,10 @@ message Grep {
   uint32 limit = 6;
 }
 message Commit { string message = 1; }
-message Collect { string base = 1; }
+message Collect {
+  string base = 1;
+  string message = 2;
+}
 message Cleanup { bool keep_cache = 1; }
 
 message Command {

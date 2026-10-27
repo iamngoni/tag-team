@@ -34,6 +34,8 @@ pub struct CommandJournal {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Entry {
     result: Option<String>,
+    #[serde(default)]
+    cancelled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,24 +84,69 @@ impl CommandJournal {
     pub fn begin(&self, command_id: &str) -> Result<BeginCommand, JournalError> {
         let mut entries = self.entries.lock().map_err(|_| JournalError::Io)?;
         if let Some(entry) = entries.get(command_id) {
-            return match &entry.result {
-                Some(encoded) => {
-                    let bytes = STANDARD
-                        .decode(encoded)
-                        .map_err(|_| JournalError::Invalid)?;
-                    Ok(BeginCommand::Completed(
-                        Ack::decode(bytes.as_slice()).map_err(|_| JournalError::Invalid)?,
-                    ))
-                }
-                None => Ok(BeginCommand::InProgress),
+            if let Some(encoded) = &entry.result {
+                let bytes = STANDARD
+                    .decode(encoded)
+                    .map_err(|_| JournalError::Invalid)?;
+                return Ok(BeginCommand::Completed(
+                    Ack::decode(bytes.as_slice()).map_err(|_| JournalError::Invalid)?,
+                ));
+            }
+            if !entry.cancelled {
+                return Ok(BeginCommand::InProgress);
+            }
+
+            // The command has arrived after a durable cancellation. Persist the
+            // terminal acknowledgement before returning it so a later replay
+            // cannot start the operation.
+            let ack = cancelled_ack(command_id);
+            let mut updated = entries.clone();
+            let Some(updated_entry) = updated.get_mut(command_id) else {
+                return Err(JournalError::Invalid);
             };
+            updated_entry.result = Some(STANDARD.encode(ack.encode_to_vec()));
+            self.persist(&updated)?;
+            *entries = updated;
+            return Ok(BeginCommand::Completed(ack));
         }
-        entries.insert(command_id.to_owned(), Entry { result: None });
+        entries.insert(
+            command_id.to_owned(),
+            Entry {
+                result: None,
+                cancelled: false,
+            },
+        );
         if let Err(error) = self.persist(&entries) {
             entries.remove(command_id);
             return Err(error);
         }
         Ok(BeginCommand::Execute)
+    }
+
+    /// Records cancellation before or during a command. The marker is durable so
+    /// a command replayed after a node restart still cannot perform side effects.
+    pub fn cancel(&self, command_id: &str) -> Result<(), JournalError> {
+        if command_id.is_empty() {
+            return Err(JournalError::Invalid);
+        }
+        let mut entries = self.entries.lock().map_err(|_| JournalError::Io)?;
+        let mut updated = entries.clone();
+        match updated.get_mut(command_id) {
+            Some(entry) if entry.result.is_some() || entry.cancelled => return Ok(()),
+            Some(entry) => entry.cancelled = true,
+            None => {
+                updated.insert(
+                    command_id.to_owned(),
+                    Entry {
+                        result: None,
+                        cancelled: true,
+                    },
+                );
+            }
+        }
+        self.persist(&updated)?;
+        *entries = updated;
+        Ok(())
     }
 
     pub fn complete(&self, ack: &Ack) -> Result<(), JournalError> {
@@ -177,6 +224,22 @@ impl CommandJournal {
     }
 }
 
+fn cancelled_ack(command_id: &str) -> Ack {
+    Ack {
+        command_id: command_id.to_owned(),
+        result: Some(tagteam_proto::v1::CommandResult {
+            command_id: command_id.to_owned(),
+            result: Some(tagteam_proto::v1::command_result::Result::Error(
+                tagteam_proto::v1::Error {
+                    code: tagteam_proto::v1::ErrorCode::Cancelled as i32,
+                    message: "command was cancelled".into(),
+                    retryable: false,
+                },
+            )),
+        }),
+    }
+}
+
 fn ensure_private_parent(path: &Path) -> Result<(), JournalError> {
     fs::create_dir_all(path).map_err(|_| JournalError::Io)?;
     let metadata = fs::symlink_metadata(path).map_err(|_| JournalError::Io)?;
@@ -242,6 +305,34 @@ mod tests {
             .expect("result persists");
         assert!(matches!(
             journal.begin("command-1"),
+            Ok(BeginCommand::Completed(_))
+        ));
+    }
+
+    #[test]
+    fn cancellation_before_dispatch_survives_store_reopen() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("commands.json");
+        let journal = CommandJournal::open(&path).expect("journal opens");
+        journal
+            .cancel("cancelled-before-dispatch")
+            .expect("cancellation persists");
+        drop(journal);
+
+        let reopened = CommandJournal::open(path).expect("journal reopens");
+        let BeginCommand::Completed(ack) = reopened
+            .begin("cancelled-before-dispatch")
+            .expect("cancelled command receipt loads")
+        else {
+            panic!("a durable cancellation must never request execution");
+        };
+        assert!(matches!(
+            ack.result.and_then(|result| result.result),
+            Some(tagteam_proto::v1::command_result::Result::Error(error))
+                if error.code == tagteam_proto::v1::ErrorCode::Cancelled as i32
+        ));
+        assert!(matches!(
+            reopened.begin("cancelled-before-dispatch"),
             Ok(BeginCommand::Completed(_))
         ));
     }

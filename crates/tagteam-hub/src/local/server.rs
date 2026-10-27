@@ -186,6 +186,7 @@ fn safe_error(error: &ServiceError) -> String {
         ServiceError::Random => "secure random generation failed".into(),
         ServiceError::Blob(_)
         | ServiceError::Preparation(_)
+        | ServiceError::Runner(_)
         | ServiceError::Worker
         | ServiceError::Internal => "internal service error".into(),
     }

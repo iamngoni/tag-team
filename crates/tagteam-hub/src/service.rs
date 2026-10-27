@@ -14,12 +14,17 @@ use std::{
 
 use data_encoding::BASE32_NOPAD;
 use tagteam_core::{
-    BlobRef, Dispatch, DispatchId, Event, EventKind, FailReason, MAX_BLOB_BYTES, MainSessionId,
-    RepoId, Subtask, SubtaskId, SubtaskSpec, SubtaskState, Timestamp,
+    Assumption, BlobRef, Check, Dispatch, DispatchId, Event, EventKind, FailReason, MAX_BLOB_BYTES,
+    MainSessionId, Outcome, RepoId, ResultSummary, Subtask, SubtaskId, SubtaskSpec, SubtaskState,
+    Timestamp,
     local_api::{
         BriefReply, CollectReply, DispatchInput, DispatchReply, InviteReply,
         LOCAL_PROTOCOL_VERSION, LocalRequest, LocalResponseBody, LogsReply, NodeView, StatusReply,
         SubtaskStatus, WatchScope,
+    },
+    render::{ExecReport, tail_middle},
+    runner_proto::{
+        HubToRunnerMessage, RemoteCall, RunnerToHubMessage, mcp_timeout_ms, wall_clock_ms,
     },
     schedule::{Placement, place},
     state::SubtaskInput,
@@ -35,6 +40,7 @@ use crate::{
     config::{DataPaths, HubConfig},
     journal::{EventFilter, EventScope, Journal, JournalError},
     nodes::{NodePlane, NodePlaneError},
+    runner::{RunnerProcess, RunnerStart},
 };
 
 const MAX_INVITE_TTL_SECONDS: u64 = 3_600;
@@ -50,6 +56,8 @@ pub enum ServiceError {
     Blob(#[from] crate::blobs::BlobError),
     #[error("workspace preparation failed: {0}")]
     Preparation(String),
+    #[error("runner failed: {0}")]
+    Runner(String),
     #[error("request is invalid: {0}")]
     Invalid(String),
     #[error("record was not found: {0}")]
@@ -76,6 +84,11 @@ pub struct HubService {
     paths: DataPaths,
     attachments: Arc<AsyncMutex<HashMap<u32, MainSessionId>>>,
     claude_sessions: Arc<AsyncMutex<HashMap<MainSessionId, String>>>,
+    runner_program: String,
+    runner_args: Vec<String>,
+    runners: Arc<AsyncMutex<HashMap<SubtaskId, tokio::sync::mpsc::Sender<HubToRunnerMessage>>>>,
+    active_commands: Arc<AsyncMutex<HashMap<SubtaskId, (tagteam_core::NodeId, String)>>>,
+    landing: Arc<AsyncMutex<()>>,
 }
 
 impl HubService {
@@ -95,6 +108,11 @@ impl HubService {
             paths,
             attachments: Arc::new(AsyncMutex::new(HashMap::new())),
             claude_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
+            runner_program: config.runner_program.clone(),
+            runner_args: config.runner_args.clone(),
+            runners: Arc::new(AsyncMutex::new(HashMap::new())),
+            active_commands: Arc::new(AsyncMutex::new(HashMap::new())),
+            landing: Arc::new(AsyncMutex::new(())),
         })
     }
 
@@ -441,6 +459,7 @@ impl HubService {
                             // reconnects; dispatch must not turn a transient
                             // disconnect into a terminal task failure.
                             tracing::debug!(subtask = %task.id, node = %node, "node unavailable during preparation");
+                            return;
                         }
                         Err(error) => {
                             tracing::warn!(subtask = %task.id, node = %node, %error, "workspace preparation failed");
@@ -458,7 +477,17 @@ impl HubService {
                                         .map(|_| ())
                                 })
                                 .await;
+                            return;
                         }
+                    }
+                    if let Err(error) = service.run_prepared_subtask(subtask_id, node).await {
+                        tracing::warn!(subtask = %subtask_id, node = %node, %error, "runner bridge failed");
+                        service
+                            .fail_if_active(
+                                subtask_id,
+                                FailReason::Runner(bounded_error(&error.to_string())),
+                            )
+                            .await;
                     }
                 });
             }
@@ -603,6 +632,582 @@ impl HubService {
         .map_err(|_| ServiceError::Worker)?
     }
 
+    /// Starts the Agent SDK runner for a prepared subtask and bridges its remote
+    /// tools to the assigned node. The bridge owns the runner child; a dropped
+    /// bridge, cancellation, or wall-clock expiry kills it rather than leaving an
+    /// orphaned model loop behind.
+    async fn run_prepared_subtask(
+        &self,
+        id: SubtaskId,
+        node: tagteam_core::NodeId,
+    ) -> Result<(), ServiceError> {
+        let task = self
+            .journal(move |journal| journal.load_subtask(id))
+            .await?
+            .ok_or_else(|| ServiceError::NotFound(format!("subtask {id}")))?;
+        if task.state != SubtaskState::Running || task.node != Some(node) {
+            return Ok(());
+        }
+        let mut process = RunnerProcess::start(RunnerStart {
+            program: self.runner_program.clone(),
+            args: self.runner_args.clone(),
+            subtask: id,
+            prompt: task.spec.prompt.clone(),
+            system_append: runner_system_append(&task),
+            cwd: task.spec.repo.clone(),
+            max_turns: task.spec.limits.max_turns,
+            wall_clock_ms: wall_clock_ms(&task.spec.limits),
+            tool_timeout_ms: mcp_timeout_ms(&task.spec.limits),
+            resume: task.runner_session.clone(),
+        })
+        .await
+        .map_err(|error| ServiceError::Runner(error.to_string()))?;
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        self.runners.lock().await.insert(id, sender);
+        let deadline = Duration::from_millis(wall_clock_ms(&task.spec.limits))
+            .saturating_add(Duration::from_secs(60));
+        let bridged = tokio::time::timeout(
+            deadline,
+            self.bridge_runner(&task, node, &mut process, &mut receiver),
+        )
+        .await;
+        self.runners.lock().await.remove(&id);
+        match bridged {
+            Ok(result) => {
+                process.kill().await;
+                result
+            }
+            Err(_) => {
+                process.kill().await;
+                Err(ServiceError::Runner(
+                    "runner exceeded its wall-clock budget".into(),
+                ))
+            }
+        }
+    }
+
+    async fn bridge_runner(
+        &self,
+        task: &Subtask,
+        node: tagteam_core::NodeId,
+        process: &mut RunnerProcess,
+        receiver: &mut tokio::sync::mpsc::Receiver<HubToRunnerMessage>,
+    ) -> Result<(), ServiceError> {
+        loop {
+            tokio::select! {
+                message = process.next() => {
+                    let message = message.map_err(|error| ServiceError::Runner(error.to_string()))?;
+                    match message {
+                        RunnerToHubMessage::Ready {
+                            session_id,
+                            claude_code_version,
+                            tools,
+                            mcp_servers,
+                        } => {
+                            if mcp_servers.iter().map(String::as_str).collect::<Vec<_>>() != ["tagteam"]
+                                || tools.iter().any(|tool| !allowed_runner_tool(tool))
+                            {
+                                return Err(ServiceError::Runner(
+                                    "runner reported an unexpected tool or MCP server".into(),
+                                ));
+                            }
+                            let id = task.id;
+                            let state = self
+                                .journal(move |journal| journal.load_subtask_state(id))
+                                .await?;
+                            if !matches!(state, Some(SubtaskState::Running)) {
+                                return Ok(());
+                            }
+                            self.journal(move |journal| {
+                                journal
+                                    .transition(
+                                        id,
+                                        SubtaskInput::RunnerStarted {
+                                            session: session_id.clone(),
+                                        },
+                                        Timestamp::now(),
+                                    )
+                                    .map(|_| ())
+                            })
+                            .await?;
+                            self.record_progress(
+                                task.id,
+                                format!("runner ready ({claude_code_version})"),
+                                None,
+                            )
+                            .await?;
+                        }
+                        RunnerToHubMessage::ToolCall { call_id, call } => {
+                            if let RemoteCall::Finish {
+                                outcome,
+                                summary,
+                                assumptions,
+                                checks: _,
+                            } = call
+                            {
+                                let result = self
+                                    .finalize_finish(
+                                        task,
+                                        node,
+                                        FinishRequest {
+                                            outcome,
+                                            summary,
+                                            assumptions,
+                                        },
+                                    )
+                                    .await?;
+                                let _ = process
+                                    .send(HubToRunnerMessage::ToolResult {
+                                        call_id,
+                                        text: format!("finish accepted: {}", result.summary),
+                                        is_error: false,
+                                    })
+                                    .await;
+                                return Ok(());
+                            }
+
+                            let started = std::time::Instant::now();
+                            let result: Result<RemoteOutcome, ServiceError> = self
+                                .execute_remote_call(task, node, &call_id, &call)
+                                .await;
+                            let (text, is_error) = match result {
+                                Ok(outcome) => (outcome.text, outcome.is_error),
+                                Err(error) => (bounded_error(&error.to_string()), true),
+                            };
+                            let tool = remote_tool_name(&call);
+                            let id = task.id;
+                            self.journal(move |journal| {
+                                journal
+                                    .record_event(
+                                        id,
+                                        EventKind::ToolRan {
+                                            tool: tool.into(),
+                                            summary: if is_error {
+                                                "tool returned an error".into()
+                                            } else {
+                                                "tool completed".into()
+                                            },
+                                            ok: !is_error,
+                                            took: started.elapsed(),
+                                        },
+                                        Timestamp::now(),
+                                    )
+                                    .map(|_| ())
+                            })
+                            .await?;
+                            process
+                                .send(HubToRunnerMessage::ToolResult {
+                                    call_id,
+                                    text,
+                                    is_error,
+                                })
+                                .await
+                                .map_err(|error| ServiceError::Runner(error.to_string()))?;
+                        }
+                        RunnerToHubMessage::Usage { usage } => {
+                            let id = task.id;
+                            self.journal(move |journal| journal.set_usage(id, usage))
+                                .await?;
+                        }
+                        RunnerToHubMessage::Note { text } => {
+                            self.record_progress(task.id, text, None).await?;
+                        }
+                        RunnerToHubMessage::RateLimited { detail } => {
+                            self.record_progress(
+                                task.id,
+                                format!("model rate limited: {detail}"),
+                                None,
+                            )
+                            .await?;
+                        }
+                        RunnerToHubMessage::Exited {
+                            subtype,
+                            error,
+                            session_id: _,
+                            cost_usd: _,
+                        } => {
+                            return Err(ServiceError::Runner(format!(
+                                "runner exited before finish ({subtype}{})",
+                                error.map(|error| format!(": {error}")).unwrap_or_default()
+                            )));
+                        }
+                    }
+                }
+                inbound = receiver.recv() => {
+                    match inbound {
+                        Some(message) => {
+                            let cancelling = matches!(message, HubToRunnerMessage::Cancel { .. });
+                            process
+                                .send(message)
+                                .await
+                                .map_err(|error| ServiceError::Runner(error.to_string()))?;
+                            if cancelling {
+                                return Ok(());
+                            }
+                        }
+                        None => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn execute_remote_call(
+        &self,
+        task: &Subtask,
+        node: tagteam_core::NodeId,
+        call_id: &str,
+        call: &RemoteCall,
+    ) -> Result<RemoteOutcome, ServiceError> {
+        let id = task.id;
+        let state = self
+            .journal(move |journal| journal.load_subtask_state(id))
+            .await?;
+        if !matches!(state, Some(SubtaskState::Running)) {
+            return Err(ServiceError::Invalid("subtask is no longer running".into()));
+        }
+        if let RemoteCall::ReportProgress { note, percent } = call {
+            self.record_progress(task.id, note.clone(), *percent)
+                .await?;
+            return Ok(RemoteOutcome {
+                text: "progress recorded".into(),
+                is_error: false,
+            });
+        }
+        let command = remote_command(task, call_id, call)?;
+        let result = self.execute_tracked_command(task, node, command).await?;
+        render_remote_result(&result, task)
+    }
+
+    /// Executes a node command only while the subtask is still running, and
+    /// records it as cancellable for the duration of the call. Cancellation can
+    /// race with finish/collection, so the state is checked again after the
+    /// command is registered and before its result is accepted.
+    async fn execute_tracked_command(
+        &self,
+        task: &Subtask,
+        node: tagteam_core::NodeId,
+        command: Proto::Command,
+    ) -> Result<Proto::CommandResult, ServiceError> {
+        if !self.is_running(task.id).await? {
+            return Err(ServiceError::Invalid("subtask is no longer running".into()));
+        }
+        let command_id = command.command_id.clone();
+        self.active_commands
+            .lock()
+            .await
+            .insert(task.id, (node, command_id.clone()));
+        if !self.is_running(task.id).await? {
+            self.active_commands.lock().await.remove(&task.id);
+            let _ = self
+                .nodes
+                .cancel_command(node, &command_id, "subtask cancelled")
+                .await;
+            return Err(ServiceError::Invalid("subtask is no longer running".into()));
+        }
+        let result = self
+            .nodes
+            .execute_command(node, command, command_wait(task))
+            .await;
+        self.active_commands.lock().await.remove(&task.id);
+        result.map_err(ServiceError::from)
+    }
+
+    async fn is_running(&self, id: SubtaskId) -> Result<bool, ServiceError> {
+        Ok(matches!(
+            self.journal(move |journal| journal.load_subtask_state(id))
+                .await?,
+            Some(SubtaskState::Running)
+        ))
+    }
+
+    async fn finalize_finish(
+        &self,
+        task: &Subtask,
+        node: tagteam_core::NodeId,
+        finish: FinishRequest,
+    ) -> Result<ResultSummary, ServiceError> {
+        let id = task.id;
+        if !self.is_running(id).await? {
+            return Err(ServiceError::Invalid("subtask is no longer running".into()));
+        }
+
+        let command_id = format!("collect-{}", task.id);
+        let collect = Proto::Command {
+            command_id,
+            subtask_id: task.id.to_string(),
+            workspace: task.id.to_string(),
+            op: Some(Proto::command::Op::Collect(Proto::Collect {
+                base: task.base.0.clone(),
+                message: format!("tagteam: {}", bounded_text(&task.spec.title, 240)),
+            })),
+        };
+        let result = self.execute_tracked_command(task, node, collect).await?;
+        let blob = match result.result {
+            Some(Proto::command_result::Result::Collected(blob)) => {
+                let digest: [u8; 32] = blob
+                    .sha256
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| ServiceError::Invalid("result digest is invalid".into()))?;
+                BlobRef {
+                    sha256: digest,
+                    size: blob.size,
+                }
+            }
+            Some(Proto::command_result::Result::Error(error)) => {
+                return Err(ServiceError::Runner(bounded_error(&error.message)));
+            }
+            _ => {
+                return Err(ServiceError::Runner(
+                    "node returned an unexpected result for collection".into(),
+                ));
+            }
+        };
+        if blob.size > MAX_BLOB_BYTES {
+            return Err(ServiceError::Invalid(
+                "result bundle exceeds the shared blob limit".into(),
+            ));
+        }
+        if !self.is_running(id).await? {
+            return Err(ServiceError::Invalid("subtask is no longer running".into()));
+        }
+
+        let root = self.paths.blobs.clone();
+        let read_blob = blob.clone();
+        let bytes = tokio::task::spawn_blocking(move || {
+            BlobStore::open(root)
+                .and_then(|store| store.read(&read_blob))
+                .map_err(ServiceError::from)
+        })
+        .await
+        .map_err(|_| ServiceError::Worker)??;
+        let bundle = tempfile::NamedTempFile::new()
+            .map_err(|error| ServiceError::Runner(error.to_string()))?;
+        fs::write(bundle.path(), &bytes)
+            .map_err(|error| ServiceError::Runner(error.to_string()))?;
+        if !self.is_running(id).await? {
+            return Err(ServiceError::Invalid("subtask is no longer running".into()));
+        }
+
+        let repository_path = task.spec.repo.clone();
+        let base = task.base.0.clone();
+        let branch = task.branch.clone();
+        let destination = format!("result-{}", task.id);
+        let bundle_path = bundle.path().to_path_buf();
+        let (fetched, diffstat) = tokio::task::spawn_blocking(move || {
+            let repository = Repository::open(repository_path)?;
+            repository.verify_bundle(&bundle_path)?;
+            let fetched = repository.fetch_bundle(&bundle_path, &branch, &destination)?;
+            repository.check_ancestry(&base, &fetched.0)?;
+            let diffstat = repository.diffstat(&base, &fetched.0)?;
+            Ok::<_, ServiceError>((fetched, diffstat))
+        })
+        .await
+        .map_err(|_| ServiceError::Worker)??;
+        if !self.is_running(id).await? {
+            return Err(ServiceError::Invalid("subtask is no longer running".into()));
+        }
+        let checks = self.recheck_done_when(task, node).await?;
+        if !self.is_running(id).await? {
+            return Err(ServiceError::Invalid("subtask is no longer running".into()));
+        }
+        let checks_passed = checks.iter().all(|check| check.passed);
+        let outcome =
+            if !checks_passed && matches!(finish.outcome, Outcome::Completed | Outcome::NoChange) {
+                Outcome::Partial
+            } else {
+                finish.outcome
+            };
+        let result = ResultSummary {
+            outcome,
+            summary: bounded_text(&finish.summary, 4096),
+            bundle: Some(blob.clone()),
+            branch: Some(task.branch.clone()),
+            diffstat,
+            assumptions: finish
+                .assumptions
+                .into_iter()
+                .map(|assumption| Assumption {
+                    what: bounded_text(&assumption.what, 512),
+                    why: bounded_text(&assumption.why, 1024),
+                    from_timeout: assumption.from_timeout,
+                })
+                .collect(),
+            checks,
+        };
+
+        // Cancellation and landing share this gate. Whichever operation gets
+        // here first wins: cancellation leaves no branch, or landing finishes
+        // before the cancel request can turn a live task terminal.
+        let landing = self.landing.lock().await;
+        if !self.is_running(id).await? {
+            return Err(ServiceError::Invalid("subtask is no longer running".into()));
+        }
+        let branch = task.branch.clone();
+        let fetched_commit = fetched.0.clone();
+        let landing_repository = task.spec.repo.clone();
+        tokio::task::spawn_blocking(move || {
+            let repository = Repository::open(landing_repository)?;
+            repository.create_review_branch(&branch, &fetched_commit)?;
+            Ok::<_, ServiceError>(())
+        })
+        .await
+        .map_err(|_| ServiceError::Worker)??;
+        let finished_result = result.clone();
+        self.journal(move |journal| {
+            journal
+                .transition(
+                    id,
+                    SubtaskInput::Finished {
+                        result: finished_result,
+                    },
+                    Timestamp::now(),
+                )
+                .map(|_| ())
+        })
+        .await?;
+        self.journal(move |journal| {
+            journal
+                .transition(
+                    id,
+                    SubtaskInput::Collected { blob: blob.clone() },
+                    Timestamp::now(),
+                )
+                .map(|_| ())
+        })
+        .await?;
+        let landed_result = result.clone();
+        self.journal(move |journal| {
+            journal
+                .transition(
+                    id,
+                    SubtaskInput::Landed {
+                        result: landed_result,
+                    },
+                    Timestamp::now(),
+                )
+                .map(|_| ())
+        })
+        .await?;
+        drop(landing);
+        Ok(result)
+    }
+
+    async fn recheck_done_when(
+        &self,
+        task: &Subtask,
+        node: tagteam_core::NodeId,
+    ) -> Result<Vec<Check>, ServiceError> {
+        let mut checks = Vec::with_capacity(task.spec.done_when.len());
+        for (index, command) in task.spec.done_when.iter().enumerate() {
+            if !self.is_running(task.id).await? {
+                return Err(ServiceError::Invalid("subtask is no longer running".into()));
+            }
+            let command_id = format!("check-{}-{}", task.id, index);
+            let result = self
+                .execute_tracked_command(
+                    task,
+                    node,
+                    Proto::Command {
+                        command_id,
+                        subtask_id: task.id.to_string(),
+                        workspace: task.id.to_string(),
+                        op: Some(Proto::command::Op::Exec(Proto::Exec {
+                            argv: vec!["bash".into(), "-lc".into(), command.clone()],
+                            cwd: String::new(),
+                            env: std::collections::HashMap::new(),
+                            stdin: Vec::new(),
+                            timeout_ms: command_timeout_ms(&task.spec.limits),
+                            output_cap: output_cap(&task.spec.limits),
+                        })),
+                    },
+                )
+                .await;
+            if !self.is_running(task.id).await? {
+                return Err(ServiceError::Invalid("subtask is no longer running".into()));
+            }
+            let check = match result {
+                Ok(Proto::CommandResult {
+                    result: Some(Proto::command_result::Result::Exec(exec)),
+                    ..
+                }) => Check {
+                    what: command.clone(),
+                    command: Some(command.clone()),
+                    passed: exec.exit_code == 0
+                        && exec.signal == 0
+                        && !exec.timed_out
+                        && !exec.killed,
+                    output_tail: bounded_text(&render_exec_tail(&exec), 8192),
+                },
+                Ok(Proto::CommandResult {
+                    result: Some(Proto::command_result::Result::Error(error)),
+                    ..
+                }) => Check {
+                    what: command.clone(),
+                    command: Some(command.clone()),
+                    passed: false,
+                    output_tail: bounded_error(&error.message),
+                },
+                Ok(_) => Check {
+                    what: command.clone(),
+                    command: Some(command.clone()),
+                    passed: false,
+                    output_tail: "node returned an unexpected check result".into(),
+                },
+                Err(error) => Check {
+                    what: command.clone(),
+                    command: Some(command.clone()),
+                    passed: false,
+                    output_tail: bounded_error(&error.to_string()),
+                },
+            };
+            checks.push(check);
+        }
+        Ok(checks)
+    }
+
+    async fn record_progress(
+        &self,
+        id: SubtaskId,
+        note: String,
+        percent: Option<u8>,
+    ) -> Result<(), ServiceError> {
+        self.journal(move |journal| {
+            journal
+                .record_event(
+                    id,
+                    EventKind::Progress {
+                        note: bounded_text(&note, 1024),
+                        percent,
+                    },
+                    Timestamp::now(),
+                )
+                .map(|_| ())
+        })
+        .await
+    }
+
+    async fn fail_if_active(&self, id: SubtaskId, reason: FailReason) {
+        let state = self
+            .journal(move |journal| journal.load_subtask_state(id))
+            .await;
+        let Ok(Some(state)) = state else {
+            return;
+        };
+        if state.is_terminal() {
+            return;
+        }
+        let _ = self
+            .journal(move |journal| {
+                journal
+                    .transition(id, SubtaskInput::Fail { reason }, Timestamp::now())
+                    .map(|_| ())
+            })
+            .await;
+    }
+
     async fn status(&self, ids: Option<Vec<SubtaskId>>) -> Result<StatusReply, ServiceError> {
         let wanted = ids.map(|ids| ids.into_iter().collect::<std::collections::HashSet<_>>());
         let subtasks = self.journal(|journal| journal.list_subtasks()).await?;
@@ -655,6 +1260,7 @@ impl HubService {
                 "cancel reason must not be empty".into(),
             ));
         }
+        let landing = self.landing.lock().await;
         let current = self
             .journal(move |journal| journal.load_subtask_state(subtask))
             .await?
@@ -677,6 +1283,22 @@ impl HubService {
                 .map(|_| ())
         })
         .await?;
+        drop(landing);
+        let runner = self.runners.lock().await.get(&subtask).cloned();
+        if let Some(runner) = runner {
+            let _ = runner
+                .send(HubToRunnerMessage::Cancel {
+                    reason: "subtask cancelled".into(),
+                })
+                .await;
+        }
+        let active = self.active_commands.lock().await.get(&subtask).cloned();
+        if let Some((node, command_id)) = active {
+            let _ = self
+                .nodes
+                .cancel_command(node, &command_id, "subtask cancelled")
+                .await;
+        }
         Ok(())
     }
 
@@ -1087,6 +1709,312 @@ fn render_event(event: &Event) -> String {
             EventKind::Cancelled => "cancelled".into(),
         }
     )
+}
+
+#[derive(Debug)]
+struct RemoteOutcome {
+    text: String,
+    is_error: bool,
+}
+
+#[derive(Debug)]
+struct FinishRequest {
+    outcome: Outcome,
+    summary: String,
+    assumptions: Vec<Assumption>,
+}
+
+fn runner_system_append(task: &Subtask) -> String {
+    let checks = task
+        .spec
+        .done_when
+        .iter()
+        .map(|command| format!("- {command}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    bounded_text(
+        &format!(
+            "You are executing one Tag Team subtask in a remote checkout.\n\n\
+             Task: {}\n\n\
+             Use only the mcp__tagteam__ tools. Every read, write, edit, search, and command \
+             must go through those tools; local shell and file tools are unavailable and are \
+             denied. Do not attempt to access credentials, user configuration, or paths outside \
+             the checkout. Keep commands bounded and report meaningful progress.\n\n\
+             The hub will authoritatively re-run these done_when checks before accepting a \
+             completed or no_change result:\n{checks}\n\n\
+             When the work is ready, call mcp__tagteam__Finish with a concise outcome, summary, \
+             and any assumptions. Do not claim a check passed unless you actually observed it.",
+            task.spec.title,
+        ),
+        8_000,
+    )
+}
+
+fn allowed_runner_tool(tool: &str) -> bool {
+    taskteam_runner_tools().contains(&tool)
+}
+
+fn taskteam_runner_tools() -> &'static [&'static str] {
+    &[
+        "mcp__tagteam__Bash",
+        "mcp__tagteam__Read",
+        "mcp__tagteam__Write",
+        "mcp__tagteam__Edit",
+        "mcp__tagteam__Glob",
+        "mcp__tagteam__Grep",
+        "mcp__tagteam__ReportProgress",
+        "mcp__tagteam__Finish",
+    ]
+}
+
+fn remote_tool_name(call: &RemoteCall) -> &'static str {
+    match call {
+        RemoteCall::Bash { .. } => "Bash",
+        RemoteCall::Read { .. } => "Read",
+        RemoteCall::Write { .. } => "Write",
+        RemoteCall::Edit { .. } => "Edit",
+        RemoteCall::Glob { .. } => "Glob",
+        RemoteCall::Grep { .. } => "Grep",
+        RemoteCall::ReportProgress { .. } => "ReportProgress",
+        RemoteCall::Finish { .. } => "Finish",
+    }
+}
+
+fn remote_command(
+    task: &Subtask,
+    call_id: &str,
+    call: &RemoteCall,
+) -> Result<Proto::Command, ServiceError> {
+    if call_id.trim().is_empty() {
+        return Err(ServiceError::Invalid("runner call ID is empty".into()));
+    }
+    let op = match call {
+        RemoteCall::Bash {
+            command,
+            timeout_ms,
+        } => {
+            let timeout = timeout_ms
+                .filter(|value| *value > 0)
+                .unwrap_or(u64::from(command_timeout_ms(&task.spec.limits)))
+                .min(u64::from(command_timeout_ms(&task.spec.limits)));
+            Proto::command::Op::Exec(Proto::Exec {
+                argv: vec!["bash".into(), "-lc".into(), command.clone()],
+                cwd: String::new(),
+                env: HashMap::new(),
+                stdin: Vec::new(),
+                timeout_ms: u32::try_from(timeout).unwrap_or(u32::MAX),
+                output_cap: output_cap(&task.spec.limits),
+            })
+        }
+        RemoteCall::Read {
+            path,
+            offset,
+            limit,
+        } => Proto::command::Op::Read(Proto::ReadFiles {
+            files: vec![Proto::FileRange {
+                path: path_text(path)?,
+                offset: offset.unwrap_or(0),
+                limit: limit.unwrap_or(0),
+            }],
+        }),
+        RemoteCall::Write { path, content } => {
+            if content.len() as u64 > task.spec.limits.max_patch.0 {
+                return Err(ServiceError::Invalid(
+                    "runner write exceeds the subtask patch limit".into(),
+                ));
+            }
+            Proto::command::Op::Write(Proto::WriteFiles {
+                files: vec![Proto::FileBody {
+                    path: path_text(path)?,
+                    data: content.as_bytes().to_vec(),
+                    expected_sha256: None,
+                }],
+            })
+        }
+        RemoteCall::Edit {
+            path,
+            old,
+            new,
+            replace_all,
+        } => {
+            if new.len() as u64 > task.spec.limits.max_patch.0 {
+                return Err(ServiceError::Invalid(
+                    "runner edit exceeds the subtask patch limit".into(),
+                ));
+            }
+            Proto::command::Op::Edit(Proto::EditFile {
+                path: path_text(path)?,
+                old: old.clone(),
+                new: new.clone(),
+                replace_all: *replace_all,
+            })
+        }
+        RemoteCall::Glob { pattern, path } => Proto::command::Op::Glob(Proto::Glob {
+            pattern: pattern.clone(),
+            cwd: path
+                .as_deref()
+                .map(path_text)
+                .transpose()?
+                .unwrap_or_default(),
+            limit: 10_000,
+        }),
+        RemoteCall::Grep {
+            pattern,
+            path,
+            glob,
+            ignore_case,
+            context,
+            limit,
+        } => Proto::command::Op::Grep(Proto::Grep {
+            pattern: pattern.clone(),
+            path: path
+                .as_deref()
+                .map(path_text)
+                .transpose()?
+                .unwrap_or_default(),
+            glob: glob.clone().unwrap_or_default(),
+            ignore_case: *ignore_case,
+            context: context.unwrap_or(3).min(100),
+            limit: limit.unwrap_or(200).min(10_000),
+        }),
+        RemoteCall::ReportProgress { .. } | RemoteCall::Finish { .. } => {
+            return Err(ServiceError::Invalid(
+                "runner control call must not be sent to the node".into(),
+            ));
+        }
+    };
+    Ok(Proto::Command {
+        command_id: format!("remote-{}-{call_id}", task.id),
+        subtask_id: task.id.to_string(),
+        workspace: task.id.to_string(),
+        op: Some(op),
+    })
+}
+
+fn render_remote_result(
+    result: &Proto::CommandResult,
+    task: &Subtask,
+) -> Result<RemoteOutcome, ServiceError> {
+    let (text, is_error) = match result.result.as_ref() {
+        Some(Proto::command_result::Result::Exec(exec)) => {
+            let report = ExecReport {
+                exit_code: Some(exec.exit_code),
+                signal: (exec.signal != 0).then_some(exec.signal),
+                timed_out: exec.timed_out,
+                killed: exec.killed,
+                stdout_tail: exec.stdout_tail.clone(),
+                stderr_tail: exec.stderr_tail.clone(),
+                truncated: exec.truncated,
+                took: Duration::from_millis(exec.took_ms),
+            };
+            let failed = exec.timed_out || exec.killed || exec.signal != 0 || exec.exit_code != 0;
+            (report.render(), failed)
+        }
+        Some(Proto::command_result::Result::Read(read)) => {
+            let mut text = String::new();
+            for file in &read.files {
+                text.push_str(&format!("{}\n", file.path));
+                text.push_str(&String::from_utf8_lossy(&file.data));
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+            (text, false)
+        }
+        Some(Proto::command_result::Result::Written(written)) => (
+            format!(
+                "wrote {} file(s): {}",
+                written.paths.len(),
+                written.paths.join(", ")
+            ),
+            false,
+        ),
+        Some(Proto::command_result::Result::Edited(edited)) => (
+            format!(
+                "edited {} ({} replacement(s))",
+                edited.path, edited.replacements
+            ),
+            false,
+        ),
+        Some(Proto::command_result::Result::Matches(matches)) => (
+            format!(
+                "{}{}",
+                matches.lines.join("\n"),
+                if matches.truncated {
+                    "\n[matches truncated]"
+                } else {
+                    ""
+                }
+            ),
+            false,
+        ),
+        Some(Proto::command_result::Result::Error(error)) => (bounded_error(&error.message), true),
+        Some(Proto::command_result::Result::Committed(committed)) => {
+            (format!("committed {}", committed.oid), false)
+        }
+        Some(Proto::command_result::Result::Collected(blob)) => (
+            format!("collected result bundle ({} bytes)", blob.size),
+            false,
+        ),
+        Some(Proto::command_result::Result::Done(done)) => {
+            (format!("operation completed: {}", done.ok), !done.ok)
+        }
+        None => {
+            return Err(ServiceError::Invalid(
+                "node returned no command result".into(),
+            ));
+        }
+    };
+    Ok(RemoteOutcome {
+        text: model_bounded_text(text, task.spec.limits.model_output),
+        is_error,
+    })
+}
+
+fn path_text(path: &Path) -> Result<String, ServiceError> {
+    path.to_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| ServiceError::Invalid("runner supplied an invalid path".into()))
+}
+
+fn command_timeout_ms(limits: &tagteam_core::Limits) -> u32 {
+    u32::try_from(limits.command_timeout.as_millis()).unwrap_or(u32::MAX)
+}
+
+fn output_cap(limits: &tagteam_core::Limits) -> u32 {
+    u32::try_from(limits.max_output.0).unwrap_or(u32::MAX)
+}
+
+fn command_wait(task: &Subtask) -> Duration {
+    task.spec
+        .limits
+        .command_timeout
+        .saturating_add(Duration::from_secs(30))
+}
+
+fn render_exec_tail(exec: &Proto::ExecDone) -> String {
+    ExecReport {
+        exit_code: Some(exec.exit_code),
+        signal: (exec.signal != 0).then_some(exec.signal),
+        timed_out: exec.timed_out,
+        killed: exec.killed,
+        stdout_tail: exec.stdout_tail.clone(),
+        stderr_tail: exec.stderr_tail.clone(),
+        truncated: exec.truncated,
+        took: Duration::from_millis(exec.took_ms),
+    }
+    .render()
+}
+
+fn model_bounded_text(text: String, cap: tagteam_core::Bytes) -> String {
+    let cap = usize::try_from(cap.0).unwrap_or(usize::MAX);
+    let (bytes, _) = tail_middle(text.as_bytes(), tagteam_core::Bytes(cap as u64));
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn bounded_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 #[cfg(test)]
