@@ -10,7 +10,7 @@ use chrono::Timelike as _;
 use sysinfo::{Disks, System};
 use tagteam_core::NodePolicy;
 
-use crate::HeartbeatSource;
+use crate::{HeartbeatSource, runtime::CommandRunner};
 
 const TOOL_NAMES: &[&str] = &["cargo", "rustc", "node", "pnpm", "git", "python3"];
 static TOOLCHAINS: OnceLock<Vec<tagteam_proto::v1::Toolchain>> = OnceLock::new();
@@ -19,6 +19,7 @@ static TOOLCHAINS: OnceLock<Vec<tagteam_proto::v1::Toolchain>> = OnceLock::new()
 pub struct HostHeartbeat {
     policy: Option<NodePolicy>,
     workspace_root: Option<PathBuf>,
+    runner: Option<CommandRunner>,
 }
 
 impl HostHeartbeat {
@@ -27,6 +28,7 @@ impl HostHeartbeat {
         Self {
             policy: Some(policy),
             workspace_root: None,
+            runner: None,
         }
     }
 
@@ -37,7 +39,16 @@ impl HostHeartbeat {
         Self {
             policy: Some(policy),
             workspace_root: Some(workspace_root),
+            runner: None,
         }
+    }
+
+    /// Attach the durable command runner so heartbeats report actual executing
+    /// workspaces and repository heads instead of process-local guesses.
+    #[must_use]
+    pub fn with_runner(mut self, runner: CommandRunner) -> Self {
+        self.runner = Some(runner);
+        self
     }
 }
 
@@ -64,6 +75,22 @@ impl HeartbeatSource for HostHeartbeat {
             .unwrap_or(0);
         let (presence, idle_for_ms) = owner_presence(self.policy.as_ref());
         let battery = detect_on_battery();
+        let running = self
+            .runner
+            .as_ref()
+            .map(CommandRunner::running_workspaces)
+            .unwrap_or_default();
+        let repos = self
+            .runner
+            .as_ref()
+            .map(CommandRunner::repo_heads)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|repo| tagteam_proto::v1::CachedRepo {
+                repo_id: repo.repo.0.0,
+                heads: repo.heads.into_iter().map(|head| head.0).collect(),
+            })
+            .collect();
         tagteam_proto::v1::Heartbeat {
             capacity: Some(tagteam_proto::v1::Capacity {
                 cores_total: u32::try_from(cores).unwrap_or(u32::MAX),
@@ -76,9 +103,7 @@ impl HeartbeatSource for HostHeartbeat {
                         system.available_memory().min(limit.0)
                     }),
                 disk_free: free_disk,
-                // CommandRunner does not expose active worker state to the heartbeat source.
-                // Keep the wire value explicitly zero until a shared runner status API exists.
-                running: 0,
+                running: u32::try_from(running.len()).unwrap_or(u32::MAX),
                 on_battery: battery.unwrap_or(false),
                 battery_known: battery.is_some(),
                 local_minute_of_day: local_minute_of_day().map(u32::from),
@@ -88,8 +113,8 @@ impl HeartbeatSource for HostHeartbeat {
             }),
             presence: presence as i32,
             toolchains: TOOLCHAINS.get_or_init(probe_toolchains).clone(),
-            repos: Vec::new(),
-            running: Vec::new(),
+            repos,
+            running,
             idle_for_ms,
         }
     }

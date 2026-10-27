@@ -123,6 +123,28 @@ if (String(start.prompt).includes("oversized-patch")) {
   process.exit(0);
 }
 
+if (String(start.prompt).includes("turn-limit")) {
+  send({
+    type: "exited",
+    subtype: "error_max_turns",
+    error: "The fake runner reached the configured turn cap.",
+    session_id: "fake-runner-session",
+    cost_usd: null,
+  });
+  process.exit(0);
+}
+
+if (String(start.prompt).includes("time-limit")) {
+  send({
+    type: "exited",
+    subtype: "wall_clock_limit",
+    error: "The fake runner reached the configured wall-clock cap.",
+    session_id: "fake-runner-session",
+    cost_usd: null,
+  });
+  process.exit(0);
+}
+
 send({
   type: "tool_call",
   call_id: "fake-bash-1",

@@ -495,6 +495,50 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
         "an oversized result must still clean up its borrowed-machine workspace"
     );
 
+    for (title, prompt, expected) in [
+        ("Stop at the turn cap", "turn-limit", FailReason::TurnLimit),
+        (
+            "Stop at the wall-clock cap",
+            "time-limit",
+            FailReason::TimeLimit,
+        ),
+    ] {
+        let subtask = dispatch_prompt(
+            &service,
+            &repository,
+            &format!("spine-{prompt}"),
+            title,
+            prompt,
+        )
+        .await;
+        let failed = wait_for_failure(&service, subtask, prompt).await;
+        assert_eq!(failed.state, SubtaskState::Failed { reason: expected });
+        let branch = failed.branch.clone();
+        assert!(
+            !git_status(
+                &repository,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}")
+                ],
+            ),
+            "a runner limit must not create a review branch"
+        );
+        let workspace = node_data.join("workspaces").join(subtask.to_string());
+        for _ in 0..200 {
+            if !workspace.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !workspace.exists(),
+            "a runner limit must clean its workspace"
+        );
+    }
+
     let cancellation = match service
         .handle(LocalRequest::Dispatch(DispatchInput {
             main_session: MainSessionId::new(),
@@ -709,6 +753,73 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
     node_loop.abort();
     let _ = shutdown.send(());
     let _ = server.await;
+}
+
+async fn dispatch_prompt(
+    service: &HubService,
+    repository: &Path,
+    session: &str,
+    title: &str,
+    prompt: &str,
+) -> tagteam_core::SubtaskId {
+    match service
+        .handle(LocalRequest::Dispatch(DispatchInput {
+            main_session: MainSessionId::new(),
+            claude_session: Some(session.into()),
+            repo: repository.to_path_buf(),
+            subtasks: vec![SubtaskSpec {
+                title: title.into(),
+                prompt: prompt.into(),
+                done_when: vec!["true".into()],
+                repo: repository.to_path_buf(),
+                base_ref: "main".into(),
+                include_uncommitted: false,
+                needs: Needs::default(),
+                limits: Limits::default(),
+                egress: Vec::new(),
+                node_hint: None,
+            }],
+            spread: false,
+        }))
+        .await
+        .expect("limit dispatch")
+    {
+        LocalResponseBody::Dispatched(dispatch) => dispatch.subtasks[0].0,
+        other => panic!("unexpected limit dispatch response: {other:?}"),
+    }
+}
+
+async fn wait_for_failure(
+    service: &HubService,
+    subtask: tagteam_core::SubtaskId,
+    label: &str,
+) -> tagteam_core::Subtask {
+    for _ in 0..600 {
+        let status = match service
+            .handle(LocalRequest::Status {
+                claude_session: None,
+                ids: Some(vec![subtask]),
+            })
+            .await
+            .expect("limit status")
+        {
+            LocalResponseBody::Status(status) => status,
+            other => panic!("unexpected limit status response: {other:?}"),
+        };
+        match status.subtasks[0].state.as_str() {
+            "failed" => {
+                let journal =
+                    Journal::open(&service.paths().journal).expect("open hub journal for limit");
+                return journal
+                    .load_subtask(subtask)
+                    .expect("load limit subtask")
+                    .expect("limit subtask exists");
+            }
+            "done" => panic!("{label} must fail, not complete"),
+            _ => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    panic!("{label} subtask did not reach a terminal failure");
 }
 
 fn git_output(repository: &Path, args: &[&str]) -> String {

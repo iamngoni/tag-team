@@ -23,7 +23,7 @@ pub use journal::{BeginCommand, CommandJournal, JournalError};
 pub use runtime::{BundleSource, CommandRunner, NoBundleSource};
 pub use session::{
     HeartbeatSource, NodeSession, PendingResultSource, ReconnectPolicy, SessionError, SessionEvent,
-    SessionHandle, SessionSender,
+    SessionHandle, SessionSender, WorkspaceSource,
 };
 
 pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");

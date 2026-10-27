@@ -31,6 +31,8 @@ pub enum SubtaskInput {
         from: NodeId,
         reason: crate::ReassignReason,
     },
+    Pause,
+    Resume,
     Finished {
         result: ResultSummary,
     },
@@ -120,10 +122,25 @@ pub fn step(
                 by: by.clone(),
             },
         )),
+        (SubtaskState::Running, SubtaskInput::Pause) => Ok((
+            SubtaskState::Paused,
+            EventKind::Progress {
+                note: "paused because the owner returned".into(),
+                percent: None,
+            },
+        )),
+        (SubtaskState::Paused, SubtaskInput::Resume) => Ok((
+            SubtaskState::Running,
+            EventKind::Progress {
+                note: "resumed because the owner is away".into(),
+                percent: None,
+            },
+        )),
         (
             SubtaskState::Preparing
             | SubtaskState::Running
             | SubtaskState::WaitingOnMain { .. }
+            | SubtaskState::Paused
             | SubtaskState::Collecting,
             SubtaskInput::Reassign { from, reason },
         ) => Ok((
@@ -234,6 +251,7 @@ mod tests {
             SubtaskState::Reassigning {
                 reason: crate::ReassignReason::NodeLost,
             },
+            SubtaskState::Paused,
             SubtaskState::Collecting,
         ];
         for state in states {
@@ -247,6 +265,32 @@ mod tests {
             assert_eq!(next, SubtaskState::Cancelled);
             assert_eq!(event, EventKind::Cancelled);
         }
+    }
+
+    #[test]
+    fn owner_return_pause_is_reversible_without_losing_the_attempt() {
+        let (paused, pause_event) =
+            step(&SubtaskState::Running, SubtaskInput::Pause).expect("running work can be paused");
+        assert_eq!(paused, SubtaskState::Paused);
+        assert!(matches!(pause_event, EventKind::Progress { .. }));
+        let (running, resume_event) =
+            step(&paused, SubtaskInput::Resume).expect("paused work can resume");
+        assert_eq!(running, SubtaskState::Running);
+        assert!(matches!(resume_event, EventKind::Progress { .. }));
+    }
+
+    #[test]
+    fn paused_work_can_be_reassigned_from_its_node() {
+        let (next, event) = step(
+            &SubtaskState::Paused,
+            SubtaskInput::Reassign {
+                from: crate::NodeId::new(),
+                reason: crate::ReassignReason::OwnerReturned,
+            },
+        )
+        .expect("paused work can be handed back");
+        assert!(matches!(next, SubtaskState::Reassigning { .. }));
+        assert!(matches!(event, EventKind::Reassigned { .. }));
     }
 
     #[test]

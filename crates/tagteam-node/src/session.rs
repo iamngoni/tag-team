@@ -28,11 +28,18 @@ pub trait PendingResultSource: Send + Sync + 'static {
     fn pending_results(&self) -> Result<Vec<tagteam_proto::v1::CommandAck>, SessionError>;
 }
 
+/// Supplies the node's current workspace inventory for each Hello. A node can
+/// create workspaces after the session starts, so this is read dynamically on
+/// every reconnect instead of being frozen at construction time.
+pub trait WorkspaceSource: Send + Sync + 'static {
+    fn workspace_ids(&self) -> Vec<String>;
+}
+
 /// Session inputs copied into each reconnect's initial Hello message.
 pub struct NodeSession {
     identity: NodeIdentity,
     version: String,
-    workspaces: Vec<String>,
+    workspaces: Arc<dyn WorkspaceSource>,
     pending: Arc<dyn PendingResultSource>,
     heartbeat_source: Arc<dyn HeartbeatSource>,
     policy: Option<NodePolicy>,
@@ -44,7 +51,7 @@ impl NodeSession {
         Self {
             identity,
             version: NODE_VERSION.to_owned(),
-            workspaces: Vec::new(),
+            workspaces: Arc::new(StaticWorkspaces(Vec::new())),
             pending: Arc::new(StaticPending(Vec::new())),
             heartbeat_source: Arc::new(heartbeat_source),
             policy: None,
@@ -59,8 +66,15 @@ impl NodeSession {
         pending: Vec<tagteam_proto::v1::CommandAck>,
     ) -> Self {
         self.version = version.into();
-        self.workspaces = workspaces;
+        self.workspaces = Arc::new(StaticWorkspaces(workspaces));
         self.pending = Arc::new(StaticPending(pending));
+        self
+    }
+
+    /// Supplies workspace IDs dynamically so a reconnect reports work created
+    /// after the session began.
+    pub fn workspace_source(mut self, source: impl WorkspaceSource) -> Self {
+        self.workspaces = Arc::new(source);
         self
     }
 
@@ -225,12 +239,35 @@ impl NodeSession {
                 tagteam_proto::v1::Hello {
                     node_id: self.identity.node_id.to_string(),
                     version: self.version.clone(),
-                    workspaces: self.workspaces.clone(),
+                    workspaces: self.workspaces.workspace_ids(),
                     pending: self.pending.pending_results()?,
                     policy: self.policy.as_ref().map(policy_to_proto),
                 },
             )),
         })
+    }
+}
+
+struct StaticWorkspaces(Vec<String>);
+
+impl WorkspaceSource for StaticWorkspaces {
+    fn workspace_ids(&self) -> Vec<String> {
+        self.0.clone()
+    }
+}
+
+impl<T> WorkspaceSource for Arc<T>
+where
+    T: WorkspaceSource + ?Sized,
+{
+    fn workspace_ids(&self) -> Vec<String> {
+        (**self).workspace_ids()
+    }
+}
+
+impl WorkspaceSource for crate::runtime::CommandRunner {
+    fn workspace_ids(&self) -> Vec<String> {
+        crate::runtime::CommandRunner::workspace_ids(self)
     }
 }
 
@@ -454,13 +491,21 @@ fn status_error(status: Status) -> SessionError {
 mod tests {
     use super::{HeartbeatSource, NodeSession, ReconnectPolicy};
     use crate::{BeginCommand, CommandJournal, NodeIdentity};
-    use std::time::Duration;
+    use std::{sync::Mutex, time::Duration};
 
     struct EmptyHeartbeat;
 
     impl HeartbeatSource for EmptyHeartbeat {
         fn heartbeat(&self) -> tagteam_proto::v1::Heartbeat {
             tagteam_proto::v1::Heartbeat::default()
+        }
+    }
+
+    struct MutableWorkspaces(Mutex<Vec<String>>);
+
+    impl super::WorkspaceSource for MutableWorkspaces {
+        fn workspace_ids(&self) -> Vec<String> {
+            self.0.lock().expect("workspace inventory").clone()
         }
     }
 
@@ -551,5 +596,37 @@ mod tests {
         };
         assert_eq!(reconnect.pending.len(), 1);
         assert!(reconnect.pending[0].result.is_some());
+    }
+
+    #[test]
+    fn reconnect_hello_reads_workspaces_created_after_session_startup() {
+        let identity = NodeIdentity {
+            node_id: tagteam_core::NodeId::new(),
+            invite: String::new(),
+            certificate_der: Vec::new(),
+            private_key_der: Vec::new(),
+            hub_address: "https://localhost".into(),
+            hub_fingerprint: tagteam_pki::CertificateFingerprint::from_certificate(b"test"),
+        };
+        let workspaces = std::sync::Arc::new(MutableWorkspaces(Mutex::new(Vec::new())));
+        let session = NodeSession::new(identity, EmptyHeartbeat)
+            .workspace_source(std::sync::Arc::clone(&workspaces));
+
+        let initial = session.hello_message().expect("initial Hello builds");
+        let Some(tagteam_proto::v1::node_message::Msg::Hello(initial)) = initial.msg else {
+            panic!("initial message is Hello");
+        };
+        assert!(initial.workspaces.is_empty());
+
+        workspaces
+            .0
+            .lock()
+            .expect("workspace inventory")
+            .push("subtask-workspace".into());
+        let reconnect = session.hello_message().expect("reconnect Hello builds");
+        let Some(tagteam_proto::v1::node_message::Msg::Hello(reconnect)) = reconnect.msg else {
+            panic!("reconnect message is Hello");
+        };
+        assert_eq!(reconnect.workspaces, vec!["subtask-workspace"]);
     }
 }

@@ -175,8 +175,10 @@ async fn run(config: tagteam_node::config::NodeConfig) -> anyhow::Result<()> {
     let heartbeat = HostHeartbeat::with_policy_and_workspace(
         policy.clone(),
         config.data_dir.join("workspaces"),
-    );
+    )
+    .with_runner(runner.clone());
     let session = NodeSession::new(identity, heartbeat)
+        .workspace_source(runner.clone())
         .pending_source(journal)
         .policy(policy)
         .start();

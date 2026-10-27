@@ -15,8 +15,8 @@ use std::{
 use semver::VersionReq;
 use tagteam_core::{
     Bytes, Capacity, Dispatch, FailReason, Limits, MainSessionId, Needs, Node, NodeId, NodePolicy,
-    NodeState, Os, OwnerPresence, Platform, Question, QuestionId, Subtask, SubtaskId, SubtaskSpec,
-    SubtaskState, Thermal, Timestamp, Trust,
+    NodeState, OnReturn, Os, OwnerPresence, Platform, Question, QuestionId, ReassignReason,
+    Subtask, SubtaskId, SubtaskSpec, SubtaskState, Thermal, Timestamp, Trust,
     local_api::{DispatchInput, DispatchReply, LocalRequest, LocalResponseBody},
     runner_proto::HubToRunnerMessage,
     schedule::{NoFitReason, Placement},
@@ -166,6 +166,53 @@ async fn load_subtask(service: &HubService, id: SubtaskId) -> tagteam_core::Subt
         .expect("subtask exists")
 }
 
+async fn seed_running_task(
+    service: &HubService,
+    node: NodeId,
+    claude_session: &str,
+    title: &str,
+) -> Subtask {
+    let created = Timestamp::now();
+    let subtask = Subtask {
+        id: SubtaskId::new(),
+        dispatch: tagteam_core::DispatchId::new(),
+        spec: spec(Path::new("/workspace/repo"), title, false),
+        state: SubtaskState::Running,
+        node: Some(node),
+        attempt: 0,
+        base: tagteam_core::GitOid::zero(),
+        repo_id: tagteam_core::RepoId(tagteam_core::GitOid::zero()),
+        branch: format!(
+            "tagteam/{}-{}",
+            title.to_ascii_lowercase().replace(' ', "-"),
+            SubtaskId::new()
+        ),
+        runner_session: Some("owner-return-session".into()),
+        created,
+        started: Some(created),
+        finished: None,
+        usage: tagteam_core::Usage::default(),
+    };
+    let dispatch = Dispatch {
+        id: subtask.dispatch,
+        main_session: MainSessionId::new(),
+        claude_session: Some(claude_session.into()),
+        repo: PathBuf::from("/workspace/repo"),
+        created,
+    };
+    let stored = subtask.clone();
+    service
+        .journal(move |journal| {
+            journal.create_dispatch(&dispatch)?;
+            // create_subtask accepts the Running state as a durable recovery
+            // fixture; production always reaches it through the state machine.
+            journal.create_subtask(&stored)
+        })
+        .await
+        .expect("seed running task");
+    subtask
+}
+
 #[tokio::test]
 async fn dispatch_snapshots_dirty_and_untracked_work_without_secrets() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -243,6 +290,137 @@ async fn dispatch_without_nodes_is_queued_with_an_explicit_reason() {
     let task = load_subtask(&service, reply.subtasks[0].0).await;
     assert_eq!(task.state, SubtaskState::Queued);
     assert_eq!(task.node, None);
+}
+
+#[tokio::test]
+async fn owner_return_policies_preserve_pause_and_reassign_hand_back_separately() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let service = service(&directory).await;
+    let node = active_node();
+    let node_id = node.id;
+    service
+        .journal(move |journal| journal.create_node(&node))
+        .await
+        .expect("node");
+
+    let paused_task = seed_running_task(&service, node_id, "pause-session", "Owner pause").await;
+    service
+        .apply_owner_return_policy(node_id, OnReturn::Pause)
+        .await
+        .expect("pause policy");
+    let paused = load_subtask(&service, paused_task.id).await;
+    assert_eq!(paused.state, SubtaskState::Paused);
+    assert_eq!(paused.runner_session, paused_task.runner_session);
+    let cleanup_id = format!("cleanup-{}-a{}", paused_task.id, paused_task.attempt);
+    let pause_cleanup = service
+        .journal({
+            let cleanup_id = cleanup_id.clone();
+            move |journal| journal.load_command(&cleanup_id)
+        })
+        .await
+        .expect("load pause cleanup");
+    assert!(
+        pause_cleanup.is_none(),
+        "pause must retain the borrowed workspace"
+    );
+
+    service
+        .apply_owner_return_policy(node_id, OnReturn::HandBack)
+        .await
+        .expect("hand-back policy");
+    let handed_back = load_subtask(&service, paused_task.id).await;
+    assert_eq!(
+        handed_back.state,
+        SubtaskState::Reassigning {
+            reason: ReassignReason::OwnerReturned
+        }
+    );
+    let hand_back_cleanup = service
+        .journal(move |journal| journal.load_command(&cleanup_id))
+        .await
+        .expect("load hand-back cleanup");
+    assert!(
+        hand_back_cleanup.is_some(),
+        "hand-back must durably request workspace cleanup"
+    );
+
+    let running_task = seed_running_task(&service, node_id, "finish-session", "Owner finish").await;
+    service
+        .apply_owner_return_policy(node_id, OnReturn::FinishRunning)
+        .await
+        .expect("finish policy");
+    assert_eq!(
+        load_subtask(&service, running_task.id).await.state,
+        SubtaskState::Running
+    );
+    let finish_cleanup_id = format!("cleanup-{}-a{}", running_task.id, running_task.attempt);
+    let finish_cleanup = service
+        .journal(move |journal| journal.load_command(&finish_cleanup_id))
+        .await
+        .expect("load finish cleanup");
+    assert!(
+        finish_cleanup.is_none(),
+        "finish_running must leave the active attempt untouched"
+    );
+}
+
+#[tokio::test]
+async fn hub_restart_recovers_a_placing_subtask_instead_of_stranding_it() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (repository, base) = init_repository(&directory);
+    let config = config(&directory);
+    let ca = Arc::new(HubCa::generate().expect("CA"));
+    let service = HubService::open(&config, Arc::clone(&ca))
+        .await
+        .expect("service");
+
+    let dispatch_id = tagteam_core::DispatchId::new();
+    let created = Timestamp::now();
+    let dispatch = Dispatch {
+        id: dispatch_id,
+        main_session: MainSessionId::new(),
+        claude_session: Some("placing-recovery-session".into()),
+        repo: repository.canonicalize().expect("canonical repo"),
+        created,
+    };
+    service
+        .journal(move |journal| journal.create_dispatch(&dispatch))
+        .await
+        .expect("dispatch");
+
+    let subtask = Subtask {
+        id: SubtaskId::new(),
+        dispatch: dispatch_id,
+        spec: spec(&repository, "Crash between create and placement", false),
+        state: SubtaskState::Placing,
+        node: None,
+        attempt: 0,
+        base: tagteam_core::GitOid(base.clone()),
+        repo_id: tagteam_core::RepoId(tagteam_core::GitOid(base)),
+        branch: "tagteam/placing-recovery".into(),
+        runner_session: None,
+        created,
+        started: None,
+        finished: None,
+        usage: tagteam_core::Usage::default(),
+    };
+    let subtask_id = subtask.id;
+    service
+        .journal(move |journal| journal.create_subtask(&subtask))
+        .await
+        .expect("placing subtask");
+    drop(service);
+
+    let restarted = HubService::open(&config, ca)
+        .await
+        .expect("restarted service");
+    restarted
+        .schedule_pending_work()
+        .await
+        .expect("recover placement");
+    let recovered = load_subtask(&restarted, subtask_id).await;
+    assert_eq!(recovered.state, SubtaskState::Queued);
+    assert_eq!(recovered.node, None);
 }
 
 #[tokio::test]
@@ -406,7 +584,10 @@ async fn an_unavailable_node_fails_preparation_after_its_wall_clock_budget() {
     let subtask_id = reply.subtasks[0].0;
 
     let mut state = None;
-    for _ in 0..100 {
+    // Bundle creation and driver startup can exceed a one-millisecond task
+    // budget before the first retry check; leave enough wall time for the
+    // asynchronous failure transition without weakening the assertion.
+    for _ in 0..300 {
         let task = load_subtask(&service, subtask_id).await;
         if matches!(task.state, SubtaskState::Failed { .. }) {
             state = Some(task.state);

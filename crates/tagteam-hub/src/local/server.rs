@@ -187,6 +187,8 @@ fn safe_error(error: &ServiceError) -> String {
         ServiceError::Blob(_)
         | ServiceError::Preparation(_)
         | ServiceError::Runner(_)
+        | ServiceError::TurnLimit
+        | ServiceError::TimeLimit
         | ServiceError::Worker
         | ServiceError::Internal => "internal service error".into(),
     }

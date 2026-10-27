@@ -6,7 +6,7 @@
 #[cfg(target_os = "linux")]
 use std::net::{IpAddr, Ipv4Addr};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     future::Future,
     net::SocketAddr,
@@ -19,7 +19,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use serde_json::Value;
-use tagteam_core::{Bytes, Limits, MAX_BLOB_BYTES, NodePolicy};
+use tagteam_core::{Bytes, CachedRepo, GitOid, Limits, MAX_BLOB_BYTES, NodePolicy, RepoId};
 #[cfg(target_os = "macos")]
 use tagteam_proxy::ProxyServer;
 #[cfg(target_os = "linux")]
@@ -72,6 +72,7 @@ pub struct CommandRunner {
     bundles: Arc<dyn BundleSource>,
     git_toolchain: Option<GitToolchain>,
     running: Arc<Mutex<HashMap<String, CommandCancellation>>>,
+    running_workspaces: Arc<Mutex<HashMap<String, usize>>>,
     workspace_limits: Arc<Mutex<HashMap<String, WorkspaceLimits>>>,
     workspace_egress: Arc<Mutex<HashMap<String, Vec<AllowedHost>>>>,
     policy: NodePolicy,
@@ -164,6 +165,7 @@ impl CommandRunner {
             bundles: Arc::new(bundles),
             git_toolchain: host_git_toolchain(),
             running: Arc::default(),
+            running_workspaces: Arc::default(),
             workspace_limits: Arc::default(),
             workspace_egress: Arc::default(),
             policy: NodePolicy::default(),
@@ -200,6 +202,138 @@ impl CommandRunner {
         token: CancellationToken,
     ) -> Result<Proto::CommandResult, String> {
         self.execute(command, token).await
+    }
+
+    /// Returns workspace IDs that still exist on this node. The hub uses this
+    /// inventory after a reconnect to distinguish a resumable attempt from one
+    /// whose borrowed workspace has disappeared.
+    #[must_use]
+    pub fn workspace_ids(&self) -> Vec<String> {
+        let root = self.data_dir.join("workspaces");
+        let Ok(entries) = fs::read_dir(root) else {
+            return Vec::new();
+        };
+        let mut ids = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_dir() {
+                    return None;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                {
+                    return None;
+                }
+                Some(name)
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    /// Returns the workspace IDs with commands currently executing. The count
+    /// is maintained by the dispatch task, not guessed from directory presence.
+    #[must_use]
+    pub fn running_workspaces(&self) -> Vec<String> {
+        let mut ids = self
+            .running_workspaces
+            .lock()
+            .map(|values| values.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    /// Derives cached repository heads from existing prepared workspaces.
+    /// Failures are omitted; a missing head is never reported as an empty repo.
+    #[must_use]
+    pub fn repo_heads(&self) -> Vec<CachedRepo> {
+        let mut repositories: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for workspace in self.workspace_ids() {
+            let path = self
+                .data_dir
+                .join("workspaces")
+                .join(&workspace)
+                .join("repo");
+            if !path.join(".git").exists() {
+                continue;
+            }
+            let Some(root) = self.git_stdout(&path, &["rev-list", "--max-parents=0", "HEAD"])
+            else {
+                continue;
+            };
+            let Some(root) = root.lines().map(str::trim).find(|line| !line.is_empty()) else {
+                continue;
+            };
+            let Some(head) = self.git_stdout(&path, &["rev-parse", "HEAD"]) else {
+                continue;
+            };
+            let head = head.trim();
+            if root.len() == 40
+                && head.len() == 40
+                && root.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && head.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                repositories
+                    .entry(root.to_owned())
+                    .or_default()
+                    .insert(head.to_owned());
+            }
+        }
+        repositories
+            .into_iter()
+            .map(|(repo, heads)| CachedRepo {
+                repo: RepoId(GitOid(repo)),
+                heads: heads.into_iter().map(GitOid).collect(),
+            })
+            .collect()
+    }
+
+    fn mark_workspace_running(&self, workspace: &str) {
+        if let Ok(mut running) = self.running_workspaces.lock() {
+            let count = running.entry(workspace.to_owned()).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn mark_workspace_idle(&self, workspace: &str) {
+        if let Ok(mut running) = self.running_workspaces.lock()
+            && let Some(count) = running.get_mut(workspace)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                running.remove(workspace);
+            }
+        }
+    }
+
+    fn git_stdout(&self, root: &Path, args: &[&str]) -> Option<String> {
+        let executable = self
+            .git_toolchain
+            .as_ref()
+            .map(|toolchain| toolchain.executable.as_path())
+            .unwrap_or_else(|| Path::new("git"));
+        let output = std::process::Command::new(executable)
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", "/dev/null")
+            .env("GIT_CONFIG_KEY_1", "core.fsmonitor")
+            .env("GIT_CONFIG_VALUE_1", "false")
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8(output.stdout).ok())
+            .flatten()
     }
 
     /// Records a receipt synchronously, then runs once in a task so cancellation events remain live.
@@ -253,7 +387,7 @@ impl CommandRunner {
                     Err(_) => Err(false),
                 };
                 match registration {
-                    Ok(()) => {}
+                    Ok(()) => self.mark_workspace_running(&command.workspace),
                     Err(cancelled_before_dispatch) => {
                         let message = if cancelled_before_dispatch {
                             "command was cancelled before dispatch"
@@ -326,6 +460,7 @@ impl CommandRunner {
                     if let Ok(mut running) = runner.running.lock() {
                         running.remove(&id);
                     }
+                    runner.mark_workspace_idle(&command.workspace);
                 });
             }
         }

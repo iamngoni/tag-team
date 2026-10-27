@@ -593,6 +593,7 @@ pub enum SubtaskState {
     Placing,
     Preparing,
     Running,
+    Paused,
     WaitingOnMain { question: QuestionId },
     Reassigning { reason: ReassignReason },
     Collecting,
@@ -616,7 +617,11 @@ impl SubtaskState {
     pub const fn occupies_worker_slot(&self) -> bool {
         matches!(
             self,
-            Self::Preparing | Self::Running | Self::WaitingOnMain { .. } | Self::Collecting
+            Self::Preparing
+                | Self::Running
+                | Self::Paused
+                | Self::WaitingOnMain { .. }
+                | Self::Collecting
         )
     }
 }

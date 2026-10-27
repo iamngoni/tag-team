@@ -61,6 +61,10 @@ pub enum ServiceError {
     Preparation(String),
     #[error("runner failed: {0}")]
     Runner(String),
+    #[error("runner reached its turn limit")]
+    TurnLimit,
+    #[error("runner reached its wall-clock limit")]
+    TimeLimit,
     #[error("request is invalid: {0}")]
     Invalid(String),
     #[error("record was not found: {0}")]
@@ -498,13 +502,55 @@ impl HubService {
                 .await?;
         }
         for (id, policy) in returned {
-            if policy != OnReturn::FinishRunning {
-                self.reassign_tasks_from_node(id, ReassignReason::OwnerReturned)
-                    .await?;
-            }
+            self.apply_owner_return_policy(id, policy).await?;
         }
 
         self.schedule_pending_work().await
+    }
+
+    /// Applies the owner-controlled policy at one return transition. Keeping
+    /// this mapping in one place prevents pause and hand-back from drifting into
+    /// the same destructive behavior.
+    async fn apply_owner_return_policy(
+        &self,
+        node: tagteam_core::NodeId,
+        policy: OnReturn,
+    ) -> Result<(), ServiceError> {
+        match policy {
+            OnReturn::FinishRunning => Ok(()),
+            OnReturn::Pause => self.pause_running_tasks(node).await,
+            OnReturn::HandBack => {
+                self.reassign_tasks_from_node(node, ReassignReason::OwnerReturned)
+                    .await
+            }
+        }
+    }
+
+    /// Stops the model loop but retains the borrowed workspace and conversation
+    /// so the same attempt can resume when the owner becomes idle again. Only
+    /// actively running work is paused; preparation and result landing are
+    /// short lifecycle operations that should reach a safe boundary.
+    async fn pause_running_tasks(&self, node: tagteam_core::NodeId) -> Result<(), ServiceError> {
+        let tasks = self.journal(|journal| journal.list_subtasks()).await?;
+        for task in tasks {
+            if task.node != Some(node) || task.state != SubtaskState::Running {
+                continue;
+            }
+            let id = task.id;
+            let transition = self
+                .journal(move |journal| {
+                    journal
+                        .transition(id, SubtaskInput::Pause, Timestamp::now())
+                        .map(|_| ())
+                })
+                .await;
+            if transition.is_err() {
+                continue;
+            }
+            self.cancel_task_work(id, "subtask paused because the owner returned")
+                .await;
+        }
+        Ok(())
     }
 
     /// Moves unfinished work off a node and cancels local and remote activity
@@ -521,6 +567,7 @@ impl HubService {
                     task.state,
                     SubtaskState::Preparing
                         | SubtaskState::Running
+                        | SubtaskState::Paused
                         | SubtaskState::WaitingOnMain { .. }
                         | SubtaskState::Collecting
                 )
@@ -558,7 +605,7 @@ impl HubService {
             .iter()
             .filter(|task| task.state.occupies_worker_slot())
             .count();
-        let online_nodes = nodes
+        let mut online_nodes = nodes
             .iter()
             .filter(|node| self.nodes.is_online(node.id))
             .cloned()
@@ -566,6 +613,44 @@ impl HubService {
 
         for task in &tasks {
             match task.state {
+                // A crash between durable subtask creation and the placement
+                // transition leaves the row in Placing with no node. Recover it
+                // through the same state machine as fresh queued work, and
+                // record a NoFit reason so the state never remains ambiguous.
+                SubtaskState::Placing => {
+                    let placement = if account_used >= self.max_concurrent_per_account {
+                        Placement::Queued(vec![NoFitReason::AccountAtCapacity])
+                    } else {
+                        place(&task.spec, &task.repo_id, &online_nodes, &[])
+                    };
+                    match placement {
+                        Placement::Placed(node) => {
+                            account_used = account_used.saturating_add(1);
+                            mark_node_slot_used(&mut online_nodes, node);
+                            let id = task.id;
+                            self.journal(move |journal| {
+                                journal
+                                    .transition(id, SubtaskInput::Placed { node }, Timestamp::now())
+                                    .map(|_| ())
+                            })
+                            .await?;
+                            self.ensure_driver(id, node).await;
+                        }
+                        Placement::Queued(reasons) => {
+                            let id = task.id;
+                            self.journal(move |journal| {
+                                journal
+                                    .transition(
+                                        id,
+                                        SubtaskInput::NoFit { reasons },
+                                        Timestamp::now(),
+                                    )
+                                    .map(|_| ())
+                            })
+                            .await?;
+                        }
+                    }
+                }
                 SubtaskState::Queued | SubtaskState::Reassigning { .. } => {
                     if account_used >= self.max_concurrent_per_account {
                         continue;
@@ -576,6 +661,7 @@ impl HubService {
                         continue;
                     };
                     account_used = account_used.saturating_add(1);
+                    mark_node_slot_used(&mut online_nodes, node);
                     let id = task.id;
                     self.journal(move |journal| {
                         journal
@@ -584,6 +670,23 @@ impl HubService {
                     })
                     .await?;
                     self.ensure_driver(id, node).await;
+                }
+                SubtaskState::Paused => {
+                    if let Some(node) = task.node
+                        && self.nodes.is_online(node)
+                        && online_nodes.iter().any(|candidate| {
+                            candidate.id == node && candidate.state == NodeState::Active
+                        })
+                    {
+                        let id = task.id;
+                        self.journal(move |journal| {
+                            journal
+                                .transition(id, SubtaskInput::Resume, Timestamp::now())
+                                .map(|_| ())
+                        })
+                        .await?;
+                        self.ensure_driver(id, node).await;
+                    }
                 }
                 SubtaskState::Preparing | SubtaskState::Running => {
                     if let Some(node) = task.node
@@ -624,6 +727,8 @@ impl HubService {
                     ServiceError::Preparation(_) => {
                         FailReason::Bundle(bounded_error(&error.to_string()))
                     }
+                    ServiceError::TurnLimit => FailReason::TurnLimit,
+                    ServiceError::TimeLimit => FailReason::TimeLimit,
                     _ => FailReason::Runner(bounded_error(&error.to_string())),
                 };
                 tracing::warn!(subtask = %id, node = %node, %error, "subtask driver failed");
@@ -647,6 +752,7 @@ impl HubService {
         match task.state {
             SubtaskState::Preparing => self.prepare_subtask(&task, node).await?,
             SubtaskState::Running => return self.run_prepared_subtask(id, node).await,
+            SubtaskState::Paused => return Ok(()),
             _ => return Ok(()),
         }
         let prepared = self
@@ -1060,9 +1166,7 @@ impl HubService {
             }
             Err(_) => {
                 process.kill().await;
-                Err(ServiceError::Runner(
-                    "runner exceeded its wall-clock budget".into(),
-                ))
+                Err(ServiceError::TimeLimit)
             }
         }
     }
@@ -1275,12 +1379,7 @@ impl HubService {
                             error,
                             session_id: _,
                             cost_usd: _,
-                        } => {
-                            return Err(ServiceError::Runner(format!(
-                                "runner exited before finish ({subtype}{})",
-                                error.map(|error| format!(": {error}")).unwrap_or_default()
-                            )));
-                        }
+                        } => return Err(runner_exit_error(&subtype, error)),
                         RunnerToHubMessage::DeliveryAck { delivery_id } => {
                             self.journal(move |journal| {
                                 journal.acknowledge_runner_delivery(delivery_id, Timestamp::now())
@@ -2354,6 +2453,15 @@ fn ensure_prepare_succeeded(result: &Proto::CommandResult) -> Result<(), Service
 /// Replaces heartbeat's process-local running count with the durable account of
 /// work that still holds a node slot. Heartbeats cannot know about work queued
 /// between process restarts; the scheduler must use durable state instead.
+/// Keeps the scheduler's local placement snapshot in step after assigning one
+/// task. Heartbeats are authoritative on the next pass, but a single pass must
+/// not overfill a node before it publishes an updated running count.
+fn mark_node_slot_used(nodes: &mut [tagteam_core::Node], selected: tagteam_core::NodeId) {
+    if let Some(node) = nodes.iter_mut().find(|node| node.id == selected) {
+        node.capacity.running = node.capacity.running.saturating_add(1);
+    }
+}
+
 fn refresh_node_running(nodes: &mut [tagteam_core::Node], tasks: &[Subtask]) {
     for node in nodes {
         let running = tasks
@@ -2361,6 +2469,20 @@ fn refresh_node_running(nodes: &mut [tagteam_core::Node], tasks: &[Subtask]) {
             .filter(|task| task.node == Some(node.id) && task.state.occupies_worker_slot())
             .count();
         node.capacity.running = u16::try_from(running).unwrap_or(u16::MAX);
+    }
+}
+
+/// Converts a runner's terminal result into the exact domain failure. The
+/// runner emits SDK result subtypes verbatim; preserving the distinction
+/// between a turn cap and wall-clock expiry keeps operator guidance actionable.
+fn runner_exit_error(subtype: &str, error: Option<String>) -> ServiceError {
+    match subtype {
+        "wall_clock_limit" => ServiceError::TimeLimit,
+        "error_max_turns" => ServiceError::TurnLimit,
+        _ => ServiceError::Runner(format!(
+            "runner exited before finish ({subtype}{})",
+            error.map(|error| format!(": {error}")).unwrap_or_default()
+        )),
     }
 }
 
@@ -2418,6 +2540,7 @@ fn state_label(state: &SubtaskState) -> &'static str {
         SubtaskState::Placing => "placing",
         SubtaskState::Preparing => "preparing",
         SubtaskState::Running => "running",
+        SubtaskState::Paused => "paused",
         SubtaskState::WaitingOnMain { .. } => "waiting_on_main",
         SubtaskState::Reassigning { .. } => "reassigning",
         SubtaskState::Collecting => "collecting",
