@@ -159,7 +159,11 @@ impl Drop for TlsUpstream {
 fn sandbox_runtime_available() -> bool {
     #[cfg(target_os = "linux")]
     {
-        if !Path::new("/usr/bin/systemd-run").exists() || !Path::new("/usr/bin/bwrap").exists() {
+        if !Path::new("/usr/bin/systemd-run").exists()
+            || !Path::new("/usr/bin/bwrap").exists()
+            || std::env::var_os("XDG_RUNTIME_DIR").is_none()
+            || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
+        {
             return false;
         }
         std::process::Command::new("/usr/bin/systemd-run")
