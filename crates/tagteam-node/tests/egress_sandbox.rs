@@ -162,10 +162,10 @@ fn sandbox_runtime_available() -> bool {
         if !Path::new("/usr/bin/systemd-run").exists() || !Path::new("/usr/bin/bwrap").exists() {
             return false;
         }
-        return std::process::Command::new("/usr/bin/systemd-run")
+        std::process::Command::new("/usr/bin/systemd-run")
             .args(["--user", "--scope", "--quiet", "--", "/usr/bin/true"])
             .status()
-            .is_ok_and(|status| status.success());
+            .is_ok_and(|status| status.success())
     }
     #[cfg(target_os = "macos")]
     {
