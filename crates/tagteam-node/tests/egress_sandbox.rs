@@ -4,6 +4,8 @@
 //!
 //! This test owns a local TLS fixture and proxy; all assertions exercise the platform sandbox.
 
+mod support;
+
 use std::{
     error::Error,
     future::Future,
@@ -156,35 +158,9 @@ impl Drop for TlsUpstream {
     }
 }
 
-fn sandbox_runtime_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        if !Path::new("/usr/bin/systemd-run").exists()
-            || !Path::new("/usr/bin/bwrap").exists()
-            || std::env::var_os("XDG_RUNTIME_DIR").is_none()
-            || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
-        {
-            return false;
-        }
-        std::process::Command::new("/usr/bin/systemd-run")
-            .args(["--user", "--scope", "--quiet", "--", "/usr/bin/true"])
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        true
-    }
-}
-
 #[tokio::test]
 async fn egress_is_proxy_only_inside_the_os_sandbox() -> Result<(), Box<dyn Error + Send + Sync>> {
-    if !sandbox_runtime_available() {
-        let message = "a working Linux user systemd manager, /usr/bin/systemd-run, and /usr/bin/bwrap are required; skipping confined egress test";
-        if std::env::var_os("TAGTEAM_REQUIRE_LINUX_SANDBOX").is_some() {
-            panic!("{message}");
-        }
-        eprintln!("{message}");
+    if support::skip_without_linux_sandbox("confined egress test") {
         return Ok(());
     }
 

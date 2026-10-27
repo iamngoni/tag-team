@@ -5,6 +5,8 @@
 //! real hub, node, sandbox, blob, git, and cancellation boundaries without
 //! spending model tokens or touching a live machine.
 
+mod support;
+
 use std::{
     fs,
     net::{Ipv4Addr, SocketAddr},
@@ -154,10 +156,7 @@ async fn wait_for_capacity(service: &HubService) {
 
 #[tokio::test]
 async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
-    if cfg!(target_os = "linux")
-        && (!Path::new("/usr/bin/systemd-run").exists() || !Path::new("/usr/bin/bwrap").exists())
-    {
-        eprintln!("sandbox tools unavailable; workspace preparation spine is skipped");
+    if support::skip_without_linux_sandbox("workspace preparation spine") {
         return;
     }
 

@@ -4,6 +4,8 @@
 //! This uses the production hub/node/mTLS/sandbox path and the shared
 //! deterministic runner fixture. It spends no model tokens.
 
+mod support;
+
 use std::{
     fs,
     net::{Ipv4Addr, SocketAddr},
@@ -207,10 +209,7 @@ async fn status(service: &HubService, subtask: tagteam_core::SubtaskId) -> Strin
 
 #[tokio::test]
 async fn lost_node_work_is_reassigned_and_completed_by_the_surviving_node() {
-    if cfg!(target_os = "linux")
-        && (!Path::new("/usr/bin/systemd-run").exists() || !Path::new("/usr/bin/bwrap").exists())
-    {
-        eprintln!("sandbox tools unavailable; two-node recovery proof is skipped");
+    if support::skip_without_linux_sandbox("two-node recovery proof") {
         return;
     }
 
