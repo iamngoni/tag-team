@@ -38,6 +38,7 @@ thiserror.workspace = true
 data-encoding.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 tagteam-hub = { path = "../tagteam-hub" }
 tempfile.workspace = true
 
