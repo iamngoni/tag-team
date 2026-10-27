@@ -15,10 +15,10 @@ use std::{
 };
 
 use tagteam_core::{
-    Bytes, Capacity, Limits, MainSessionId, Needs, SubtaskSpec, SubtaskState, Thermal,
+    Bytes, Capacity, FailReason, Limits, MainSessionId, Needs, SubtaskSpec, SubtaskState, Thermal,
     local_api::{DispatchInput, LocalRequest, LocalResponseBody},
 };
-use tagteam_hub::{config::HubConfig, service::HubService};
+use tagteam_hub::{config::HubConfig, journal::Journal, service::HubService};
 use tagteam_node::{
     CommandJournal, CommandRunner, HeartbeatSource, HubBundleSource, NodeEnrollment, NodeSession,
     SessionEvent,
@@ -38,6 +38,8 @@ impl HeartbeatSource for TestHeartbeat {
                 disk_free: Bytes::gib(64).0,
                 running: 0,
                 on_battery: false,
+                battery_known: true,
+                local_minute_of_day: Some(10 * 60),
                 thermal: "nominal".into(),
             }),
             presence: tagteam_proto::v1::OwnerPresence::Away as i32,
@@ -132,6 +134,8 @@ async fn wait_for_capacity(service: &HubService) {
                         disk_free: Bytes::gib(64),
                         running: 0,
                         on_battery: false,
+                        battery_known: true,
+                        local_minute_of_day: Some(10 * 60),
                         thermal: Thermal::Nominal,
                     }
         }) {
@@ -399,6 +403,96 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
     assert_eq!(
         git_output(&repository, &["symbolic-ref", "--short", "HEAD"]).trim(),
         "main"
+    );
+
+    let oversized_limits = Limits {
+        max_patch: Bytes::kib(1),
+        ..Limits::default()
+    };
+    let oversized = match service
+        .handle(LocalRequest::Dispatch(DispatchInput {
+            main_session: MainSessionId::new(),
+            claude_session: Some("spine-oversized-patch".into()),
+            repo: repository.clone(),
+            subtasks: vec![SubtaskSpec {
+                title: "Reject an oversized aggregate patch".into(),
+                prompt: "oversized-patch".into(),
+                done_when: vec!["true".into()],
+                repo: repository.clone(),
+                base_ref: "main".into(),
+                include_uncommitted: false,
+                needs: Needs::default(),
+                limits: oversized_limits,
+                egress: Vec::new(),
+                node_hint: None,
+            }],
+            spread: false,
+        }))
+        .await
+        .expect("oversized-patch dispatch")
+    {
+        LocalResponseBody::Dispatched(dispatch) => dispatch,
+        other => panic!("unexpected oversized-patch dispatch response: {other:?}"),
+    };
+    let oversized_subtask = oversized.subtasks[0].0;
+    let mut oversized_branch = None;
+    let mut oversized_progress = None;
+    for _ in 0..600 {
+        let status = match service
+            .handle(LocalRequest::Status {
+                claude_session: None,
+                ids: Some(vec![oversized_subtask]),
+            })
+            .await
+            .expect("oversized-patch status")
+        {
+            LocalResponseBody::Status(status) => status,
+            other => panic!("unexpected oversized-patch status response: {other:?}"),
+        };
+        let current = &status.subtasks[0];
+        oversized_branch = current.branch.clone();
+        oversized_progress = current.last_progress.clone();
+        if current.state == "failed" {
+            break;
+        }
+        assert_ne!(
+            current.state, "done",
+            "an oversized aggregate patch must not land successfully"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let journal = Journal::open(&service.paths().journal).expect("open hub journal for assertion");
+    let oversized_task = journal
+        .load_subtask(oversized_subtask)
+        .expect("load oversized subtask")
+        .expect("oversized subtask exists");
+    match oversized_task.state {
+        SubtaskState::Failed {
+            reason: FailReason::PatchTooLarge { limit, .. },
+        } => assert_eq!(limit, Bytes::kib(1)),
+        state => panic!(
+            "oversized patch must fail with PatchTooLarge, got {state:?}; last progress: {oversized_progress:?}"
+        ),
+    }
+    let oversized_branch = oversized_branch.expect("oversized-patch branch name");
+    assert!(
+        !git_status(
+            &repository,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{oversized_branch}")
+            ],
+        ),
+        "an oversized result must not create a review branch"
+    );
+    let oversized_workspace = node_data
+        .join("workspaces")
+        .join(oversized_subtask.to_string());
+    assert!(
+        !oversized_workspace.exists(),
+        "an oversized result must still clean up its borrowed-machine workspace"
     );
 
     let cancellation = match service

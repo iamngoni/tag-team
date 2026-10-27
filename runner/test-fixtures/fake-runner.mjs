@@ -6,7 +6,7 @@
 
 import { createInterface } from "node:readline";
 
-const version = 1;
+const version = 2;
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const pending = [];
 let waiter;
@@ -85,6 +85,36 @@ if (String(start.prompt).includes("cancel-during-check")) {
       tool: "finish",
       outcome: "completed",
       summary: "Fake runner requested an authoritative check.",
+      assumptions: [],
+      checks: [],
+    },
+  });
+  await next();
+  process.exit(0);
+}
+
+if (String(start.prompt).includes("oversized-patch")) {
+  send({
+    type: "tool_call",
+    call_id: "fake-oversized-bash-1",
+    call: {
+      tool: "bash",
+      command: "printf 'x%.0s' {1..2048} > oversized.txt",
+      timeout_ms: 30000,
+    },
+  });
+  const bashResult = await next();
+  if (bashResult.type !== "tool_result" || bashResult.is_error) {
+    send({ type: "note", text: `oversized-patch Bash failed: ${JSON.stringify(bashResult)}` });
+    throw new Error(`oversized-patch Bash failed: ${JSON.stringify(bashResult)}`);
+  }
+  send({
+    type: "tool_call",
+    call_id: "fake-oversized-finish-1",
+    call: {
+      tool: "finish",
+      outcome: "completed",
+      summary: "Fake runner intentionally exceeded the aggregate patch limit.",
       assumptions: [],
       checks: [],
     },
