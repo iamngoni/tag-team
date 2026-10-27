@@ -156,14 +156,31 @@ impl Drop for TlsUpstream {
     }
 }
 
+fn sandbox_runtime_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if !Path::new("/usr/bin/systemd-run").exists() || !Path::new("/usr/bin/bwrap").exists() {
+            return false;
+        }
+        return std::process::Command::new("/usr/bin/systemd-run")
+            .args(["--user", "--scope", "--quiet", "--", "/usr/bin/true"])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+}
+
 #[tokio::test]
 async fn egress_is_proxy_only_inside_the_os_sandbox() -> Result<(), Box<dyn Error + Send + Sync>> {
-    if cfg!(target_os = "linux")
-        && (!Path::new("/usr/bin/systemd-run").exists() || !Path::new("/usr/bin/bwrap").exists())
-    {
-        eprintln!(
-            "/usr/bin/systemd-run or /usr/bin/bwrap unavailable; skipping confined egress test"
-        );
+    if !sandbox_runtime_available() {
+        let message = "a working Linux user systemd manager, /usr/bin/systemd-run, and /usr/bin/bwrap are required; skipping confined egress test";
+        if std::env::var_os("TAGTEAM_REQUIRE_LINUX_SANDBOX").is_some() {
+            panic!("{message}");
+        }
+        eprintln!("{message}");
         return Ok(());
     }
 
