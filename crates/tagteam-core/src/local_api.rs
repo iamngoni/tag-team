@@ -3,8 +3,8 @@ use std::{path::PathBuf, time::Duration};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DispatchId, Event, MainSessionId, Node, ResultSummary, SubtaskId, SubtaskSpec, Usage,
-    schedule::Placement,
+    AnsweredBy, DispatchId, Event, MainSessionId, Node, QuestionId, ResultSummary, SubtaskId,
+    SubtaskSpec, Usage, schedule::Placement,
 };
 
 /// Version carried by the private CLI/MCP attach handshake.
@@ -51,6 +51,8 @@ pub struct SubtaskStatus {
     pub usage: Usage,
     pub last_progress: Option<String>,
     pub open_question: Option<String>,
+    pub open_question_text: Option<String>,
+    pub question_deadline: Option<crate::Timestamp>,
     pub branch: Option<String>,
 }
 
@@ -98,6 +100,32 @@ pub struct InviteReply {
     pub expires_in_seconds: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerAuthor {
+    MainClaude,
+    You,
+}
+
+impl AnswerAuthor {
+    #[must_use]
+    pub const fn answered_by(self) -> AnsweredBy {
+        match self {
+            Self::MainClaude => AnsweredBy::MainClaude,
+            Self::You => AnsweredBy::You,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerReply {
+    pub subtask: SubtaskId,
+    pub question: QuestionId,
+    pub text: String,
+    pub by: AnsweredBy,
+    pub delivered: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LocalRequest {
@@ -115,12 +143,16 @@ pub enum LocalRequest {
     Dispatch(DispatchInput),
     Status {
         ids: Option<Vec<SubtaskId>>,
+        #[serde(default)]
+        claude_session: Option<String>,
     },
     Inbox {
         since_seq: u64,
         wait_ms: u64,
         kinds: Option<Vec<String>>,
         all: bool,
+        #[serde(default)]
+        claude_session: Option<String>,
     },
     Watch {
         scope: WatchScope,
@@ -129,14 +161,35 @@ pub enum LocalRequest {
     Logs {
         subtask: SubtaskId,
         tail: u32,
+        #[serde(default)]
+        claude_session: Option<String>,
     },
     Cancel {
         subtask: SubtaskId,
         reason: String,
+        #[serde(default)]
+        claude_session: Option<String>,
     },
     Collect {
         subtask: SubtaskId,
         worktree: bool,
+        #[serde(default)]
+        claude_session: Option<String>,
+    },
+    Answer {
+        subtask: SubtaskId,
+        #[serde(default)]
+        question: Option<QuestionId>,
+        text: String,
+        author: AnswerAuthor,
+        #[serde(default)]
+        claude_session: Option<String>,
+    },
+    Steer {
+        subtask: SubtaskId,
+        text: String,
+        #[serde(default)]
+        claude_session: Option<String>,
     },
     Brief {
         claude_session: String,
@@ -172,6 +225,8 @@ pub enum LocalResponseBody {
     Logs(LogsReply),
     Cancelled { subtask: SubtaskId },
     Collected(CollectReply),
+    Answered(AnswerReply),
+    Steered { subtask: SubtaskId },
     Brief(BriefReply),
     Invited(InviteReply),
     NodeChanged { name: String },

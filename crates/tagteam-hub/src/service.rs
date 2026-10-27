@@ -14,13 +14,14 @@ use std::{
 
 use data_encoding::BASE32_NOPAD;
 use tagteam_core::{
-    Assumption, BlobRef, Check, Dispatch, DispatchId, Event, EventKind, FailReason, MAX_BLOB_BYTES,
-    MainSessionId, Outcome, RepoId, ResultSummary, Subtask, SubtaskId, SubtaskSpec, SubtaskState,
-    Timestamp,
+    AnsweredBy, Assumption, BlobRef, Check, Dispatch, DispatchId, Event, EventKind, FailReason,
+    MAX_BLOB_BYTES, MainSessionId, NodeState, OnReturn, Outcome, OwnerPresence, Question,
+    QuestionId, ReassignReason, RepoId, ResultSummary, Subtask, SubtaskId, SubtaskSpec,
+    SubtaskState, Timestamp,
     local_api::{
-        BriefReply, CollectReply, DispatchInput, DispatchReply, InviteReply,
-        LOCAL_PROTOCOL_VERSION, LocalRequest, LocalResponseBody, LogsReply, NodeView, StatusReply,
-        SubtaskStatus, WatchScope,
+        AnswerAuthor, AnswerReply, BriefReply, CollectReply, DispatchInput, DispatchReply,
+        InviteReply, LOCAL_PROTOCOL_VERSION, LocalRequest, LocalResponseBody, LogsReply, NodeView,
+        StatusReply, SubtaskStatus, WatchScope,
     },
     render::{ExecReport, tail_middle},
     runner_proto::{
@@ -74,6 +75,13 @@ pub enum ServiceError {
     Internal,
 }
 
+#[derive(Debug, Clone)]
+struct NodeObservation {
+    online: bool,
+    presence: OwnerPresence,
+    state_since: Timestamp,
+}
+
 /// Shared daemon application state.
 #[derive(Clone)]
 pub struct HubService {
@@ -86,8 +94,11 @@ pub struct HubService {
     claude_sessions: Arc<AsyncMutex<HashMap<MainSessionId, String>>>,
     runner_program: String,
     runner_args: Vec<String>,
+    heartbeat_timeout: Duration,
     runners: Arc<AsyncMutex<HashMap<SubtaskId, tokio::sync::mpsc::Sender<HubToRunnerMessage>>>>,
     active_commands: Arc<AsyncMutex<HashMap<SubtaskId, (tagteam_core::NodeId, String)>>>,
+    node_observations: Arc<AsyncMutex<HashMap<tagteam_core::NodeId, NodeObservation>>>,
+    drivers: Arc<AsyncMutex<HashSet<SubtaskId>>>,
     landing: Arc<AsyncMutex<()>>,
 }
 
@@ -99,9 +110,28 @@ impl HubService {
         let journal = tokio::task::spawn_blocking(move || Journal::open(journal_path))
             .await
             .map_err(|_| ServiceError::Worker)??;
+        let journal = Arc::new(Mutex::new(journal));
+        let started = Timestamp::now();
+        let initial_nodes = {
+            let store = journal.lock().map_err(|_| ServiceError::Internal)?;
+            store.list_nodes()?
+        };
+        let node_observations = initial_nodes
+            .into_iter()
+            .map(|node| {
+                (
+                    node.id,
+                    NodeObservation {
+                        online: false,
+                        presence: node.presence,
+                        state_since: started,
+                    },
+                )
+            })
+            .collect();
         let nodes = NodePlane::with_ca(&paths.journal, &paths.blobs, Arc::clone(&ca)).await?;
         Ok(Self {
-            journal: Arc::new(Mutex::new(journal)),
+            journal,
             nodes,
             ca,
             public_address: config.public_address.clone(),
@@ -110,8 +140,11 @@ impl HubService {
             claude_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
             runner_program: config.runner_program.clone(),
             runner_args: config.runner_args.clone(),
+            heartbeat_timeout: config.heartbeat_timeout,
             runners: Arc::new(AsyncMutex::new(HashMap::new())),
             active_commands: Arc::new(AsyncMutex::new(HashMap::new())),
+            node_observations: Arc::new(AsyncMutex::new(node_observations)),
+            drivers: Arc::new(AsyncMutex::new(HashSet::new())),
             landing: Arc::new(AsyncMutex::new(())),
         })
     }
@@ -175,30 +208,74 @@ impl HubService {
                 .dispatch(input)
                 .await
                 .map(LocalResponseBody::Dispatched),
-            LocalRequest::Status { ids } => self.status(ids).await.map(LocalResponseBody::Status),
+            LocalRequest::Status {
+                ids,
+                claude_session,
+            } => self
+                .status(ids, claude_session.as_deref())
+                .await
+                .map(LocalResponseBody::Status),
             LocalRequest::Inbox {
                 since_seq,
                 wait_ms,
                 kinds,
-                all: _,
+                all,
+                claude_session,
             } => self
-                .inbox(since_seq, wait_ms, kinds.as_deref())
+                .inbox(
+                    since_seq,
+                    wait_ms,
+                    kinds.as_deref(),
+                    if all { None } else { claude_session.as_deref() },
+                )
                 .await
                 .map(LocalResponseBody::Events),
             LocalRequest::Watch { .. } => Err(ServiceError::Unsupported(
                 "watch is a streaming request".into(),
             )),
-            LocalRequest::Logs { subtask, tail } => {
-                self.logs(subtask, tail).await.map(LocalResponseBody::Logs)
-            }
-            LocalRequest::Cancel { subtask, reason } => {
-                self.cancel(subtask, reason).await?;
+            LocalRequest::Logs {
+                subtask,
+                tail,
+                claude_session,
+            } => self
+                .logs(subtask, tail, claude_session.as_deref())
+                .await
+                .map(LocalResponseBody::Logs),
+            LocalRequest::Cancel {
+                subtask,
+                reason,
+                claude_session,
+            } => {
+                self.cancel(subtask, reason, claude_session.as_deref())
+                    .await?;
                 Ok(LocalResponseBody::Cancelled { subtask })
             }
-            LocalRequest::Collect { subtask, worktree } => self
-                .collect(subtask, worktree)
+            LocalRequest::Collect {
+                subtask,
+                worktree,
+                claude_session,
+            } => self
+                .collect(subtask, worktree, claude_session.as_deref())
                 .await
                 .map(LocalResponseBody::Collected),
+            LocalRequest::Answer {
+                subtask,
+                question,
+                text,
+                author,
+                claude_session,
+            } => self
+                .answer(subtask, question, text, author, claude_session.as_deref())
+                .await
+                .map(LocalResponseBody::Answered),
+            LocalRequest::Steer {
+                subtask,
+                text,
+                claude_session,
+            } => {
+                self.steer(subtask, text, claude_session.as_deref()).await?;
+                Ok(LocalResponseBody::Steered { subtask })
+            }
             LocalRequest::Brief { claude_session } => self
                 .brief(&claude_session)
                 .await
@@ -220,19 +297,25 @@ impl HubService {
         since_seq: u64,
         wait_ms: u64,
         kinds: Option<&[String]>,
+        claude_session: Option<&str>,
     ) -> Result<Vec<Event>, ServiceError> {
         let wait_ms = wait_ms.min(50_000);
         let kinds = kinds.unwrap_or_default().to_vec();
+        let claude_session = claude_session.map(str::to_owned);
+        let visible = self
+            .journal(move |journal| journal.visible_subtask_ids(claude_session.as_deref()))
+            .await?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
         loop {
             let kinds = kinds.clone();
+            let visible = visible.clone();
             let events = self
                 .journal(move |journal| {
                     let kind_refs = kinds.iter().map(String::as_str).collect::<Vec<_>>();
                     journal.events(EventFilter {
                         since_seq,
                         kinds: &kind_refs,
-                        scope: EventScope::All,
+                        scope: EventScope::Watch(&visible),
                         limit: 512,
                     })
                 })
@@ -293,6 +376,291 @@ impl HubService {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    /// Reconciles the durable node lease, owner-return policy and queued work.
+    ///
+    /// This pass is intentionally idempotent: node sessions are process-local,
+    /// while every state change is committed by the journal before a new driver
+    /// is started. A hub restart therefore cannot reassign work until the node
+    /// or a clean alternative has had one full heartbeat window to reconnect.
+    pub async fn reconcile_nodes(&self) -> Result<(), ServiceError> {
+        let now = Timestamp::now();
+        let timeout_ms = i64::try_from(self.heartbeat_timeout.as_millis()).unwrap_or(i64::MAX);
+        let mut nodes = self.journal(|journal| journal.list_nodes()).await?;
+        let mut lost = Vec::new();
+        let mut restore = Vec::new();
+        let mut owner_busy = Vec::new();
+        let mut idle_again = Vec::new();
+        let mut returned = Vec::new();
+
+        {
+            let mut observations = self.node_observations.lock().await;
+            for node in &mut nodes {
+                let online = self.nodes.is_online(node.id);
+                let observation = observations.entry(node.id).or_insert(NodeObservation {
+                    online,
+                    presence: node.presence,
+                    state_since: now,
+                });
+                let was_online = observation.online;
+                if observation.online != online {
+                    observation.state_since = now;
+                }
+                let previous_presence = observation.presence;
+                observation.online = online;
+                observation.presence = node.presence;
+
+                if online && !was_online && node.state == NodeState::Lost {
+                    restore.push(node.id);
+                    node.state = if node.policy.only_when_idle
+                        && matches!(node.presence, OwnerPresence::Present)
+                    {
+                        owner_busy.push(node.id);
+                        NodeState::OwnerBusy
+                    } else {
+                        NodeState::Active
+                    };
+                }
+
+                if online && node.policy.only_when_idle {
+                    if matches!(previous_presence, OwnerPresence::Away { .. })
+                        && matches!(node.presence, OwnerPresence::Present)
+                        && node.state == NodeState::Active
+                    {
+                        node.state = NodeState::OwnerBusy;
+                        owner_busy.push(node.id);
+                        returned.push((node.id, node.policy.on_owner_return));
+                    } else if matches!(previous_presence, OwnerPresence::Present)
+                        && matches!(node.presence, OwnerPresence::Away { .. })
+                        && node.state == NodeState::OwnerBusy
+                    {
+                        node.state = NodeState::Active;
+                        idle_again.push(node.id);
+                    }
+                }
+
+                if matches!(node.state, NodeState::Active | NodeState::OwnerBusy) {
+                    let lease_floor = node.last_seen.0.max(observation.state_since.0);
+                    if now.0.saturating_sub(lease_floor) >= timeout_ms {
+                        if online {
+                            self.nodes.disconnect(node.id);
+                        }
+                        observation.online = false;
+                        observation.state_since = now;
+                        node.state = NodeState::Lost;
+                        lost.push(node.id);
+                    }
+                }
+            }
+        }
+
+        let lost_ids = lost.iter().copied().collect::<HashSet<_>>();
+        returned.retain(|(node, _)| !lost_ids.contains(node));
+
+        let lost_for_journal = lost.clone();
+        for id in lost_for_journal {
+            if let Err(error) = self
+                .journal(move |journal| journal.mark_node_lost(id))
+                .await
+            {
+                tracing::debug!(%error, %id, "node was already moved out of a leaseable state");
+            }
+        }
+        for id in restore {
+            self.journal(move |journal| journal.restore_lost_node(id))
+                .await?;
+        }
+        for id in owner_busy {
+            self.journal(move |journal| journal.mark_node_owner_busy(id))
+                .await?;
+        }
+        for id in idle_again {
+            self.journal(move |journal| journal.restore_idle_node(id))
+                .await?;
+        }
+        for id in lost {
+            self.reassign_tasks_from_node(id, ReassignReason::NodeLost)
+                .await?;
+        }
+        for (id, policy) in returned {
+            if policy != OnReturn::FinishRunning {
+                self.reassign_tasks_from_node(id, ReassignReason::OwnerReturned)
+                    .await?;
+            }
+        }
+
+        self.schedule_pending_work(now).await
+    }
+
+    /// Moves unfinished work off a node and cancels local and remote activity
+    /// before the scheduler is allowed to place the same subtask elsewhere.
+    async fn reassign_tasks_from_node(
+        &self,
+        node: tagteam_core::NodeId,
+        reason: ReassignReason,
+    ) -> Result<(), ServiceError> {
+        let tasks = self.journal(|journal| journal.list_subtasks()).await?;
+        for task in tasks {
+            if task.node != Some(node)
+                || !matches!(
+                    task.state,
+                    SubtaskState::Preparing
+                        | SubtaskState::Running
+                        | SubtaskState::WaitingOnMain { .. }
+                        | SubtaskState::Collecting
+                )
+            {
+                continue;
+            }
+            let id = task.id;
+            let transition = self
+                .journal(move |journal| {
+                    journal.transition(
+                        id,
+                        SubtaskInput::Reassign { from: node, reason },
+                        Timestamp::now(),
+                    )
+                })
+                .await;
+            let Ok(_) = transition else {
+                continue;
+            };
+            self.cancel_task_work(id, "subtask is being reassigned")
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Attempts to place queued/reassigning work and restarts any durable
+    /// Preparing or Running task whose in-memory driver disappeared.
+    async fn schedule_pending_work(&self, now: Timestamp) -> Result<(), ServiceError> {
+        let mut nodes = self.journal(|journal| journal.list_nodes()).await?;
+        let tasks = self.journal(|journal| journal.list_subtasks()).await?;
+        for node in &mut nodes {
+            let running = tasks
+                .iter()
+                .filter(|task| {
+                    task.node == Some(node.id)
+                        && !task.state.is_terminal()
+                        && !matches!(task.state, SubtaskState::Reassigning { .. })
+                })
+                .count();
+            node.capacity.running = u16::try_from(running).unwrap_or(u16::MAX);
+        }
+        let online_nodes = nodes
+            .iter()
+            .filter(|node| self.nodes.is_online(node.id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for task in &tasks {
+            match task.state {
+                SubtaskState::Queued | SubtaskState::Reassigning { .. } => {
+                    let Placement::Placed(node) =
+                        place(&task.spec, &task.repo_id, &online_nodes, &[], now)
+                    else {
+                        continue;
+                    };
+                    let id = task.id;
+                    self.journal(move |journal| {
+                        journal
+                            .transition(id, SubtaskInput::Placed { node }, Timestamp::now())
+                            .map(|_| ())
+                    })
+                    .await?;
+                    self.ensure_driver(id, node).await;
+                }
+                SubtaskState::Preparing | SubtaskState::Running => {
+                    if let Some(node) = task.node
+                        && self.nodes.is_online(node)
+                    {
+                        self.ensure_driver(task.id, node).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts at most one process-local driver for a durable subtask attempt.
+    async fn ensure_driver(&self, id: SubtaskId, node: tagteam_core::NodeId) -> bool {
+        if !self.drivers.lock().await.insert(id) {
+            return false;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.supervise_driver(id, node).await;
+            service.drivers.lock().await.remove(&id);
+        });
+        true
+    }
+
+    async fn supervise_driver(&self, id: SubtaskId, node: tagteam_core::NodeId) {
+        match self.drive_task(id, node).await {
+            Ok(()) => {}
+            Err(ServiceError::NodePlane(NodePlaneError::Offline | NodePlaneError::Timeout))
+            | Err(ServiceError::Invalid(_)) => {
+                // A node lease can disappear mid-call. The durable state stays
+                // authoritative; reconciliation will resume or reassign it.
+            }
+            Err(error) => {
+                let reason = match &error {
+                    ServiceError::Preparation(_) => {
+                        FailReason::Bundle(bounded_error(&error.to_string()))
+                    }
+                    _ => FailReason::Runner(bounded_error(&error.to_string())),
+                };
+                tracing::warn!(subtask = %id, node = %node, %error, "subtask driver failed");
+                self.fail_if_active(id, reason).await;
+            }
+        }
+    }
+
+    async fn drive_task(
+        &self,
+        id: SubtaskId,
+        node: tagteam_core::NodeId,
+    ) -> Result<(), ServiceError> {
+        let task = self
+            .journal(move |journal| journal.load_subtask(id))
+            .await?
+            .ok_or_else(|| ServiceError::NotFound(format!("subtask {id}")))?;
+        if task.node != Some(node) {
+            return Ok(());
+        }
+        match task.state {
+            SubtaskState::Preparing => self.prepare_subtask(&task, node).await?,
+            SubtaskState::Running => return self.run_prepared_subtask(id, node).await,
+            _ => return Ok(()),
+        }
+        let prepared = self
+            .journal(move |journal| journal.load_subtask(id))
+            .await?
+            .ok_or_else(|| ServiceError::NotFound(format!("subtask {id}")))?;
+        if prepared.node == Some(node) && prepared.state == SubtaskState::Running {
+            self.run_prepared_subtask(id, node).await?;
+        }
+        Ok(())
+    }
+
+    async fn cancel_task_work(&self, id: SubtaskId, reason: &str) {
+        let runner = self.runners.lock().await.get(&id).cloned();
+        if let Some(runner) = runner {
+            let _ = runner
+                .send(HubToRunnerMessage::Cancel {
+                    reason: reason.to_owned(),
+                })
+                .await;
+        }
+        let active = self.active_commands.lock().await.get(&id).cloned();
+        if let Some((node, command_id)) = active {
+            let _ = self.nodes.cancel_command(node, &command_id, reason).await;
+        }
+        let _ = self
+            .journal(move |journal| journal.cancel_subtask_commands(id).map(|_| ()))
+            .await;
     }
 
     async fn node_views(&self) -> Result<Vec<NodeView>, ServiceError> {
@@ -443,53 +811,7 @@ impl HubService {
             })
             .await?;
             if let Placement::Placed(node) = placement {
-                let service = self.clone();
-                let task = self
-                    .journal(move |journal| journal.load_subtask(subtask_id))
-                    .await?
-                    .ok_or_else(|| ServiceError::NotFound(format!("subtask {subtask_id}")))?;
-                tokio::spawn(async move {
-                    match service.prepare_subtask(&task, node).await {
-                        Ok(()) => {}
-                        Err(ServiceError::NodePlane(
-                            NodePlaneError::Offline | NodePlaneError::Timeout,
-                        )) => {
-                            // The durable placement remains valid. A later
-                            // reconciliation pass can prepare it when the node
-                            // reconnects; dispatch must not turn a transient
-                            // disconnect into a terminal task failure.
-                            tracing::debug!(subtask = %task.id, node = %node, "node unavailable during preparation");
-                            return;
-                        }
-                        Err(error) => {
-                            tracing::warn!(subtask = %task.id, node = %node, %error, "workspace preparation failed");
-                            let message = bounded_error(&error.to_string());
-                            let _ = service
-                                .journal(move |journal| {
-                                    journal
-                                        .transition(
-                                            subtask_id,
-                                            SubtaskInput::Fail {
-                                                reason: FailReason::Bundle(message),
-                                            },
-                                            Timestamp::now(),
-                                        )
-                                        .map(|_| ())
-                                })
-                                .await;
-                            return;
-                        }
-                    }
-                    if let Err(error) = service.run_prepared_subtask(subtask_id, node).await {
-                        tracing::warn!(subtask = %subtask_id, node = %node, %error, "runner bridge failed");
-                        service
-                            .fail_if_active(
-                                subtask_id,
-                                FailReason::Runner(bounded_error(&error.to_string())),
-                            )
-                            .await;
-                    }
-                });
+                self.ensure_driver(subtask_id, node).await;
             }
             placements.push((subtask_id, placement));
         }
@@ -516,7 +838,7 @@ impl HubService {
             return Ok(());
         }
         let blob = self.create_source_bundle(task).await?;
-        let command_id = format!("prepare-{}", task.id);
+        let command_id = format!("prepare-{}-a{}", task.id, task.attempt);
         let command = Proto::Command {
             command_id,
             subtask_id: task.id.to_string(),
@@ -767,6 +1089,61 @@ impl HubService {
                                 return Ok(());
                             }
 
+                            if let RemoteCall::AskMain {
+                                question_id,
+                                text,
+                                options,
+                                context,
+                            } = call
+                            {
+                                let question = Question {
+                                    id: question_id,
+                                    subtask: task.id,
+                                    text: bounded_text(text.trim(), 8_000),
+                                    options: options
+                                        .into_iter()
+                                        .take(16)
+                                        .map(|option| bounded_text(option.trim(), 512))
+                                        .filter(|option| !option.is_empty())
+                                        .collect(),
+                                    context: context.map(|context| bounded_text(&context, 4_000)),
+                                    deadline: Timestamp::now()
+                                        .checked_add(task.spec.limits.question_deadline),
+                                };
+                                if question.text.is_empty() {
+                                    process
+                                        .send(HubToRunnerMessage::ToolResult {
+                                            call_id,
+                                            text: "question text must not be empty".into(),
+                                            is_error: true,
+                                        })
+                                        .await
+                                        .map_err(|error| {
+                                            ServiceError::Runner(error.to_string())
+                                        })?;
+                                    continue;
+                                }
+                                let id = task.id;
+                                let call_id_for_store = call_id.clone();
+                                self.journal(move |journal| {
+                                    journal
+                                        .transition(
+                                            id,
+                                            SubtaskInput::Ask {
+                                                question,
+                                                call_id: call_id_for_store,
+                                            },
+                                            Timestamp::now(),
+                                        )
+                                        .map(|_| ())
+                                })
+                                .await?;
+                                // The runner tool promise remains pending until an
+                                // answer (or timeout guidance) arrives on the
+                                // receiver branch below.
+                                continue;
+                            }
+
                             let started = std::time::Instant::now();
                             let result: Result<RemoteOutcome, ServiceError> = self
                                 .execute_remote_call(task, node, &call_id, &call)
@@ -933,7 +1310,7 @@ impl HubService {
             return Err(ServiceError::Invalid("subtask is no longer running".into()));
         }
 
-        let command_id = format!("collect-{}", task.id);
+        let command_id = format!("collect-{}-a{}", task.id, task.attempt);
         let collect = Proto::Command {
             command_id,
             subtask_id: task.id.to_string(),
@@ -1105,7 +1482,7 @@ impl HubService {
             if !self.is_running(task.id).await? {
                 return Err(ServiceError::Invalid("subtask is no longer running".into()));
             }
-            let command_id = format!("check-{}-{}", task.id, index);
+            let command_id = format!("check-{}-a{}-{}", task.id, task.attempt, index);
             let result = self
                 .execute_tracked_command(
                     task,
@@ -1208,32 +1585,44 @@ impl HubService {
             .await;
     }
 
-    async fn status(&self, ids: Option<Vec<SubtaskId>>) -> Result<StatusReply, ServiceError> {
+    async fn status(
+        &self,
+        ids: Option<Vec<SubtaskId>>,
+        claude_session: Option<&str>,
+    ) -> Result<StatusReply, ServiceError> {
         let wanted = ids.map(|ids| ids.into_iter().collect::<std::collections::HashSet<_>>());
-        let subtasks = self.journal(|journal| journal.list_subtasks()).await?;
+        let subtasks = match claude_session {
+            Some(session) => {
+                let session = session.to_owned();
+                self.journal(move |journal| journal.list_subtasks_for_session(&session))
+                    .await?
+            }
+            None => self.journal(|journal| journal.list_subtasks()).await?,
+        };
         let events = self
             .journal(|journal| journal.events(EventFilter::default()))
             .await?;
-        let subtasks = subtasks
-            .into_iter()
-            .filter(|subtask| {
-                wanted
-                    .as_ref()
-                    .is_none_or(|wanted| wanted.contains(&subtask.id))
-            })
-            .map(|subtask| status_for(&subtask, &events))
-            .collect();
-        Ok(StatusReply { subtasks })
+        let mut statuses = Vec::new();
+        for subtask in subtasks.into_iter().filter(|subtask| {
+            wanted
+                .as_ref()
+                .is_none_or(|wanted| wanted.contains(&subtask.id))
+        }) {
+            let question = self
+                .journal(move |journal| journal.open_question(subtask.id))
+                .await?;
+            statuses.push(status_for(&subtask, &events, question.as_ref()));
+        }
+        Ok(StatusReply { subtasks: statuses })
     }
 
-    async fn logs(&self, subtask: SubtaskId, tail: u32) -> Result<LogsReply, ServiceError> {
-        if self
-            .journal(move |journal| journal.load_subtask(subtask))
-            .await?
-            .is_none()
-        {
-            return Err(ServiceError::NotFound(format!("subtask {subtask}")));
-        }
+    async fn logs(
+        &self,
+        subtask: SubtaskId,
+        tail: u32,
+        claude_session: Option<&str>,
+    ) -> Result<LogsReply, ServiceError> {
+        self.owned_subtask(subtask, claude_session).await?;
         let events = self
             .journal(move |journal| {
                 journal.events(EventFilter {
@@ -1254,12 +1643,18 @@ impl HubService {
         Ok(LogsReply { subtask, lines })
     }
 
-    async fn cancel(&self, subtask: SubtaskId, reason: String) -> Result<(), ServiceError> {
+    async fn cancel(
+        &self,
+        subtask: SubtaskId,
+        reason: String,
+        claude_session: Option<&str>,
+    ) -> Result<(), ServiceError> {
         if reason.trim().is_empty() {
             return Err(ServiceError::Invalid(
                 "cancel reason must not be empty".into(),
             ));
         }
+        self.owned_subtask(subtask, claude_session).await?;
         let landing = self.landing.lock().await;
         let current = self
             .journal(move |journal| journal.load_subtask_state(subtask))
@@ -1306,11 +1701,9 @@ impl HubService {
         &self,
         subtask: SubtaskId,
         worktree: bool,
+        claude_session: Option<&str>,
     ) -> Result<CollectReply, ServiceError> {
-        let task = self
-            .journal(move |journal| journal.load_subtask(subtask))
-            .await?
-            .ok_or_else(|| ServiceError::NotFound(format!("subtask {subtask}")))?;
+        let task = self.owned_subtask(subtask, claude_session).await?;
         let result = self
             .journal(move |journal| journal.load_result_summary(subtask))
             .await?
@@ -1331,6 +1724,218 @@ impl HubService {
             result,
             worktree,
         })
+    }
+
+    async fn owned_subtask(
+        &self,
+        subtask: SubtaskId,
+        claude_session: Option<&str>,
+    ) -> Result<Subtask, ServiceError> {
+        let task = self
+            .journal(move |journal| journal.load_subtask(subtask))
+            .await?
+            .ok_or_else(|| ServiceError::NotFound(format!("subtask {subtask}")))?;
+        if let Some(session) = claude_session {
+            let session = session.to_owned();
+            let owned = self
+                .journal(move |journal| journal.subtask_belongs_to_session(subtask, &session))
+                .await?;
+            if !owned {
+                return Err(ServiceError::NotFound(format!("subtask {subtask}")));
+            }
+        }
+        Ok(task)
+    }
+
+    async fn answer(
+        &self,
+        subtask: SubtaskId,
+        question: Option<QuestionId>,
+        text: String,
+        author: AnswerAuthor,
+        claude_session: Option<&str>,
+    ) -> Result<AnswerReply, ServiceError> {
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return Err(ServiceError::Invalid(
+                "answer text must not be empty".into(),
+            ));
+        }
+        if text.len() > 16 * 1024 {
+            return Err(ServiceError::Invalid(
+                "answer text exceeds the 16 KiB limit".into(),
+            ));
+        }
+        let task = self.owned_subtask(subtask, claude_session).await?;
+        let open_id = match task.state {
+            SubtaskState::WaitingOnMain { question } => question,
+            _ => {
+                return Err(ServiceError::Invalid(
+                    "subtask is not waiting for an answer".into(),
+                ));
+            }
+        };
+        if question.is_some_and(|question| question != open_id) {
+            return Err(ServiceError::Invalid(
+                "question does not match the open question".into(),
+            ));
+        }
+        let stored = self
+            .journal(move |journal| journal.load_question(open_id))
+            .await?
+            .ok_or_else(|| ServiceError::NotFound(format!("question {open_id}")))?;
+        if stored.answer.is_some() || stored.closed_at.is_some() {
+            return Err(ServiceError::Invalid("question is already closed".into()));
+        }
+        if stored.question.deadline < Timestamp::now() {
+            return Err(ServiceError::Invalid(
+                "question deadline has passed; the runner will receive the timeout policy".into(),
+            ));
+        }
+        let by = author.answered_by();
+        let answer_text = text.clone();
+        let answer_by = by.clone();
+        self.journal(move |journal| {
+            journal
+                .transition(
+                    subtask,
+                    SubtaskInput::Answer {
+                        question: open_id,
+                        by: answer_by,
+                        text: answer_text,
+                    },
+                    Timestamp::now(),
+                )
+                .map(|_| ())
+        })
+        .await?;
+        let runner = self.runners.lock().await.get(&subtask).cloned();
+        let delivered = if let Some(runner) = runner {
+            runner
+                .send(HubToRunnerMessage::Answer {
+                    question_id: open_id,
+                    call_id: stored.call_id,
+                    text: text.clone(),
+                    timed_out: false,
+                })
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        Ok(AnswerReply {
+            subtask,
+            question: open_id,
+            text,
+            by,
+            delivered,
+        })
+    }
+
+    async fn steer(
+        &self,
+        subtask: SubtaskId,
+        text: String,
+        claude_session: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return Err(ServiceError::Invalid(
+                "steering text must not be empty".into(),
+            ));
+        }
+        if text.len() > 16 * 1024 {
+            return Err(ServiceError::Invalid(
+                "steering text exceeds the 16 KiB limit".into(),
+            ));
+        }
+        let task = self.owned_subtask(subtask, claude_session).await?;
+        if task.state.is_terminal() {
+            return Err(ServiceError::Invalid(
+                "cannot steer a terminal subtask".into(),
+            ));
+        }
+        let runner = self
+            .runners
+            .lock()
+            .await
+            .get(&subtask)
+            .cloned()
+            .ok_or_else(|| ServiceError::Unsupported("runner is not connected".into()))?;
+        runner
+            .send(HubToRunnerMessage::Steer { text: text.clone() })
+            .await
+            .map_err(|error| ServiceError::Runner(error.to_string()))?;
+        self.journal(move |journal| {
+            journal
+                .record_event(subtask, EventKind::Steered { text }, Timestamp::now())
+                .map(|_| ())
+        })
+        .await
+    }
+
+    /// Expires unanswered questions and wakes their runners with the documented
+    /// best-judgment policy. Returns the number of questions answered by timeout.
+    pub async fn expire_due_questions(&self) -> Result<usize, ServiceError> {
+        let now = Timestamp::now();
+        let due = self
+            .journal(move |journal| journal.due_questions(now))
+            .await?;
+        let mut expired = 0;
+        for stored in due {
+            let task = self
+                .journal(move |journal| journal.load_subtask(stored.question.subtask))
+                .await?;
+            let Some(task) = task else {
+                continue;
+            };
+            if task.state
+                != (SubtaskState::WaitingOnMain {
+                    question: stored.question.id,
+                })
+            {
+                continue;
+            }
+            let guidance = "No main-session answer arrived before the deadline. Continue using your best judgment, make the smallest safe assumption, and record it in the Finish assumptions with from_timeout=true.";
+            let question = stored.question.id;
+            let subtask = stored.question.subtask;
+            let result = self
+                .journal(move |journal| {
+                    journal.transition(
+                        subtask,
+                        SubtaskInput::Answer {
+                            question,
+                            by: AnsweredBy::Timeout {
+                                guess: guidance.into(),
+                            },
+                            text: guidance.into(),
+                        },
+                        Timestamp::now(),
+                    )
+                })
+                .await;
+            if result.is_err() {
+                continue;
+            }
+            expired += 1;
+            let runner = self
+                .runners
+                .lock()
+                .await
+                .get(&stored.question.subtask)
+                .cloned();
+            if let Some(runner) = runner {
+                let _ = runner
+                    .send(HubToRunnerMessage::Answer {
+                        question_id: stored.question.id,
+                        call_id: stored.call_id,
+                        text: guidance.into(),
+                        timed_out: true,
+                    })
+                    .await;
+            }
+        }
+        Ok(expired)
     }
 
     async fn brief(&self, claude_session: &str) -> Result<BriefReply, ServiceError> {
@@ -1411,13 +2016,25 @@ impl HubService {
             })
             .await?
             .ok_or_else(|| ServiceError::NotFound(format!("node {name}")))?;
+        let node_id = node.id;
         self.journal(move |journal| match action {
-            NodeAction::Approve => journal.approve_node(node.id),
-            NodeAction::Pause => journal.pause_node(node.id),
-            NodeAction::Resume => journal.resume_node(node.id),
-            NodeAction::Remove => journal.remove_node(node.id, Timestamp::now()),
+            NodeAction::Approve => journal.approve_node(node_id),
+            NodeAction::Pause => journal.pause_node(node_id),
+            NodeAction::Resume => journal.resume_node(node_id),
+            NodeAction::Remove => journal.remove_node(node_id, Timestamp::now()),
         })
         .await?;
+        match action {
+            NodeAction::Pause => {
+                self.reassign_tasks_from_node(node_id, ReassignReason::NodePaused)
+                    .await?;
+            }
+            NodeAction::Remove => {
+                self.reassign_tasks_from_node(node_id, ReassignReason::NodeRemoved)
+                    .await?;
+            }
+            NodeAction::Approve | NodeAction::Resume => {}
+        }
         Ok(LocalResponseBody::NodeChanged { name })
     }
 
@@ -1633,7 +2250,11 @@ enum NodeAction {
     Remove,
 }
 
-fn status_for(task: &Subtask, events: &[Event]) -> SubtaskStatus {
+fn status_for(
+    task: &Subtask,
+    events: &[Event],
+    question: Option<&crate::journal::StoredQuestion>,
+) -> SubtaskStatus {
     let last_progress = events
         .iter()
         .filter(|event| event.subtask == task.id)
@@ -1659,6 +2280,8 @@ fn status_for(task: &Subtask, events: &[Event]) -> SubtaskStatus {
         usage: task.usage,
         last_progress,
         open_question,
+        open_question_text: question.map(|question| question.question.text.clone()),
+        question_deadline: question.map(|question| question.question.deadline),
         branch: Some(task.branch.clone()),
     }
 }
@@ -1762,6 +2385,7 @@ fn taskteam_runner_tools() -> &'static [&'static str] {
         "mcp__tagteam__Edit",
         "mcp__tagteam__Glob",
         "mcp__tagteam__Grep",
+        "mcp__tagteam__AskMain",
         "mcp__tagteam__ReportProgress",
         "mcp__tagteam__Finish",
     ]
@@ -1775,6 +2399,7 @@ fn remote_tool_name(call: &RemoteCall) -> &'static str {
         RemoteCall::Edit { .. } => "Edit",
         RemoteCall::Glob { .. } => "Glob",
         RemoteCall::Grep { .. } => "Grep",
+        RemoteCall::AskMain { .. } => "AskMain",
         RemoteCall::ReportProgress { .. } => "ReportProgress",
         RemoteCall::Finish { .. } => "Finish",
     }
@@ -1877,14 +2502,16 @@ fn remote_command(
             context: context.unwrap_or(3).min(100),
             limit: limit.unwrap_or(200).min(10_000),
         }),
-        RemoteCall::ReportProgress { .. } | RemoteCall::Finish { .. } => {
+        RemoteCall::ReportProgress { .. }
+        | RemoteCall::Finish { .. }
+        | RemoteCall::AskMain { .. } => {
             return Err(ServiceError::Invalid(
                 "runner control call must not be sent to the node".into(),
             ));
         }
     };
     Ok(Proto::Command {
-        command_id: format!("remote-{}-{call_id}", task.id),
+        command_id: format!("remote-{}-a{}-{call_id}", task.id, task.attempt),
         subtask_id: task.id.to_string(),
         workspace: task.id.to_string(),
         op: Some(op),

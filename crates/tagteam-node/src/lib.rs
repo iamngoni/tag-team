@@ -5,6 +5,7 @@
 //! material, invites, or one-time enrollment codes.
 
 mod blob_source;
+pub mod config;
 mod enrollment;
 pub mod fsop;
 mod heartbeat;

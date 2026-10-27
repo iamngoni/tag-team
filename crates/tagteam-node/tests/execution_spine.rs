@@ -44,6 +44,7 @@ impl HeartbeatSource for TestHeartbeat {
             toolchains: Vec::new(),
             repos: Vec::new(),
             running: Vec::new(),
+            idle_for_ms: 0,
         }
     }
 }
@@ -288,6 +289,7 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
     for _ in 0..1_200 {
         let status = match service
             .handle(LocalRequest::Status {
+                claude_session: None,
                 ids: Some(vec![subtask]),
             })
             .await
@@ -319,6 +321,7 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
     );
     let collected = match service
         .handle(LocalRequest::Collect {
+            claude_session: None,
             subtask,
             worktree: false,
         })
@@ -417,6 +420,7 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
     for _ in 0..400 {
         let status = match service
             .handle(LocalRequest::Status {
+                claude_session: None,
                 ids: Some(vec![cancel_subtask]),
             })
             .await
@@ -442,6 +446,7 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
     tokio::time::sleep(Duration::from_millis(700)).await;
     service
         .handle(LocalRequest::Cancel {
+            claude_session: None,
             subtask: cancel_subtask,
             reason: "loopback cancellation proof".into(),
         })
@@ -451,6 +456,7 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
     for _ in 0..400 {
         let status = match service
             .handle(LocalRequest::Status {
+                claude_session: None,
                 ids: Some(vec![cancel_subtask]),
             })
             .await
@@ -508,6 +514,7 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
     let check_subtask = check_cancellation.subtasks[0].0;
     let check_branch = match service
         .handle(LocalRequest::Status {
+            claude_session: None,
             ids: Some(vec![check_subtask]),
         })
         .await
@@ -534,6 +541,7 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
     assert!(saw_check, "authoritative check must start");
     service
         .handle(LocalRequest::Cancel {
+            claude_session: None,
             subtask: check_subtask,
             reason: "cancellation during done_when proof".into(),
         })
@@ -543,6 +551,7 @@ async fn dispatch_executes_and_lands_an_unmerged_review_branch() {
     for _ in 0..400 {
         let status = match service
             .handle(LocalRequest::Status {
+                claude_session: None,
                 ids: Some(vec![check_subtask]),
             })
             .await

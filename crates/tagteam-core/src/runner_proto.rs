@@ -50,7 +50,9 @@ pub enum HubToRunnerMessage {
     },
     Answer {
         question_id: crate::QuestionId,
+        call_id: String,
         text: String,
+        timed_out: bool,
     },
 }
 
@@ -136,6 +138,13 @@ pub enum RemoteCall {
         ignore_case: bool,
         context: Option<u32>,
         limit: Option<u32>,
+    },
+    AskMain {
+        question_id: crate::QuestionId,
+        text: String,
+        #[serde(default)]
+        options: Vec<String>,
+        context: Option<String>,
     },
     ReportProgress {
         note: String,

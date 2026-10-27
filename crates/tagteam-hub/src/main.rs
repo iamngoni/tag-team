@@ -9,8 +9,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tagteam_core::{
-    SubtaskId,
-    local_api::{LocalFrame, LocalRequest, LocalResponseBody, WatchScope},
+    QuestionId, SubtaskId,
+    local_api::{AnswerAuthor, LocalFrame, LocalRequest, LocalResponseBody, WatchScope},
 };
 use tagteam_hub::{
     config::HubConfig, local::client::LocalClient, mcp::McpServer, service::HubService,
@@ -87,6 +87,18 @@ enum Command {
         #[arg(long, default_value = "cancelled by user")]
         reason: String,
     },
+    /// Answer the open question from a waiting subtask.
+    Answer {
+        subtask: SubtaskId,
+        text: String,
+        #[arg(long)]
+        question: Option<QuestionId>,
+        /// Answer author: `you` (default) or `main`.
+        #[arg(long, default_value = "you")]
+        by: String,
+    },
+    /// Steer a running subtask with a new instruction.
+    Steer { subtask: SubtaskId, text: String },
     /// Show a completed result and optionally create a review worktree.
     Collect {
         subtask: SubtaskId,
@@ -145,6 +157,40 @@ async fn run_hub(config_path: Option<&std::path::Path>) -> Result<()> {
         .with_context(|| format!("bind node plane at {}", config.listen))?;
     let (shutdown, shutdown_rx) = watch::channel(false);
 
+    let expiry_service = service.clone();
+    let mut expiry_shutdown = shutdown_rx.clone();
+    let expiry = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = expiry_shutdown.changed() => break,
+                _ = ticker.tick() => {
+                    if let Err(error) = expiry_service.expire_due_questions().await {
+                        tracing::warn!(%error, "question expiry sweep failed");
+                    }
+                }
+            }
+        }
+    });
+
+    let reconciler_service = service.clone();
+    let mut reconciler_shutdown = shutdown_rx.clone();
+    let reconciler = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = reconciler_shutdown.changed() => break,
+                _ = ticker.tick() => {
+                    if let Err(error) = reconciler_service.reconcile_nodes().await {
+                        tracing::warn!(%error, "node reconciliation sweep failed");
+                    }
+                }
+            }
+        }
+    });
+
     let grpc_service = service.nodes().clone();
     let grpc_shutdown = shutdown_rx.clone();
     let mut grpc = tokio::spawn(async move {
@@ -183,6 +229,8 @@ async fn run_hub(config_path: Option<&std::path::Path>) -> Result<()> {
     shutdown.send_replace(true);
     let _ = grpc.await;
     let _ = local.await;
+    let _ = expiry.await;
+    let _ = reconciler.await;
     Ok(())
 }
 
@@ -229,6 +277,7 @@ async fn run_client(command: Command, client: &mut LocalClient) -> Result<()> {
             client,
             LocalRequest::Status {
                 ids: (!id.is_empty()).then_some(id),
+                claude_session: None,
             },
         )
         .await?
@@ -261,7 +310,8 @@ async fn run_client(command: Command, client: &mut LocalClient) -> Result<()> {
                     since_seq: since,
                     wait_ms,
                     kinds,
-                    all: false,
+                    all: true,
+                    claude_session: None,
                 },
             )
             .await?
@@ -304,7 +354,16 @@ async fn run_client(command: Command, client: &mut LocalClient) -> Result<()> {
             }
         }
         Command::Logs { subtask, tail } => {
-            match request(client, LocalRequest::Logs { subtask, tail }).await? {
+            match request(
+                client,
+                LocalRequest::Logs {
+                    subtask,
+                    tail,
+                    claude_session: None,
+                },
+            )
+            .await?
+            {
                 LocalResponseBody::Logs(reply) => {
                     for line in reply.lines {
                         println!("{line}");
@@ -314,13 +373,78 @@ async fn run_client(command: Command, client: &mut LocalClient) -> Result<()> {
             }
         }
         Command::Cancel { subtask, reason } => {
-            match request(client, LocalRequest::Cancel { subtask, reason }).await? {
+            match request(
+                client,
+                LocalRequest::Cancel {
+                    subtask,
+                    reason,
+                    claude_session: None,
+                },
+            )
+            .await?
+            {
                 LocalResponseBody::Cancelled { subtask } => println!("cancelled {subtask}"),
                 other => bail!("unexpected reply: {other:?}"),
             }
         }
+        Command::Answer {
+            subtask,
+            text,
+            question,
+            by,
+        } => {
+            let author = match by.trim().to_ascii_lowercase().as_str() {
+                "you" | "user" => AnswerAuthor::You,
+                "main" | "claude" => AnswerAuthor::MainClaude,
+                _ => bail!("--by must be `you` or `main`"),
+            };
+            match request(
+                client,
+                LocalRequest::Answer {
+                    subtask,
+                    question,
+                    text,
+                    author,
+                    claude_session: None,
+                },
+            )
+            .await?
+            {
+                LocalResponseBody::Answered(reply) => {
+                    println!("answered {}: {}", reply.question, reply.text);
+                    if !reply.delivered {
+                        eprintln!("warning: runner was not connected when the answer was saved");
+                    }
+                }
+                other => bail!("unexpected reply: {other:?}"),
+            }
+        }
+        Command::Steer { subtask, text } => {
+            match request(
+                client,
+                LocalRequest::Steer {
+                    subtask,
+                    text,
+                    claude_session: None,
+                },
+            )
+            .await?
+            {
+                LocalResponseBody::Steered { subtask } => println!("steered {subtask}"),
+                other => bail!("unexpected reply: {other:?}"),
+            }
+        }
         Command::Collect { subtask, worktree } => {
-            match request(client, LocalRequest::Collect { subtask, worktree }).await? {
+            match request(
+                client,
+                LocalRequest::Collect {
+                    subtask,
+                    worktree,
+                    claude_session: None,
+                },
+            )
+            .await?
+            {
                 LocalResponseBody::Collected(reply) => {
                     println!("{}", serde_json::to_string_pretty(&reply.result)?);
                     if let Some(path) = reply.worktree {

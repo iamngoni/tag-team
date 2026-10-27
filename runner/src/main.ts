@@ -1,5 +1,5 @@
-import { createSdkMcpServer, query, tool, type Options, type Query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { randomUUID } from "node:crypto";
+import { createSdkMcpServer, query, tool, type Options, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import type { Readable, Writable } from "node:stream";
 import { z } from "zod";
@@ -14,7 +14,8 @@ import {
 
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_PENDING_TOOLS = 32;
-const REMOTE_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "ReportProgress", "Finish"] as const;
+const REMOTE_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "AskMain", "ReportProgress", "Finish"] as const;
+const BUILTIN_WEB_TOOLS = ["WebFetch", "WebSearch"] as const;
 const MCP_SERVER = "tagteam";
 
 type DeferredToolResult = {
@@ -27,8 +28,71 @@ export type RunnerDependencies = {
   input: Readable;
   output: Writable;
   stderr?: (text: string) => void;
-  runQuery?: (params: { prompt: string; options: Options }) => Query;
+  runQuery?: (params: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options }) => Query;
 };
+
+class MessageStream implements AsyncIterable<SDKUserMessage> {
+  private readonly queued: SDKUserMessage[] = [];
+  private waiting: ((value: IteratorResult<SDKUserMessage>) => void) | undefined;
+  private closed = false;
+
+  push(text: string): void {
+    if (this.closed) return;
+    const message: SDKUserMessage = {
+      type: "user",
+      message: { role: "user", content: text },
+      parent_tool_use_id: null,
+      client_composed: true,
+      priority: "now",
+    };
+    if (this.waiting) {
+      const resolve = this.waiting;
+      this.waiting = undefined;
+      resolve({ done: false, value: message });
+    } else {
+      this.queued.push(message);
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.waiting) {
+      const resolve = this.waiting;
+      this.waiting = undefined;
+      resolve({ done: true, value: undefined });
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
+    return this;
+  }
+
+  next(): Promise<IteratorResult<SDKUserMessage>> {
+    const message = this.queued.shift();
+    if (message) return Promise.resolve({ done: false, value: message });
+    if (this.closed) return Promise.resolve({ done: true, value: undefined });
+    return new Promise((resolve) => { this.waiting = resolve; });
+  }
+}
+
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+function ulid(now = Date.now()): string {
+  let time = BigInt(now);
+  let timestamp = "";
+  for (let index = 0; index < 10; index += 1) {
+    timestamp = CROCKFORD[Number(time & 31n)]! + timestamp;
+    time >>= 5n;
+  }
+  let random = BigInt(`0x${randomBytes(10).toString("hex")}`);
+  let randomText = "";
+  for (let index = 0; index < 16; index += 1) {
+    randomText = CROCKFORD[Number(random & 31n)]! + randomText;
+    random >>= 5n;
+  }
+  return `${timestamp}${randomText}`;
+}
 
 class BoundedJsonlReader {
   private buffer = Buffer.alloc(0);
@@ -155,6 +219,26 @@ function toolSchemas(sendToolCall: (call: RemoteCall) => Promise<{ text: string;
       pattern: z.string(), path: z.string().nullable().optional(), glob: z.string().nullable().optional(),
       ignore_case: z.boolean().optional(), context: z.number().int().nonnegative().nullable().optional(), limit: z.number().int().nonnegative().nullable().optional(),
     }, "grep"),
+    tool(
+      "AskMain",
+      "Ask the user's main Claude session a question when a required decision cannot be inferred safely. The call stays pending until the coordinator answers or the deadline expires.",
+      {
+        text: z.string().min(1),
+        options: z.array(z.string()).max(16).optional(),
+        context: z.string().nullable().optional(),
+      },
+      async (args) => {
+        const call = remoteCallSchema.parse({
+          tool: "ask_main",
+          question_id: ulid(),
+          text: args.text,
+          options: args.options ?? [],
+          context: args.context ?? null,
+        });
+        const result = await sendToolCall(call);
+        return { content: [{ type: "text", text: result.text }], isError: result.is_error };
+      },
+    ),
     forward("ReportProgress", "Send progress to the Tag Team coordinator.", {
       note: z.string(), percent: z.number().int().min(0).max(100).nullable().optional(),
     }, "report_progress"),
@@ -167,20 +251,23 @@ function toolSchemas(sendToolCall: (call: RemoteCall) => Promise<{ text: string;
 }
 
 function sdkOptions(start: Extract<HubToRunner, { type: "start" }>, server: ReturnType<typeof createSdkMcpServer>, abortController: AbortController): Options {
-  const allowedTools = REMOTE_TOOLS.map((name) => `mcp__${MCP_SERVER}__${name}`);
+  const allowedTools = [
+    ...REMOTE_TOOLS.map((name) => `mcp__${MCP_SERVER}__${name}`),
+    ...BUILTIN_WEB_TOOLS,
+  ];
   return {
     abortController,
     cwd: start.cwd,
     maxTurns: start.max_turns,
     ...(start.resume ? { resume: start.resume } : {}),
     systemPrompt: { type: "preset", preset: "claude_code", append: start.system_append },
-    tools: [],
+    tools: [...BUILTIN_WEB_TOOLS],
     allowedTools,
     disallowedTools: [
       "Agent", "AgentOutput", "AskUserQuestion", "Bash", "Config", "EnterPlanMode", "EnterWorktree",
       "ExitPlanMode", "ExitWorktree", "Glob", "Grep", "KillShell", "ListMcpResources", "ListMcpServers",
       "NotebookEdit", "Read", "RemoteControl", "RequestLocalCommand", "SendMessage", "Skill", "Task",
-      "TaskOutput", "TeamCreate", "TeamDelete", "TodoWrite", "WebFetch", "WebSearch", "Write", "Edit",
+      "TaskOutput", "TeamCreate", "TeamDelete", "TodoWrite", "Write", "Edit",
       "WorktreeCreate", "WorktreeRemove",
     ],
     permissionMode: "default",
@@ -217,6 +304,8 @@ export async function runRunner({ input, output, stderr = () => undefined, runQu
   const latestCost = { value: null as number | null };
   const commandCount = { value: 0 };
   const canceled = { value: false };
+  const messages = new MessageStream();
+  messages.push(start.prompt);
   let closingReason: string | null = null;
   let queryHandle: Query | undefined;
 
@@ -277,6 +366,7 @@ export async function runRunner({ input, output, stderr = () => undefined, runQu
             queryHandle?.close();
             settlePending(new Error("hub input closed"));
           }
+          messages.close();
           return;
         }
         if (!next.value.trim()) continue;
@@ -298,10 +388,24 @@ export async function runRunner({ input, output, stderr = () => undefined, runQu
           closingReason = message.reason || "cancelled";
           abortController.abort(new Error(closingReason));
           queryHandle?.close();
+          messages.close();
           settlePending(new Error(closingReason));
           return;
-        } else if (message.type === "steer" || message.type === "answer") {
-          await writeMessage(output, { v: 1, type: "note", text: `${message.type} is not supported by this runner session.` });
+        } else if (message.type === "steer") {
+          messages.push(`Tag Team steering update from the main session. Apply this direction to the assigned subtask:\n\n${message.text}`);
+          await writeMessage(output, { v: RUNNER_PROTOCOL_VERSION, type: "note", text: "steering message delivered to the agent session" });
+        } else if (message.type === "answer") {
+          const item = pending.get(message.call_id);
+          if (!item) {
+            await writeMessage(output, { v: RUNNER_PROTOCOL_VERSION, type: "note", text: `answer ${message.question_id} arrived after its tool call closed` });
+            continue;
+          }
+          clearTimeout(item.timeout);
+          pending.delete(message.call_id);
+          const text = message.timed_out
+            ? `${message.text}\n\n[Tag Team deadline expired: record the assumption you used with from_timeout=true.]`
+            : message.text;
+          item.resolve({ text, is_error: false });
         } else {
           await writeMessage(output, { v: 1, type: "note", text: "Ignoring duplicate start message." });
         }
@@ -317,7 +421,7 @@ export async function runRunner({ input, output, stderr = () => undefined, runQu
   let subtype = "success";
   let failure: string | null = null;
   try {
-    queryHandle = runQuery({ prompt: start.prompt, options: sdkOptions(start, server, abortController) });
+    queryHandle = runQuery({ prompt: messages, options: sdkOptions(start, server, abortController) });
     for await (const message of queryHandle) {
       if (message.type === "system" && message.subtype === "init") {
         sessionId.value = message.session_id;
@@ -369,6 +473,7 @@ export async function runRunner({ input, output, stderr = () => undefined, runQu
     failure = errorMessage(error);
   } finally {
     clearTimeout(wallTimer);
+    messages.close();
     lines.close();
     settlePending(new Error("runner session ended"));
     await inboundPump;

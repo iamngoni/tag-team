@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
-import type { Options, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Options, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { expect, test } from "vitest";
 import { runRunner } from "../src/main.js";
 import { hubToRunnerSchema, remoteCallSchema, RUNNER_PROTOCOL_VERSION } from "../src/protocol.js";
@@ -39,7 +39,7 @@ test("stdio hub tool calls are streamed and wait for their matching result", asy
   const iterator = outputLines[Symbol.asyncIterator]();
   let capturedOptions: Options | undefined;
 
-  const runQuery = ({ options }: { prompt: string; options: Options }): Query => {
+  const runQuery = ({ options }: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options }): Query => {
     capturedOptions = options;
     let release: () => void = () => undefined;
     const sequence = (async function* () {
@@ -68,10 +68,11 @@ test("stdio hub tool calls are streamed and wait for their matching result", asy
   await runner;
 
   expect(capturedOptions).toMatchObject({
-    tools: [],
+    tools: ["WebFetch", "WebSearch"],
     allowedTools: [
       "mcp__tagteam__Bash", "mcp__tagteam__Read", "mcp__tagteam__Write", "mcp__tagteam__Edit",
-      "mcp__tagteam__Glob", "mcp__tagteam__Grep", "mcp__tagteam__ReportProgress", "mcp__tagteam__Finish",
+      "mcp__tagteam__Glob", "mcp__tagteam__Grep", "mcp__tagteam__AskMain",
+      "mcp__tagteam__ReportProgress", "mcp__tagteam__Finish", "WebFetch", "WebSearch",
     ],
     strictMcpConfig: true,
     settingSources: ["user", "project", "local"],
@@ -81,8 +82,10 @@ test("stdio hub tool calls are streamed and wait for their matching result", asy
   const originalInput = { command: "pwd" };
   const permissionOptions = { signal: new AbortController().signal, toolUseID: "tool-1", requestId: "request-1" };
   const allowed = await capturedOptions?.canUseTool?.("mcp__tagteam__Bash", originalInput, permissionOptions);
-  const denied = await capturedOptions?.canUseTool?.("WebSearch", originalInput, permissionOptions);
+  const web = await capturedOptions?.canUseTool?.("WebSearch", originalInput, permissionOptions);
+  const denied = await capturedOptions?.canUseTool?.("Bash", originalInput, permissionOptions);
   expect(allowed).toMatchObject({ behavior: "allow", updatedInput: originalInput });
+  expect(web).toMatchObject({ behavior: "allow", updatedInput: originalInput });
   expect(denied).toMatchObject({ behavior: "deny" });
   outputLines.close();
 });
@@ -93,7 +96,7 @@ test("runner fails closed if the SDK reports bypassPermissions", async () => {
   input.write(`${JSON.stringify(start)}\n`);
   const outputLines = createInterface({ input: output });
   const iterator = outputLines[Symbol.asyncIterator]();
-  const runQuery = ({ options }: { prompt: string; options: Options }): Query => {
+  const runQuery = ({ options }: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options }): Query => {
     let closed = false;
     const sequence = (async function* () {
       yield { ...sdkInit(), permissionMode: "bypassPermissions" } as unknown as SDKMessage;
@@ -162,6 +165,102 @@ test("normal SDK completion stops the hub reader while stdin remains open", asyn
   expect(input.destroyed).toBe(false);
   outputLines.close();
   input.destroy();
+});
+
+test("AskMain stays pending until the matching hub answer arrives", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  input.write(`${JSON.stringify(start)}\n`);
+  const outputLines = createInterface({ input: output });
+  const iterator = outputLines[Symbol.asyncIterator]();
+  let answerText: string | undefined;
+  let questionId: string | undefined;
+
+  const runQuery = ({ options }: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options }): Query => {
+    const sequence = (async function* () {
+      yield sdkInit();
+      const server = options.mcpServers?.tagteam;
+      if (!server || !("instance" in server)) throw new Error("Tag Team MCP server missing");
+      const registered = (server.instance as unknown as {
+        _registeredTools: Record<string, { handler: (args: unknown, extra: unknown) => Promise<{ content: Array<{ text?: string }> }> }>;
+      })._registeredTools;
+      const result = await registered.AskMain!.handler({ text: "Which API should I preserve?", options: ["v1", "v2"] }, {});
+      answerText = result.content[0]?.text;
+      yield sdkResult();
+    })();
+    return Object.assign(sequence, { close: () => undefined }) as Query;
+  };
+
+  const runner = runRunner({ input, output, runQuery });
+  expect(JSON.parse((await iterator.next()).value!).type).toBe("ready");
+  const call = JSON.parse((await iterator.next()).value!) as {
+    type: string;
+    call_id: string;
+    call: { tool: string; question_id: string; text: string; options: string[] };
+  };
+  expect(call).toMatchObject({
+    type: "tool_call",
+    call: { tool: "ask_main", text: "Which API should I preserve?", options: ["v1", "v2"] },
+  });
+  questionId = call.call.question_id;
+  expect(questionId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+  input.write(`${JSON.stringify({
+    v: 1,
+    type: "answer",
+    question_id: questionId,
+    call_id: call.call_id,
+    text: "Preserve v2 and add a compatibility adapter.",
+    timed_out: false,
+  })}\n`);
+  expect(JSON.parse((await iterator.next()).value!).type).toBe("usage");
+  expect(JSON.parse((await iterator.next()).value!)).toMatchObject({ type: "exited", subtype: "success" });
+  await runner;
+  expect(answerText).toBe("Preserve v2 and add a compatibility adapter.");
+  outputLines.close();
+});
+
+test("steering is delivered on the streaming query input", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  input.write(`${JSON.stringify(start)}\n`);
+  const outputLines = createInterface({ input: output });
+  const iterator = outputLines[Symbol.asyncIterator]();
+  let seen: string[] = [];
+  let release: () => void = () => undefined;
+  const steered = new Promise<void>((resolve) => { release = resolve; });
+
+  const runQuery = ({ prompt }: { prompt: string | AsyncIterable<SDKUserMessage>; options: Options }): Query => {
+    if (typeof prompt === "string") throw new Error("runner must use streaming input");
+    void (async () => {
+      for await (const message of prompt) {
+        const content = message.message.content;
+        const text = typeof content === "string" ? content : content.map((part) => "text" in part ? part.text : "").join("");
+        seen.push(text);
+        if (text.includes("Use the other migration path")) {
+          release();
+          return;
+        }
+      }
+    })();
+    let closed = false;
+    const sequence = (async function* () {
+      yield sdkInit();
+      await steered;
+      yield sdkResult();
+    })();
+    return Object.assign(sequence, { close: () => { closed = true; } }) as Query;
+  };
+
+  const runner = runRunner({ input, output, runQuery });
+  expect(JSON.parse((await iterator.next()).value!).type).toBe("ready");
+  input.write(`${JSON.stringify({ v: 1, type: "steer", text: "Use the other migration path." })}\n`);
+  expect(JSON.parse((await iterator.next()).value!)).toMatchObject({ type: "note" });
+  expect(JSON.parse((await iterator.next()).value!).type).toBe("usage");
+  expect(JSON.parse((await iterator.next()).value!)).toMatchObject({ type: "exited", subtype: "success" });
+  await runner;
+  expect(seen[0]).toBe(start.prompt);
+  expect(seen.some((text) => text.includes("Use the other migration path"))).toBe(true);
+  outputLines.close();
 });
 
 function sdkInit(): SDKMessage {

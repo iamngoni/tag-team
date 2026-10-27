@@ -14,10 +14,13 @@ use std::{
 
 use semver::VersionReq;
 use tagteam_core::{
-    Bytes, Capacity, FailReason, Limits, MainSessionId, Needs, Node, NodeId, NodePolicy, NodeState,
-    Os, OwnerPresence, Platform, SubtaskId, SubtaskSpec, SubtaskState, Thermal, Timestamp, Trust,
+    Bytes, Capacity, Dispatch, FailReason, Limits, MainSessionId, Needs, Node, NodeId, NodePolicy,
+    NodeState, Os, OwnerPresence, Platform, Question, QuestionId, Subtask, SubtaskId, SubtaskSpec,
+    SubtaskState, Thermal, Timestamp, Trust,
     local_api::{DispatchInput, DispatchReply, LocalRequest, LocalResponseBody},
+    runner_proto::HubToRunnerMessage,
     schedule::{NoFitReason, Placement},
+    state::SubtaskInput,
 };
 use tagteam_pki::HubCa;
 use tempfile::TempDir;
@@ -359,6 +362,7 @@ async fn cancellation_while_preparing_never_reaches_running() {
         .handle(LocalRequest::Cancel {
             subtask: subtask_id,
             reason: "operator cancelled".into(),
+            claude_session: None,
         })
         .await
         .expect("cancel preparing task");
@@ -670,4 +674,260 @@ fn direct_spec_validation_normalizes_fields_and_rejects_partial_inputs() {
     let mut zero_output = valid.clone();
     zero_output.limits.max_output = Bytes(0);
     assert!(normalize_and_validate_spec(&mut zero_output, &repository).is_err());
+}
+
+async fn seed_question(
+    service: &HubService,
+    claude_session: &str,
+    deadline: Timestamp,
+) -> (
+    SubtaskId,
+    QuestionId,
+    tokio::sync::mpsc::Receiver<HubToRunnerMessage>,
+) {
+    let dispatch = Dispatch {
+        id: tagteam_core::DispatchId::new(),
+        main_session: MainSessionId::new(),
+        claude_session: Some(claude_session.into()),
+        repo: PathBuf::from("/workspace/repo"),
+        created: Timestamp::now(),
+    };
+    let task = Subtask {
+        id: SubtaskId::new(),
+        dispatch: dispatch.id,
+        spec: spec(Path::new("/workspace/repo"), "Interactive task", false),
+        state: SubtaskState::Running,
+        node: None,
+        attempt: 0,
+        base: tagteam_core::GitOid::zero(),
+        repo_id: tagteam_core::RepoId(tagteam_core::GitOid::zero()),
+        branch: "tagteam/interactive-task".into(),
+        runner_session: Some("runner-session".into()),
+        created: Timestamp::now(),
+        started: Some(Timestamp::now()),
+        finished: None,
+        usage: tagteam_core::Usage::default(),
+    };
+    let question = Question {
+        id: QuestionId::new(),
+        subtask: task.id,
+        text: "Which compatibility path should I keep?".into(),
+        options: vec!["old".into(), "new".into()],
+        context: Some("The answer changes the migration surface.".into()),
+        deadline,
+    };
+    let task_id = task.id;
+    let question_id = question.id;
+    service
+        .journal(move |journal| {
+            journal.create_dispatch(&dispatch)?;
+            journal.create_subtask(&task)?;
+            journal.transition(
+                task.id,
+                SubtaskInput::Ask {
+                    question,
+                    call_id: "ask-call-1".into(),
+                },
+                Timestamp::now(),
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed question");
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    service.runners.lock().await.insert(task_id, sender);
+    (task_id, question_id, receiver)
+}
+
+#[tokio::test]
+async fn answer_commits_state_then_delivers_the_pending_tool_result() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let service = service(&directory).await;
+    let deadline = Timestamp::now().checked_add(Duration::from_secs(60));
+    let (subtask, question, mut runner) = seed_question(&service, "claude-a", deadline).await;
+
+    let response = service
+        .handle(LocalRequest::Answer {
+            subtask,
+            question: Some(question),
+            text: "Keep the old path for one release.".into(),
+            author: tagteam_core::local_api::AnswerAuthor::MainClaude,
+            claude_session: Some("claude-a".into()),
+        })
+        .await
+        .expect("answer");
+    let LocalResponseBody::Answered(reply) = response else {
+        panic!("unexpected answer response: {response:?}");
+    };
+    assert!(reply.delivered);
+    assert_eq!(reply.question, question);
+    assert_eq!(
+        load_subtask(&service, subtask).await.state,
+        SubtaskState::Running
+    );
+
+    let message = tokio::time::timeout(Duration::from_secs(1), runner.recv())
+        .await
+        .expect("runner delivery timeout")
+        .expect("runner message");
+    assert!(matches!(
+        message,
+        HubToRunnerMessage::Answer {
+            question_id,
+            call_id,
+            text,
+            timed_out: false,
+        } if question_id == question
+            && call_id == "ask-call-1"
+            && text == "Keep the old path for one release."
+    ));
+
+    let duplicate = service
+        .handle(LocalRequest::Answer {
+            subtask,
+            question: Some(question),
+            text: "A second answer".into(),
+            author: tagteam_core::local_api::AnswerAuthor::You,
+            claude_session: Some("claude-a".into()),
+        })
+        .await;
+    assert!(duplicate.is_err(), "duplicate answer must be rejected");
+}
+
+#[tokio::test]
+async fn question_expiry_resumes_the_runner_with_timeout_guidance() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let service = service(&directory).await;
+    let deadline = Timestamp::now().checked_add(Duration::from_millis(25));
+    let (subtask, question, mut runner) = seed_question(&service, "claude-a", deadline).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    assert_eq!(service.expire_due_questions().await.expect("expire"), 1);
+    assert_eq!(
+        load_subtask(&service, subtask).await.state,
+        SubtaskState::Running
+    );
+    let message = tokio::time::timeout(Duration::from_secs(1), runner.recv())
+        .await
+        .expect("runner delivery timeout")
+        .expect("runner message");
+    assert!(matches!(
+        message,
+        HubToRunnerMessage::Answer {
+            question_id,
+            call_id,
+            timed_out: true,
+            ..
+        } if question_id == question && call_id == "ask-call-1"
+    ));
+    assert_eq!(service.expire_due_questions().await.expect("idempotent"), 0);
+}
+
+#[tokio::test]
+async fn session_scope_hides_other_claude_sessions_from_tools_and_events() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let service = service(&directory).await;
+    let deadline = Timestamp::now().checked_add(Duration::from_secs(60));
+    let (first, first_question, _first_runner) =
+        seed_question(&service, "session-a", deadline).await;
+    let (second, second_question, _second_runner) =
+        seed_question(&service, "session-b", deadline).await;
+
+    let status = service
+        .handle(LocalRequest::Status {
+            ids: None,
+            claude_session: Some("session-a".into()),
+        })
+        .await
+        .expect("status");
+    let LocalResponseBody::Status(status) = status else {
+        panic!("unexpected status response: {status:?}");
+    };
+    assert_eq!(status.subtasks.len(), 1);
+    assert_eq!(status.subtasks[0].id, first);
+    assert_eq!(
+        status.subtasks[0].open_question_text.as_deref(),
+        Some("Which compatibility path should I keep?")
+    );
+
+    let events = service
+        .handle(LocalRequest::Inbox {
+            since_seq: 0,
+            wait_ms: 0,
+            kinds: None,
+            all: false,
+            claude_session: Some("session-a".into()),
+        })
+        .await
+        .expect("inbox");
+    let LocalResponseBody::Events(events) = events else {
+        panic!("unexpected inbox response: {events:?}");
+    };
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|event| event.subtask == first));
+
+    let cross_session_answer = service
+        .handle(LocalRequest::Answer {
+            subtask: second,
+            question: Some(second_question),
+            text: "should not cross sessions".into(),
+            author: tagteam_core::local_api::AnswerAuthor::You,
+            claude_session: Some("session-a".into()),
+        })
+        .await;
+    assert!(cross_session_answer.is_err());
+
+    let own_question = service
+        .journal(move |journal| journal.load_question(first_question))
+        .await
+        .expect("journal")
+        .expect("question");
+    assert_eq!(own_question.question.subtask, first);
+}
+
+#[tokio::test]
+async fn an_expired_node_lease_reassigns_its_unfinished_work() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (repository, _) = init_repository(&directory);
+    let mut config = config(&directory);
+    config.heartbeat_timeout = Duration::from_millis(1);
+    let ca = Arc::new(HubCa::generate().expect("CA"));
+    let service = HubService::open(&config, ca).await.expect("service");
+    let node = active_node();
+    let node_id = node.id;
+    service
+        .journal(move |journal| journal.create_node(&node))
+        .await
+        .expect("node");
+
+    let reply = dispatch(
+        &service,
+        &repository,
+        vec![spec(&repository, "Survive node loss", false)],
+    )
+    .await;
+    let subtask_id = reply.subtasks[0].0;
+    let mut observed = None;
+    for _ in 0..100 {
+        service.reconcile_nodes().await.expect("reconcile");
+        let task = load_subtask(&service, subtask_id).await;
+        if matches!(
+            task.state,
+            SubtaskState::Reassigning {
+                reason: tagteam_core::ReassignReason::NodeLost
+            }
+        ) {
+            observed = Some(task);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let task = observed.expect("expired lease must move the task to reassigning");
+    assert_eq!(task.node, Some(node_id));
+    let node = service
+        .journal(move |journal| journal.load_node(node_id))
+        .await
+        .expect("load node")
+        .expect("node");
+    assert_eq!(node.state, NodeState::Lost);
 }

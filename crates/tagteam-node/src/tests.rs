@@ -34,6 +34,7 @@ impl HeartbeatSource for StaticHeartbeat {
             toolchains: Vec::new(),
             repos: Vec::new(),
             running: Vec::new(),
+            idle_for_ms: 0,
         }
     }
 }

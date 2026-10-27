@@ -623,10 +623,11 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
                     on_battery: false,
                     thermal: "fair".into(),
                 }),
-                presence: proto::OwnerPresence::Present as i32,
+                presence: proto::OwnerPresence::Away as i32,
                 toolchains: Vec::new(),
                 repos: Vec::new(),
                 running: Vec::new(),
+                idle_for_ms: 47_000,
             })),
         })
         .await
@@ -651,7 +652,12 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
     assert_eq!(updated.capacity.cores_total, 8);
     assert_eq!(updated.capacity.cores_free, 2.5);
     assert_eq!(updated.capacity.running, 2);
-    assert_eq!(updated.presence, OwnerPresence::Present);
+    assert_eq!(
+        updated.presence,
+        OwnerPresence::Away {
+            idle_for: Duration::from_secs(47),
+        }
+    );
     assert!(updated.last_seen > Timestamp(0));
     let ended = tokio::time::timeout(Duration::from_secs(2), first_session.message())
         .await

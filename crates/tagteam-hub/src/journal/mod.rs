@@ -10,14 +10,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tagteam_core::{
-    CachedRepo, Capacity, Dispatch, DispatchId, Event, EventKind, GitOid, MainSessionId, Node,
-    NodeId, NodePolicy, NodeState, OwnerPresence, Platform, RepoId, ResultSummary, Subtask,
-    SubtaskId, SubtaskState, Timestamp, Toolchain, Usage,
+    AnsweredBy, CachedRepo, Capacity, Dispatch, DispatchId, Event, EventKind, GitOid,
+    MainSessionId, Node, NodeId, NodePolicy, NodeState, OwnerPresence, Platform, Question,
+    QuestionId, RepoId, ResultSummary, Subtask, SubtaskId, SubtaskState, Timestamp, Toolchain,
+    Usage,
     state::{self, IllegalTransition, SubtaskInput},
 };
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 type ResultRow = (
     String,
@@ -59,6 +60,10 @@ pub enum JournalError {
     UnsupportedSchema(i64),
     #[error("integer value is outside SQLite's supported range")]
     IntegerRange,
+    #[error("request is invalid: {0}")]
+    Invalid(String),
+    #[error("question is no longer open: {0}")]
+    QuestionClosed(String),
 }
 
 /// A synchronous SQLite journal. Callers that need async integration should
@@ -94,6 +99,17 @@ pub struct Command {
 pub struct TransitionResult {
     pub state: SubtaskState,
     pub event: Event,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// A durable question, including its runner tool call and answer state.
+pub struct StoredQuestion {
+    pub question: Question,
+    pub call_id: String,
+    pub answer: Option<String>,
+    pub answered_by: Option<AnsweredBy>,
+    pub answered_at: Option<Timestamp>,
+    pub closed_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -133,6 +149,12 @@ impl Journal {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(include_str!("../../migrations/0001_initial.sql"))?;
             transaction.pragma_update(None, "user_version", 1)?;
+            transaction.commit()?;
+        }
+        if version < 2 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(include_str!("../../migrations/0002_questions.sql"))?;
+            transaction.pragma_update(None, "user_version", 2)?;
             transaction.commit()?;
         }
         Ok(Self { connection })
@@ -376,6 +398,31 @@ impl Journal {
     /// Resumes a paused node; repeating the operation is safe.
     pub fn resume_node(&mut self, id: NodeId) -> Result<(), JournalError> {
         self.set_node_state(id, NodeState::Active, &[NodeState::Paused])
+    }
+
+    /// Marks a node lost after its heartbeat lease expires. Repeating the
+    /// operation is safe so overlapping reconciliation passes cannot conflict.
+    pub fn mark_node_lost(&mut self, id: NodeId) -> Result<(), JournalError> {
+        self.set_node_state(
+            id,
+            NodeState::Lost,
+            &[NodeState::Active, NodeState::OwnerBusy],
+        )
+    }
+
+    /// Restores a reconnect after the node missed its heartbeat deadline.
+    pub fn restore_lost_node(&mut self, id: NodeId) -> Result<(), JournalError> {
+        self.set_node_state(id, NodeState::Active, &[NodeState::Lost])
+    }
+
+    /// Stops new placement when an idle-only machine's owner returns.
+    pub fn mark_node_owner_busy(&mut self, id: NodeId) -> Result<(), JournalError> {
+        self.set_node_state(id, NodeState::OwnerBusy, &[NodeState::Active])
+    }
+
+    /// Re-opens a machine after its owner has been away again.
+    pub fn restore_idle_node(&mut self, id: NodeId) -> Result<(), JournalError> {
+        self.set_node_state(id, NodeState::Active, &[NodeState::OwnerBusy])
     }
 
     /// Revokes and marks a node removed without deleting its durable record.
@@ -641,34 +688,184 @@ impl Journal {
         at: Timestamp,
     ) -> Result<TransitionResult, JournalError> {
         let transaction = self.connection.transaction()?;
-        let current_json: String = transaction
+        let result = transition_in_transaction(&transaction, id, input, at)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Loads one question by its durable ID.
+    pub fn load_question(&self, id: QuestionId) -> Result<Option<StoredQuestion>, JournalError> {
+        self.connection
             .query_row(
-                "SELECT state FROM subtasks WHERE id=?1",
+                "SELECT id,subtask_id,text,options,context,deadline_at,answer,answered_by,answered_at,closed_at,call_id FROM questions WHERE id=?1",
+                [id.to_string()],
+                read_question,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Loads the currently open question for a subtask, if any.
+    pub fn open_question(
+        &self,
+        subtask: SubtaskId,
+    ) -> Result<Option<StoredQuestion>, JournalError> {
+        self.connection
+            .query_row(
+                "SELECT id,subtask_id,text,options,context,deadline_at,answer,answered_by,answered_at,closed_at,call_id FROM questions WHERE subtask_id=?1 AND answer IS NULL AND closed_at IS NULL ORDER BY deadline_at DESC LIMIT 1",
+                [subtask.to_string()],
+                read_question,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Lists every question that is still open.
+    pub fn open_questions(&self) -> Result<Vec<StoredQuestion>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,subtask_id,text,options,context,deadline_at,answer,answered_by,answered_at,closed_at,call_id FROM questions WHERE answer IS NULL AND closed_at IS NULL ORDER BY deadline_at,id",
+        )?;
+        let rows = statement.query_map([], read_question)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Lists open questions whose answer deadline is at or before `now`.
+    pub fn due_questions(&self, now: Timestamp) -> Result<Vec<StoredQuestion>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,subtask_id,text,options,context,deadline_at,answer,answered_by,answered_at,closed_at,call_id FROM questions WHERE answer IS NULL AND closed_at IS NULL AND deadline_at<=?1 ORDER BY deadline_at,id",
+        )?;
+        let rows = statement.query_map([now.0], read_question)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Loads every subtask in creation order for one Claude session.
+    pub fn list_subtasks_for_session(
+        &self,
+        claude_session: &str,
+    ) -> Result<Vec<Subtask>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id FROM subtasks s JOIN dispatches d ON d.id=s.dispatch_id WHERE d.claude_session=?1 ORDER BY s.created_at,s.id",
+        )?;
+        let rows = statement.query_map([claude_session], |row| row.get::<_, String>(0))?;
+        let ids = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut subtasks = Vec::with_capacity(ids.len());
+        for encoded in ids {
+            let id = SubtaskId::from_str(&encoded)
+                .map_err(|error| JournalError::IdempotencyConflict(error.to_string()))?;
+            if let Some(subtask) = self.load_subtask(id)? {
+                subtasks.push(subtask);
+            }
+        }
+        Ok(subtasks)
+    }
+
+    /// Returns whether a subtask belongs to the supplied Claude session.
+    pub fn subtask_belongs_to_session(
+        &self,
+        id: SubtaskId,
+        claude_session: &str,
+    ) -> Result<bool, JournalError> {
+        let dispatch_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT dispatch_id FROM subtasks WHERE id=?1",
                 [id.to_string()],
                 |row| row.get(0),
             )
-            .optional()?
-            .ok_or_else(|| JournalError::NotFound(format!("subtask {id}")))?;
-        let current: SubtaskState = serde_json::from_str(&current_json)?;
-        let assigned_node = match &input {
-            SubtaskInput::Placed { node } => Some(node.to_string()),
-            _ => None,
+            .optional()?;
+        let Some(dispatch_id) = dispatch_id else {
+            return Ok(false);
         };
-        let runner_session = match &input {
-            SubtaskInput::RunnerStarted { session } => Some(session.clone()),
-            _ => None,
-        };
-        let started = runner_session.is_some();
-        let result = match &input {
-            SubtaskInput::Finished { result } | SubtaskInput::Landed { result } => {
-                Some(result.clone())
+        let dispatch_id = DispatchId::from_str(&dispatch_id)
+            .map_err(|error| JournalError::IdempotencyConflict(error.to_string()))?;
+        Ok(self
+            .load_dispatch(dispatch_id)?
+            .and_then(|dispatch| dispatch.claude_session)
+            .as_deref()
+            == Some(claude_session))
+    }
+
+    /// Loads dispatches and subtasks in one pass for event authorization.
+    pub fn visible_subtask_ids(
+        &self,
+        claude_session: Option<&str>,
+    ) -> Result<Vec<SubtaskId>, JournalError> {
+        match claude_session {
+            Some(session) => self
+                .list_subtasks_for_session(session)
+                .map(|subtasks| subtasks.into_iter().map(|subtask| subtask.id).collect()),
+            None => self
+                .list_subtasks()
+                .map(|subtasks| subtasks.into_iter().map(|subtask| subtask.id).collect()),
+        }
+    }
+
+    /// Returns the number of open questions without loading their content.
+    pub fn open_question_count(&self, subtask: SubtaskId) -> Result<u64, JournalError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM questions WHERE subtask_id=?1 AND answer IS NULL AND closed_at IS NULL",
+            [subtask.to_string()],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| JournalError::IntegerRange)
+    }
+}
+
+fn transition_in_transaction(
+    transaction: &Transaction<'_>,
+    id: SubtaskId,
+    input: SubtaskInput,
+    at: Timestamp,
+) -> Result<TransitionResult, JournalError> {
+    let current_json: String = transaction
+        .query_row(
+            "SELECT state FROM subtasks WHERE id=?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| JournalError::NotFound(format!("subtask {id}")))?;
+    let current: SubtaskState = serde_json::from_str(&current_json)?;
+    let assigned_node = match &input {
+        SubtaskInput::Placed { node } => Some(node.to_string()),
+        _ => None,
+    };
+    let runner_session = match &input {
+        SubtaskInput::RunnerStarted { session } => Some(session.clone()),
+        _ => None,
+    };
+    let started = runner_session.is_some();
+    let result = match &input {
+        SubtaskInput::Finished { result } | SubtaskInput::Landed { result } => Some(result.clone()),
+        _ => None,
+    };
+    let asked = match &input {
+        SubtaskInput::Ask { question, call_id } => {
+            if question.subtask != id {
+                return Err(JournalError::Invalid(
+                    "question subtask does not match the transition".into(),
+                ));
             }
-            _ => None,
-        };
-        let (next, event_kind) =
-            state::step(&current, input).map_err(JournalError::IllegalTransition)?;
-        transaction.execute(
-            "UPDATE subtasks SET state=?2,node_id=COALESCE(?3,node_id),runner_session=COALESCE(?4,runner_session),started_at=CASE WHEN ?5 THEN COALESCE(started_at,?6) ELSE started_at END,finished_at=CASE WHEN ?7 THEN ?6 ELSE finished_at END WHERE id=?1",
+            if call_id.trim().is_empty() {
+                return Err(JournalError::Invalid(
+                    "question runner call ID must not be empty".into(),
+                ));
+            }
+            if question.deadline <= at {
+                return Err(JournalError::Invalid(
+                    "question deadline must be in the future".into(),
+                ));
+            }
+            Some((question, call_id))
+        }
+        _ => None,
+    };
+    let (next, event_kind) =
+        state::step(&current, input.clone()).map_err(JournalError::IllegalTransition)?;
+    let reassignment_placement =
+        matches!(current, SubtaskState::Reassigning { .. }) && assigned_node.is_some();
+    transaction.execute(
+            "UPDATE subtasks SET state=?2,node_id=COALESCE(?3,node_id),runner_session=COALESCE(?4,runner_session),attempt=CASE WHEN ?8 THEN attempt+1 ELSE attempt END,started_at=CASE WHEN ?5 THEN COALESCE(started_at,?6) ELSE started_at END,finished_at=CASE WHEN ?7 THEN ?6 ELSE finished_at END WHERE id=?1",
             params![
                 id.to_string(),
                 serde_json::to_string(&next)?,
@@ -677,24 +874,61 @@ impl Journal {
                 started,
                 at.0,
                 next.is_terminal(),
+                reassignment_placement,
             ],
         )?;
-        if let Some(result) = result {
-            store_result(&transaction, id, &result)?;
-        }
-        let seq = insert_event(&transaction, id, at, &event_kind)?;
-        transaction.commit()?;
-        Ok(TransitionResult {
-            state: next,
-            event: Event {
-                seq,
-                subtask: id,
-                at,
-                kind: event_kind,
-            },
-        })
+    if let Some(result) = result {
+        store_result(transaction, id, &result)?;
     }
+    if let Some((question, call_id)) = asked {
+        transaction.execute(
+                "INSERT INTO questions(id,subtask_id,text,options,context,deadline_at,call_id) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    question.id.to_string(),
+                    id.to_string(),
+                    question.text,
+                    serde_json::to_string(&question.options)?,
+                    question.context,
+                    question.deadline.0,
+                    call_id,
+                ],
+            )?;
+    }
+    if let SubtaskInput::Answer { question, by, text } = &input {
+        let changed = transaction.execute(
+                "UPDATE questions SET answer=?2,answered_by=?3,answered_at=?4 WHERE id=?5 AND subtask_id=?6 AND answer IS NULL AND closed_at IS NULL",
+                params![
+                    id.to_string(),
+                    text,
+                    serde_json::to_string(by)?,
+                    at.0,
+                    question.to_string(),
+                    id.to_string(),
+                ],
+            )?;
+        if changed != 1 {
+            return Err(JournalError::QuestionClosed(question.to_string()));
+        }
+    }
+    if next.is_terminal() || matches!(next, SubtaskState::Reassigning { .. }) {
+        transaction.execute(
+                "UPDATE questions SET closed_at=COALESCE(closed_at,?2) WHERE subtask_id=?1 AND answer IS NULL",
+                params![id.to_string(), at.0],
+            )?;
+    }
+    let seq = insert_event(transaction, id, at, &event_kind)?;
+    Ok(TransitionResult {
+        state: next,
+        event: Event {
+            seq,
+            subtask: id,
+            at,
+            kind: event_kind,
+        },
+    })
+}
 
+impl Journal {
     /// Lists every subtask in creation order.
     pub fn list_subtasks(&self) -> Result<Vec<Subtask>, JournalError> {
         let mut statement = self
@@ -967,6 +1201,20 @@ impl Journal {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Cancels every unfinished command for a subtask. This prevents a lost
+    /// node from replaying work after the subtask has been reassigned.
+    pub fn cancel_subtask_commands(
+        &mut self,
+        subtask_id: SubtaskId,
+    ) -> Result<usize, JournalError> {
+        self.connection
+            .execute(
+                "UPDATE commands SET state='cancelled' WHERE subtask_id=?1 AND result IS NULL AND state!='cancelled'",
+                [subtask_id.to_string()],
+            )
+            .map_err(Into::into)
+    }
+
     /// Loads a command and its stored result by idempotency key.
     pub fn load_command(&self, command_id: &str) -> Result<Option<Command>, JournalError> {
         self.connection
@@ -1126,6 +1374,49 @@ fn read_command(row: &rusqlite::Row<'_>) -> rusqlite::Result<Command> {
             })?,
         sent_at: row.get::<_, Option<i64>>(6)?.map(Timestamp),
         done_at: row.get::<_, Option<i64>>(7)?.map(Timestamp),
+    })
+}
+
+fn read_question(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredQuestion> {
+    let id: String = row.get(0)?;
+    let subtask: String = row.get(1)?;
+    let options: String = row.get(3)?;
+    let answered_by: Option<String> = row.get(7)?;
+    let question_id = QuestionId::from_str(&id).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let subtask_id = SubtaskId::from_str(&subtask).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(StoredQuestion {
+        question: Question {
+            id: question_id,
+            subtask: subtask_id,
+            text: row.get(2)?,
+            options: serde_json::from_str(&options).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+            context: row.get(4)?,
+            deadline: Timestamp(row.get(5)?),
+        },
+        answer: row.get(6)?,
+        answered_by: answered_by
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        answered_at: row.get::<_, Option<i64>>(8)?.map(Timestamp),
+        closed_at: row.get::<_, Option<i64>>(9)?.map(Timestamp),
+        call_id: row.get(10)?,
     })
 }
 

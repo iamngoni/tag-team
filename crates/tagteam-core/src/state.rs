@@ -8,15 +8,44 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "input", rename_all = "snake_case")]
 pub enum SubtaskInput {
-    Placed { node: NodeId },
-    NoFit { reasons: Vec<NoFitReason> },
+    Placed {
+        node: NodeId,
+    },
+    NoFit {
+        reasons: Vec<NoFitReason>,
+    },
     Prepared,
-    RunnerStarted { session: String },
-    Finished { result: ResultSummary },
-    Collected { blob: BlobRef },
-    Landed { result: ResultSummary },
-    Fail { reason: FailReason },
-    Cancel { reason: String },
+    RunnerStarted {
+        session: String,
+    },
+    Ask {
+        question: crate::Question,
+        call_id: String,
+    },
+    Answer {
+        question: crate::QuestionId,
+        by: crate::AnsweredBy,
+        text: String,
+    },
+    Reassign {
+        from: NodeId,
+        reason: crate::ReassignReason,
+    },
+    Finished {
+        result: ResultSummary,
+    },
+    Collected {
+        blob: BlobRef,
+    },
+    Landed {
+        result: ResultSummary,
+    },
+    Fail {
+        reason: FailReason,
+    },
+    Cancel {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -40,10 +69,13 @@ pub fn step(
     }
 
     match (&current, &input) {
-        (
-            SubtaskState::Queued | SubtaskState::Placing | SubtaskState::Reassigning { .. },
-            SubtaskInput::Placed { node },
-        ) => Ok((SubtaskState::Preparing, EventKind::Placed { node: *node })),
+        (SubtaskState::Queued | SubtaskState::Placing, SubtaskInput::Placed { node }) => {
+            Ok((SubtaskState::Preparing, EventKind::Placed { node: *node }))
+        }
+        (SubtaskState::Reassigning { .. }, SubtaskInput::Placed { node }) => Ok((
+            SubtaskState::Preparing,
+            EventKind::ReassignedTo { to: *node },
+        )),
         (SubtaskState::Placing, SubtaskInput::NoFit { reasons }) => Ok((
             SubtaskState::Queued,
             EventKind::Progress {
@@ -66,6 +98,39 @@ pub fn step(
             EventKind::Progress {
                 note: format!("runner started ({session})"),
                 percent: None,
+            },
+        )),
+        (SubtaskState::Running, SubtaskInput::Ask { question, .. }) => Ok((
+            SubtaskState::WaitingOnMain {
+                question: question.id,
+            },
+            EventKind::Question(question.clone()),
+        )),
+        (
+            SubtaskState::WaitingOnMain { question: current },
+            SubtaskInput::Answer {
+                question,
+                by,
+                text: _,
+            },
+        ) if current == question => Ok((
+            SubtaskState::Running,
+            EventKind::Answered {
+                question: *question,
+                by: by.clone(),
+            },
+        )),
+        (
+            SubtaskState::Preparing
+            | SubtaskState::Running
+            | SubtaskState::WaitingOnMain { .. }
+            | SubtaskState::Collecting,
+            SubtaskInput::Reassign { from, reason },
+        ) => Ok((
+            SubtaskState::Reassigning { reason: *reason },
+            EventKind::Reassigned {
+                from: *from,
+                reason: *reason,
             },
         )),
         (SubtaskState::Running, SubtaskInput::Finished { result }) => {

@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use super::*;
 use tagteam_core::{
-    Arch, Capacity, Check, DiffStat, GitOid, Limits, MainSessionId, Needs, NodePolicy, Os, Outcome,
-    OwnerPresence, Platform, RepoId, ResultSummary, SubtaskSpec, Trust,
+    AnsweredBy, Arch, Capacity, Check, DiffStat, GitOid, Limits, MainSessionId, Needs, NodePolicy,
+    Os, Outcome, OwnerPresence, Platform, Question, QuestionId, ReassignReason, RepoId,
+    ResultSummary, SubtaskSpec, Trust,
 };
 use tempfile::tempdir;
 
@@ -83,6 +84,31 @@ fn setup() -> (tempfile::TempDir, Journal, Dispatch, Subtask) {
     (dir, journal, dispatch, task)
 }
 
+fn setup_running() -> (tempfile::TempDir, Journal, Dispatch, Subtask) {
+    let dir = tempdir().expect("tempdir");
+    let mut journal =
+        Journal::open(dir.path().join("nested/journal.sqlite")).expect("open journal");
+    let dispatch = dispatch();
+    journal.create_dispatch(&dispatch).expect("create dispatch");
+    let mut task = subtask(&dispatch);
+    task.state = SubtaskState::Running;
+    journal
+        .create_subtask(&task)
+        .expect("create running subtask");
+    (dir, journal, dispatch, task)
+}
+
+fn running_question(task: &Subtask) -> Question {
+    Question {
+        id: QuestionId::new(),
+        subtask: task.id,
+        text: "Should the migration keep the legacy column?".into(),
+        options: vec!["keep".into(), "drop".into()],
+        context: Some("The answer changes the rollback plan.".into()),
+        deadline: Timestamp(1_000),
+    }
+}
+
 #[test]
 fn migration_is_idempotent_across_reopen() {
     let dir = tempdir().expect("tempdir");
@@ -128,6 +154,285 @@ fn transition_commits_state_and_event_together() {
     assert_eq!(
         journal.events(EventFilter::default()).expect("events"),
         vec![result.event]
+    );
+}
+
+#[test]
+fn question_and_answer_round_trip_atomically() {
+    let (dir, mut journal, _dispatch, task) = setup_running();
+    let question = running_question(&task);
+
+    let asked = journal
+        .transition(
+            task.id,
+            SubtaskInput::Ask {
+                question: question.clone(),
+                call_id: "tool-call-7".into(),
+            },
+            Timestamp(100),
+        )
+        .expect("ask");
+    assert_eq!(
+        asked.state,
+        SubtaskState::WaitingOnMain {
+            question: question.id
+        }
+    );
+    assert!(matches!(asked.event.kind, EventKind::Question(_)));
+
+    let stored = journal
+        .open_question(task.id)
+        .expect("open question")
+        .expect("question exists");
+    assert_eq!(stored.question, question);
+    assert_eq!(stored.call_id, "tool-call-7");
+    assert_eq!(stored.answer, None);
+    assert_eq!(stored.answered_at, None);
+
+    drop(journal);
+    let mut journal = Journal::open(dir.path().join("nested/journal.sqlite")).expect("reopen");
+    let answered = journal
+        .transition(
+            task.id,
+            SubtaskInput::Answer {
+                question: question.id,
+                by: AnsweredBy::MainClaude,
+                text: "Keep it for one release.".into(),
+            },
+            Timestamp(200),
+        )
+        .expect("answer");
+    assert_eq!(answered.state, SubtaskState::Running);
+    assert!(matches!(
+        answered.event.kind,
+        EventKind::Answered {
+            question: id,
+            by: AnsweredBy::MainClaude,
+        } if id == question.id
+    ));
+
+    let stored = journal
+        .load_question(question.id)
+        .expect("load question")
+        .expect("stored question");
+    assert_eq!(stored.answer.as_deref(), Some("Keep it for one release."));
+    assert_eq!(stored.answered_by, Some(AnsweredBy::MainClaude));
+    assert_eq!(stored.answered_at, Some(Timestamp(200)));
+    assert_eq!(stored.closed_at, None);
+    assert!(
+        journal
+            .open_question(task.id)
+            .expect("open question")
+            .is_none()
+    );
+}
+
+#[test]
+fn wrong_question_cannot_answer_the_waiting_question() {
+    let (_dir, mut journal, _dispatch, task) = setup_running();
+    let question = running_question(&task);
+    journal
+        .transition(
+            task.id,
+            SubtaskInput::Ask {
+                question: question.clone(),
+                call_id: "tool-call-7".into(),
+            },
+            Timestamp(100),
+        )
+        .expect("ask");
+
+    let rejected = journal.transition(
+        task.id,
+        SubtaskInput::Answer {
+            question: QuestionId::new(),
+            by: AnsweredBy::You,
+            text: "not for this question".into(),
+        },
+        Timestamp(200),
+    );
+    assert!(matches!(rejected, Err(JournalError::IllegalTransition(_))));
+    assert_eq!(
+        journal.load_subtask_state(task.id).expect("state"),
+        Some(SubtaskState::WaitingOnMain {
+            question: question.id
+        })
+    );
+    let stored = journal
+        .open_question(task.id)
+        .expect("open question")
+        .expect("still open");
+    assert_eq!(stored.answer, None);
+}
+
+#[test]
+fn timeout_answer_resumes_with_explicit_guidance() {
+    let (_dir, mut journal, _dispatch, task) = setup_running();
+    let question = running_question(&task);
+    journal
+        .transition(
+            task.id,
+            SubtaskInput::Ask {
+                question: question.clone(),
+                call_id: "tool-call-timeout".into(),
+            },
+            Timestamp(100),
+        )
+        .expect("ask");
+    let guidance = "No answer. Use the smallest safe assumption.";
+    let result = journal
+        .transition(
+            task.id,
+            SubtaskInput::Answer {
+                question: question.id,
+                by: AnsweredBy::Timeout {
+                    guess: guidance.into(),
+                },
+                text: guidance.into(),
+            },
+            Timestamp(1_000),
+        )
+        .expect("timeout answer");
+    assert_eq!(result.state, SubtaskState::Running);
+    let stored = journal
+        .load_question(question.id)
+        .expect("question")
+        .expect("stored");
+    assert_eq!(stored.answer.as_deref(), Some(guidance));
+    assert!(matches!(
+        stored.answered_by,
+        Some(AnsweredBy::Timeout { guess }) if guess == guidance
+    ));
+}
+
+#[test]
+fn cancellation_closes_an_unanswered_question_and_rejects_late_answers() {
+    let (_dir, mut journal, _dispatch, task) = setup_running();
+    let question = running_question(&task);
+    journal
+        .transition(
+            task.id,
+            SubtaskInput::Ask {
+                question: question.clone(),
+                call_id: "tool-call-cancel".into(),
+            },
+            Timestamp(100),
+        )
+        .expect("ask");
+    journal
+        .transition(
+            task.id,
+            SubtaskInput::Cancel {
+                reason: "owner cancelled".into(),
+            },
+            Timestamp(110),
+        )
+        .expect("cancel");
+    let stored = journal
+        .load_question(question.id)
+        .expect("question")
+        .expect("stored");
+    assert_eq!(stored.closed_at, Some(Timestamp(110)));
+    assert_eq!(stored.answer, None);
+    assert!(
+        journal
+            .open_question(task.id)
+            .expect("open question")
+            .is_none()
+    );
+
+    let late = journal.transition(
+        task.id,
+        SubtaskInput::Answer {
+            question: question.id,
+            by: AnsweredBy::You,
+            text: "too late".into(),
+        },
+        Timestamp(120),
+    );
+    assert!(matches!(late, Err(JournalError::IllegalTransition(_))));
+}
+
+#[test]
+fn reassignment_closes_an_unanswered_question() {
+    let (_dir, mut journal, _dispatch, task) = setup_running();
+    let question = running_question(&task);
+    journal
+        .transition(
+            task.id,
+            SubtaskInput::Ask {
+                question: question.clone(),
+                call_id: "tool-call-reassign".into(),
+            },
+            Timestamp(100),
+        )
+        .expect("ask");
+    let reassigned = journal
+        .transition(
+            task.id,
+            SubtaskInput::Reassign {
+                from: NodeId::new(),
+                reason: ReassignReason::NodeLost,
+            },
+            Timestamp(120),
+        )
+        .expect("reassign");
+    assert!(matches!(
+        reassigned.state,
+        SubtaskState::Reassigning {
+            reason: ReassignReason::NodeLost
+        }
+    ));
+    let stored = journal
+        .load_question(question.id)
+        .expect("question")
+        .expect("stored");
+    assert_eq!(stored.closed_at, Some(Timestamp(120)));
+    assert!(
+        journal
+            .open_question(task.id)
+            .expect("open question")
+            .is_none()
+    );
+}
+
+#[test]
+fn session_lookups_do_not_leak_across_claude_sessions() {
+    let (_dir, mut journal, _dispatch, _task) = setup();
+    let mut first = dispatch();
+    first.claude_session = Some("session-a".into());
+    journal.create_dispatch(&first).expect("first dispatch");
+    let first_task = subtask(&first);
+    journal.create_subtask(&first_task).expect("first task");
+
+    let mut second = dispatch();
+    second.claude_session = Some("session-b".into());
+    journal.create_dispatch(&second).expect("second dispatch");
+    let second_task = subtask(&second);
+    journal.create_subtask(&second_task).expect("second task");
+
+    let visible = journal
+        .list_subtasks_for_session("session-a")
+        .expect("session tasks");
+    assert_eq!(
+        visible.iter().map(|task| task.id).collect::<Vec<_>>(),
+        [first_task.id]
+    );
+    assert!(
+        journal
+            .subtask_belongs_to_session(first_task.id, "session-a")
+            .expect("ownership")
+    );
+    assert!(
+        !journal
+            .subtask_belongs_to_session(first_task.id, "session-b")
+            .expect("ownership")
+    );
+    assert_eq!(
+        journal
+            .visible_subtask_ids(Some("session-b"))
+            .expect("visible"),
+        [second_task.id]
     );
 }
 
@@ -590,4 +895,89 @@ fn transition_persists_node_assignment_and_runner_session() {
     assert_eq!(loaded.node, Some(node.id));
     assert_eq!(loaded.runner_session.as_deref(), Some("runner-session-1"));
     assert_eq!(loaded.started, Some(Timestamp(25)));
+}
+
+#[test]
+fn reassignment_placement_increments_attempt_and_emits_destination_event() {
+    let (_dir, mut journal, _dispatch, task) = setup();
+    let first = node();
+    let mut second = node();
+    second.name = "second-node".into();
+    journal.create_node(&first).expect("first node");
+    journal.create_node(&second).expect("second node");
+    journal
+        .transition(
+            task.id,
+            SubtaskInput::Placed { node: first.id },
+            Timestamp(20),
+        )
+        .expect("place");
+    journal
+        .transition(task.id, SubtaskInput::Prepared, Timestamp(21))
+        .expect("prepared");
+    journal
+        .transition(
+            task.id,
+            SubtaskInput::Reassign {
+                from: first.id,
+                reason: ReassignReason::NodeLost,
+            },
+            Timestamp(22),
+        )
+        .expect("reassign");
+    let placed = journal
+        .transition(
+            task.id,
+            SubtaskInput::Placed { node: second.id },
+            Timestamp(23),
+        )
+        .expect("re-place");
+    assert_eq!(placed.event.kind, EventKind::ReassignedTo { to: second.id });
+    let loaded = journal
+        .load_subtask(task.id)
+        .expect("load")
+        .expect("subtask");
+    assert_eq!(loaded.node, Some(second.id));
+    assert_eq!(loaded.attempt, 1);
+    assert_eq!(loaded.state, SubtaskState::Preparing);
+}
+
+#[test]
+fn cancelling_a_subtasks_commands_prevents_replay_after_reassignment() {
+    let (_dir, mut journal, _dispatch, task) = setup();
+    let node = node();
+    journal.create_node(&node).expect("node");
+    journal
+        .store_command(&Command {
+            id: "prepare-old-attempt".into(),
+            node_id: node.id,
+            subtask_id: task.id,
+            operation: serde_json::json!({"proto_b64": "old"}),
+            state: "pending".into(),
+            result: None,
+            sent_at: Some(Timestamp(20)),
+            done_at: None,
+        })
+        .expect("store command");
+    assert_eq!(journal.pending_commands(node.id).expect("pending").len(), 1);
+    assert_eq!(
+        journal
+            .cancel_subtask_commands(task.id)
+            .expect("cancel commands"),
+        1
+    );
+    assert!(
+        journal
+            .pending_commands(node.id)
+            .expect("pending")
+            .is_empty()
+    );
+    assert_eq!(
+        journal
+            .load_command("prepare-old-attempt")
+            .expect("load command")
+            .expect("command")
+            .state,
+        "cancelled"
+    );
 }

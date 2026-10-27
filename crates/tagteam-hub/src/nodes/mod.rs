@@ -106,6 +106,19 @@ impl NodePlane {
         })
     }
 
+    /// Closes a stale session so a wedged node must reconnect and re-lease its
+    /// assignments. Returns whether a session was present.
+    pub fn disconnect(&self, node_id: NodeId) -> bool {
+        let Ok(mut sessions) = self.inner.sessions.lock() else {
+            return false;
+        };
+        let Some(session) = sessions.remove(&node_id) else {
+            return false;
+        };
+        session.cancel.send_replace(true);
+        true
+    }
+
     /// Returns whether a node currently has a live session.
     pub fn is_online(&self, node_id: NodeId) -> bool {
         self.inner
@@ -728,7 +741,7 @@ async fn update_heartbeat(
         .map_err(|_| Status::invalid_argument("heartbeat presence is invalid"))?
     {
         proto::OwnerPresence::Away => OwnerPresence::Away {
-            idle_for: Duration::ZERO,
+            idle_for: Duration::from_millis(heartbeat.idle_for_ms),
         },
         proto::OwnerPresence::Present => OwnerPresence::Present,
         proto::OwnerPresence::Unspecified => {

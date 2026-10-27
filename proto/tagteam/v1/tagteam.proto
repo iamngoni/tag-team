@@ -129,6 +129,8 @@ message Heartbeat {
   repeated Toolchain toolchains = 3;
   repeated CachedRepo repos = 4;
   repeated string running = 5;
+  // Duration since the last observed user input, in milliseconds. Zero means no reliable sample.
+  uint64 idle_for_ms = 6;
 }
 
 message CommandAck {

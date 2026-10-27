@@ -9,7 +9,9 @@ use std::{path::Path, str::FromStr, time::Duration};
 use schemars::JsonSchema;
 use semver::VersionReq;
 use serde::Deserialize;
-use tagteam_core::{Arch, Bytes, Limits, Needs, Os, SubtaskId, SubtaskSpec};
+use tagteam_core::{
+    Arch, Bytes, Limits, Needs, Os, QuestionId, SubtaskId, SubtaskSpec, local_api::AnswerAuthor,
+};
 
 /// Maximum long-poll duration accepted by the MCP inbox tool.
 pub const MAX_INBOX_WAIT_MS: u64 = 50_000;
@@ -189,6 +191,48 @@ pub struct CollectParams {
 pub struct HookBriefParams {
     /// Claude Code session ID supplied by the plugin hook.
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HookStopParams {
+    /// Claude Code session ID supplied by the plugin hook.
+    pub session_id: String,
+    /// Claude Code's recursion guard from the Stop hook payload.
+    #[serde(default)]
+    pub stop_hook_active: String,
+}
+
+impl HookStopParams {
+    /// Whether the current Stop event was already caused by a stop hook.
+    #[must_use]
+    pub fn stop_hook_active(&self) -> bool {
+        matches!(
+            self.stop_hook_active.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnswerParams {
+    /// Subtask ID.
+    pub subtask: String,
+    /// Answer text. This is treated as a quoted user/coordinator response.
+    pub text: String,
+    /// Optional open question ID. The daemon rejects a mismatch.
+    #[serde(default)]
+    pub question: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SteerParams {
+    /// Subtask ID.
+    pub subtask: String,
+    /// New direction for the running agent.
+    pub text: String,
 }
 
 impl SubtaskParams {
@@ -387,6 +431,23 @@ pub fn parse_subtasks(values: Option<Vec<String>>) -> Result<Option<Vec<SubtaskI
         .map(|value| parse_subtask(&value))
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
+}
+
+pub fn parse_question(value: Option<String>) -> Result<Option<QuestionId>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("question ID must not be empty".into());
+    }
+    QuestionId::from_str(value)
+        .map(Some)
+        .map_err(|error| format!("invalid question ID {value:?}: {error}"))
+}
+
+pub fn answer_author() -> AnswerAuthor {
+    AnswerAuthor::MainClaude
 }
 
 pub fn capped_wait_ms(wait_ms: u64) -> u64 {
