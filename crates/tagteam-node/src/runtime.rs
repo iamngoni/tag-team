@@ -20,7 +20,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use serde_json::Value;
 use tagteam_core::{Bytes, CachedRepo, GitOid, Limits, MAX_BLOB_BYTES, NodePolicy, RepoId};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use tagteam_proxy::ProxyServer;
 #[cfg(target_os = "linux")]
 use tagteam_proxy::UnixProxyServer;
@@ -1162,7 +1162,7 @@ async fn start_workspace_proxy(
 ) -> Result<(RunningProxy, SocketAddr), String> {
     #[cfg(target_os = "linux")]
     {
-        let (proxy, _outcomes) = UnixProxyServer::start_unix(
+        let (proxy, _outcomes) = ProxyServer::start_unix(
             _socket,
             config,
             Arc::new(TokioResolver),
