@@ -33,7 +33,14 @@ impl HeartbeatSource for HostHeartbeat {
         let mut system = System::new();
         system.refresh_cpu_all();
         system.refresh_memory();
-        let cores = system.cpus().len();
+        let physical_cores = system.cpus().len();
+        let cores = self
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.max_cores)
+            .map_or(physical_cores, |limit| {
+                physical_cores.min(usize::from(limit))
+            });
         // Load average is available immediately without waiting for a second CPU sample.
         let load = System::load_average().one as f32;
         let disks = Disks::new_with_refreshed_list();
@@ -49,7 +56,13 @@ impl HeartbeatSource for HostHeartbeat {
             capacity: Some(tagteam_proto::v1::Capacity {
                 cores_total: u32::try_from(cores).unwrap_or(u32::MAX),
                 cores_free: (cores as f32 - load).clamp(0.0, cores as f32),
-                memory_free: system.available_memory(),
+                memory_free: self
+                    .policy
+                    .as_ref()
+                    .and_then(|policy| policy.max_memory)
+                    .map_or(system.available_memory(), |limit| {
+                        system.available_memory().min(limit.0)
+                    }),
                 disk_free: free_disk,
                 // CommandRunner does not expose active worker state to the heartbeat source.
                 // Keep the wire value explicitly zero until a shared runner status API exists.

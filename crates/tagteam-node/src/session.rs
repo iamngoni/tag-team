@@ -5,6 +5,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use tagteam_core::{NodePolicy, OnReturn};
 use tokio::{
     sync::{mpsc, watch},
     time::{Instant, interval_at},
@@ -34,6 +35,7 @@ pub struct NodeSession {
     workspaces: Vec<String>,
     pending: Arc<dyn PendingResultSource>,
     heartbeat_source: Arc<dyn HeartbeatSource>,
+    policy: Option<NodePolicy>,
     reconnect: ReconnectPolicy,
 }
 
@@ -45,6 +47,7 @@ impl NodeSession {
             workspaces: Vec::new(),
             pending: Arc::new(StaticPending(Vec::new())),
             heartbeat_source: Arc::new(heartbeat_source),
+            policy: None,
             reconnect: ReconnectPolicy::default(),
         }
     }
@@ -63,6 +66,13 @@ impl NodeSession {
 
     pub fn pending_source(mut self, source: impl PendingResultSource) -> Self {
         self.pending = Arc::new(source);
+        self
+    }
+
+    /// Sends the owner's local policy on every authenticated Hello so the hub's
+    /// durable placement decisions cannot drift from the machine's limits.
+    pub fn policy(mut self, policy: NodePolicy) -> Self {
+        self.policy = Some(policy);
         self
     }
 
@@ -217,9 +227,41 @@ impl NodeSession {
                     version: self.version.clone(),
                     workspaces: self.workspaces.clone(),
                     pending: self.pending.pending_results()?,
+                    policy: self.policy.as_ref().map(policy_to_proto),
                 },
             )),
         })
+    }
+}
+
+fn policy_to_proto(policy: &NodePolicy) -> tagteam_proto::v1::NodePolicy {
+    tagteam_proto::v1::NodePolicy {
+        only_when_idle: policy.only_when_idle,
+        idle_after_ms: u64::try_from(policy.idle_after.as_millis()).unwrap_or(u64::MAX),
+        on_owner_return: match policy.on_owner_return {
+            OnReturn::FinishRunning => "finish_running",
+            OnReturn::Pause => "pause",
+            OnReturn::HandBack => "hand_back",
+        }
+        .into(),
+        max_cores: policy.max_cores.map(u32::from),
+        max_memory: policy.max_memory.map(|value| value.0),
+        max_subtasks: u32::from(policy.max_subtasks),
+        hours: policy
+            .hours
+            .as_ref()
+            .map(|hours| {
+                hours
+                    .iter()
+                    .map(|range| tagteam_proto::v1::HourRange {
+                        start_minutes: u32::from(range.start_minutes),
+                        end_minutes: u32::from(range.end_minutes),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        never_on_battery: policy.never_on_battery,
+        extra_hosts: policy.extra_hosts.clone(),
     }
 }
 
@@ -433,6 +475,37 @@ mod tests {
         assert_eq!(policy.delay(2), Duration::from_millis(400));
         assert_eq!(policy.delay(3), Duration::from_millis(450));
         assert_eq!(policy.delay(u32::MAX), Duration::from_millis(450));
+    }
+
+    #[test]
+    fn authenticated_hello_carries_the_owner_policy() {
+        let identity = NodeIdentity {
+            node_id: tagteam_core::NodeId::new(),
+            invite: String::new(),
+            certificate_der: Vec::new(),
+            private_key_der: Vec::new(),
+            hub_address: "https://localhost".into(),
+            hub_fingerprint: tagteam_pki::CertificateFingerprint::from_certificate(b"test"),
+        };
+        let policy = tagteam_core::NodePolicy {
+            only_when_idle: true,
+            max_cores: Some(3),
+            max_memory: Some(tagteam_core::Bytes(8192)),
+            max_subtasks: 2,
+            extra_hosts: vec!["git.example".into()],
+            ..tagteam_core::NodePolicy::default()
+        };
+        let session = NodeSession::new(identity, EmptyHeartbeat).policy(policy);
+        let hello = session.hello_message().expect("Hello builds");
+        let Some(tagteam_proto::v1::node_message::Msg::Hello(hello)) = hello.msg else {
+            panic!("initial message is Hello");
+        };
+        let policy = hello.policy.expect("policy is present");
+        assert!(policy.only_when_idle);
+        assert_eq!(policy.max_cores, Some(3));
+        assert_eq!(policy.max_memory, Some(8192));
+        assert_eq!(policy.max_subtasks, 2);
+        assert_eq!(policy.extra_hosts, vec!["git.example"]);
     }
 
     #[test]

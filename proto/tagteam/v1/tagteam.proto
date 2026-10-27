@@ -143,6 +143,10 @@ message Hello {
   string version = 2;
   repeated string workspaces = 3;
   repeated CommandAck pending = 4;
+  // Owner-controlled scheduling and resource policy. Authenticated by the
+  // node's client certificate; the hub must not treat a missing policy as a
+  // request to widen local limits.
+  optional NodePolicy policy = 5;
 }
 
 message Welcome {

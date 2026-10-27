@@ -55,6 +55,11 @@ pub struct NodeConfig {
     pub never_on_battery: bool,
     #[serde(default)]
     pub extra_hosts: Vec<String>,
+    /// Root commit IDs this node may execute. `None` preserves the trusted
+    /// own-machine default; `Some([])` denies every repository and is the
+    /// correct starting point for a friend's machine.
+    #[serde(default)]
+    pub allowed_repo_ids: Option<Vec<String>>,
 }
 
 impl Default for NodeConfig {
@@ -72,6 +77,7 @@ impl Default for NodeConfig {
             hours: None,
             never_on_battery: true,
             extra_hosts: Vec::new(),
+            allowed_repo_ids: None,
         }
     }
 }
@@ -177,6 +183,15 @@ impl NodeConfig {
                 "extra_hosts entries must contain 1 to 253 bytes".into(),
             ));
         }
+        if let Some(repositories) = &self.allowed_repo_ids
+            && repositories.iter().any(|repository| {
+                repository.len() != 40 || !repository.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err(ConfigError::Invalid(
+                "allowed_repo_ids entries must be 40-character Git object IDs".into(),
+            ));
+        }
         if self
             .hub_invite
             .as_ref()
@@ -243,6 +258,7 @@ mod tests {
         assert_eq!(policy.max_cores, None);
         assert_eq!(policy.max_subtasks, 1);
         assert!(policy.never_on_battery);
+        assert_eq!(config.allowed_repo_ids, None);
     }
 
     #[test]
@@ -256,6 +272,27 @@ mod tests {
         let mut invalid = config;
         invalid.max_subtasks = 0;
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn repository_trust_is_explicit_for_borrowed_machines() {
+        let config = NodeConfig {
+            allowed_repo_ids: Some(Vec::new()),
+            ..NodeConfig::default()
+        };
+        assert!(config.validate().is_ok());
+
+        let config = NodeConfig {
+            allowed_repo_ids: Some(vec!["not-an-oid".into()]),
+            ..NodeConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = NodeConfig {
+            allowed_repo_ids: Some(vec!["0123456789012345678901234567890123456789".into()]),
+            ..NodeConfig::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

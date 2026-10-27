@@ -437,6 +437,23 @@ impl Journal {
         Ok(())
     }
 
+    /// Persists the locally authenticated policy sent in the node's Hello.
+    /// Heartbeats do not update policy; only a certificate-bound Hello can.
+    pub fn update_node_policy(
+        &mut self,
+        id: NodeId,
+        policy: &NodePolicy,
+    ) -> Result<(), JournalError> {
+        let changed = self.connection.execute(
+            "UPDATE nodes SET policy=?2 WHERE id=?1 AND state<>'removed' AND revoked_at IS NULL",
+            params![id.to_string(), serde_json::to_string(policy)?],
+        )?;
+        if changed == 0 {
+            return Err(JournalError::NotFound(format!("node {id}")));
+        }
+        Ok(())
+    }
+
     /// Updates heartbeat-owned fields without changing durable trust, policy,
     /// or approval state. Removed and revoked nodes cannot heartbeat.
     pub fn update_node_heartbeat(

@@ -981,3 +981,26 @@ fn cancelling_a_subtasks_commands_prevents_replay_after_reassignment() {
         "cancelled"
     );
 }
+
+#[test]
+fn authenticated_hello_policy_replaces_enrollment_defaults() {
+    let (_dir, mut journal, _dispatch, _task) = setup();
+    let mut enrolled = node();
+    journal.create_node(&enrolled).expect("seed node");
+    let policy = NodePolicy {
+        only_when_idle: true,
+        max_cores: Some(2),
+        max_memory: Some(tagteam_core::Bytes(4096)),
+        max_subtasks: 2,
+        extra_hosts: vec!["git.example".into()],
+        ..NodePolicy::default()
+    };
+    journal
+        .update_node_policy(enrolled.id, &policy)
+        .expect("policy update");
+    enrolled = journal
+        .load_node(enrolled.id)
+        .expect("load node")
+        .expect("node exists");
+    assert_eq!(enrolled.policy, policy);
+}

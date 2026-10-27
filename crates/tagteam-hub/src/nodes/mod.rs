@@ -455,7 +455,7 @@ impl Hub for NodeService {
         request: Request<tonic::Streaming<NodeMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
         let cert = peer_certificate(&request)?;
-        let node = self.authorize_by_cert(&cert).await?;
+        let mut node = self.authorize_by_cert(&cert).await?;
         let mut stream = request.into_inner();
         let first = stream
             .message()
@@ -470,6 +470,11 @@ impl Hub for NodeService {
             return Err(Status::unauthenticated(
                 "Hello node ID does not match client certificate",
             ));
+        }
+        if let Some(policy) = hello.policy {
+            let policy = policy_from_proto(policy)?;
+            set_node_policy(&self.inner, node.id, policy.clone()).await?;
+            node.policy = policy;
         }
         for ack in hello.pending {
             let Some(result) = ack.result else {
@@ -725,6 +730,101 @@ fn peer_certificate<T>(request: &Request<T>) -> Result<Vec<u8>, Status> {
         .first()
         .map(|cert| cert.as_ref().to_vec())
         .ok_or_else(|| Status::unauthenticated("client certificate is required"))
+}
+
+async fn set_node_policy(inner: &Arc<Inner>, id: NodeId, policy: NodePolicy) -> Result<(), Status> {
+    let inner = Arc::clone(inner);
+    tokio::task::spawn_blocking(move || {
+        let mut journal = inner
+            .journal
+            .lock()
+            .map_err(|_| Status::internal("journal lock is unavailable"))?;
+        journal
+            .update_node_policy(id, &policy)
+            .map_err(journal_status)
+    })
+    .await
+    .map_err(|_| Status::internal("policy worker stopped"))?
+}
+
+fn policy_from_proto(value: proto::NodePolicy) -> Result<NodePolicy, Status> {
+    let on_owner_return = match value.on_owner_return.as_str() {
+        "finish_running" => tagteam_core::OnReturn::FinishRunning,
+        "pause" => tagteam_core::OnReturn::Pause,
+        "hand_back" => tagteam_core::OnReturn::HandBack,
+        _ => {
+            return Err(Status::invalid_argument(
+                "node policy on_owner_return is invalid",
+            ));
+        }
+    };
+    if value.max_subtasks == 0 {
+        return Err(Status::invalid_argument(
+            "node policy max_subtasks must be greater than zero",
+        ));
+    }
+    let max_cores = value
+        .max_cores
+        .map(|cores| {
+            u16::try_from(cores)
+                .ok()
+                .filter(|cores| *cores > 0)
+                .ok_or_else(|| Status::invalid_argument("node policy max_cores is out of range"))
+        })
+        .transpose()?;
+    let max_memory = value
+        .max_memory
+        .map(|bytes| {
+            (bytes > 0).then_some(Bytes(bytes)).ok_or_else(|| {
+                Status::invalid_argument("node policy max_memory must be greater than zero")
+            })
+        })
+        .transpose()?;
+    let hours = if value.hours.is_empty() {
+        None
+    } else {
+        let mut hours = Vec::with_capacity(value.hours.len());
+        for range in value.hours {
+            let start_minutes = u16::try_from(range.start_minutes)
+                .ok()
+                .filter(|minute| *minute < 1440)
+                .ok_or_else(|| {
+                    Status::invalid_argument("node policy hour range is out of range")
+                })?;
+            let end_minutes = u16::try_from(range.end_minutes)
+                .ok()
+                .filter(|minute| *minute < 1440)
+                .ok_or_else(|| {
+                    Status::invalid_argument("node policy hour range is out of range")
+                })?;
+            hours.push(tagteam_core::HourRange {
+                start_minutes,
+                end_minutes,
+            });
+        }
+        Some(hours)
+    };
+    if value
+        .extra_hosts
+        .iter()
+        .any(|host| host.trim().is_empty() || host.len() > 253)
+    {
+        return Err(Status::invalid_argument(
+            "node policy extra_hosts are invalid",
+        ));
+    }
+    Ok(NodePolicy {
+        only_when_idle: value.only_when_idle,
+        idle_after: Duration::from_millis(value.idle_after_ms),
+        on_owner_return,
+        max_cores,
+        max_memory,
+        max_subtasks: u16::try_from(value.max_subtasks)
+            .map_err(|_| Status::invalid_argument("node policy max_subtasks is out of range"))?,
+        hours,
+        never_on_battery: value.never_on_battery,
+        extra_hosts: value.extra_hosts,
+    })
 }
 
 async fn update_heartbeat(

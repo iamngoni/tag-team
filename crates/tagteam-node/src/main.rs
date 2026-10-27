@@ -166,8 +166,11 @@ async fn run(config: tagteam_node::config::NodeConfig) -> anyhow::Result<()> {
         .await
         .map_err(anyhow::Error::msg)?;
     let runner = CommandRunner::new(&config.data_dir, journal.clone(), bundles);
-    let session = NodeSession::new(identity, HostHeartbeat::with_policy(config.policy()))
+    let policy = config.policy();
+    let runner = runner.with_policy(policy.clone(), config.allowed_repo_ids.clone());
+    let session = NodeSession::new(identity, HostHeartbeat::with_policy(policy.clone()))
         .pending_source(journal)
+        .policy(policy)
         .start();
     let sender = session.sender();
     let mut session = session;

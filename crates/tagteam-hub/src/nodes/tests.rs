@@ -17,7 +17,7 @@ use tonic::{
 };
 
 use super::{
-    NodePlane, certificate_pem, chunk, json_command, private_key_pem,
+    NodePlane, certificate_pem, chunk, json_command, policy_from_proto, private_key_pem,
     proto::{self, hub_client::HubClient},
 };
 use crate::journal::{Command as JournalCommand, Journal};
@@ -413,6 +413,7 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
                 version: "test".into(),
                 workspaces: Vec::new(),
                 pending: Vec::new(),
+                policy: None,
             })),
         })]))
         .await;
@@ -439,6 +440,7 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
                 version: "test".into(),
                 workspaces: Vec::new(),
                 pending: Vec::new(),
+                policy: None,
             })),
         })]))
         .await
@@ -466,6 +468,7 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
                 version: "test".into(),
                 workspaces: Vec::new(),
                 pending: Vec::new(),
+                policy: None,
             })),
         })
         .await
@@ -569,6 +572,7 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
                 version: "test".into(),
                 workspaces: Vec::new(),
                 pending: Vec::new(),
+                policy: None,
             })),
         })
         .await
@@ -899,6 +903,7 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
                 version: "test".into(),
                 workspaces: Vec::new(),
                 pending: Vec::new(),
+                policy: None,
             })),
         })]))
         .await
@@ -960,4 +965,49 @@ async fn cancellation_before_journal_insertion_prevents_command_dispatch() {
             .is_empty(),
         "a cancellation intent must prevent a replayable command row"
     );
+}
+
+#[test]
+fn node_policy_conversion_preserves_owner_limits_and_rejects_invalid_values() {
+    let policy = policy_from_proto(proto::NodePolicy {
+        only_when_idle: true,
+        idle_after_ms: 90_000,
+        on_owner_return: "hand_back".into(),
+        max_cores: Some(4),
+        max_memory: Some(8 * 1024 * 1024),
+        max_subtasks: 2,
+        hours: vec![proto::HourRange {
+            start_minutes: 540,
+            end_minutes: 1020,
+        }],
+        never_on_battery: true,
+        extra_hosts: vec!["git.example".into()],
+    })
+    .expect("valid policy");
+    assert!(policy.only_when_idle);
+    assert_eq!(policy.idle_after, Duration::from_secs(90));
+    assert_eq!(policy.on_owner_return, tagteam_core::OnReturn::HandBack);
+    assert_eq!(policy.max_cores, Some(4));
+    assert_eq!(
+        policy.max_memory,
+        Some(tagteam_core::Bytes(8 * 1024 * 1024))
+    );
+    assert_eq!(policy.max_subtasks, 2);
+    assert_eq!(policy.extra_hosts, vec!["git.example"]);
+
+    let mut invalid = proto::NodePolicy {
+        on_owner_return: "pause".into(),
+        max_subtasks: 1,
+        ..proto::NodePolicy::default()
+    };
+    invalid.max_subtasks = 0;
+    assert!(policy_from_proto(invalid).is_err());
+
+    let mut invalid = proto::NodePolicy {
+        on_owner_return: "unknown".into(),
+        max_subtasks: 1,
+        ..proto::NodePolicy::default()
+    };
+    invalid.on_owner_return = "unknown".into();
+    assert!(policy_from_proto(invalid).is_err());
 }

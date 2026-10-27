@@ -17,7 +17,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use serde_json::Value;
-use tagteam_core::{Bytes, Limits, MAX_BLOB_BYTES};
+use tagteam_core::{Bytes, Limits, MAX_BLOB_BYTES, NodePolicy};
 use tagteam_sandbox::{
     CancellationHandle, CancellationToken, JobHint, ProxyEndpoint, ResourceLimits, SandboxProfile,
     spawn_confined,
@@ -67,6 +67,8 @@ pub struct CommandRunner {
     git_toolchain: Option<GitToolchain>,
     running: Arc<Mutex<HashMap<String, CommandCancellation>>>,
     workspace_limits: Arc<Mutex<HashMap<String, WorkspaceLimits>>>,
+    policy: NodePolicy,
+    allowed_repo_ids: Option<Vec<String>>,
     execution_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -134,8 +136,26 @@ impl CommandRunner {
             git_toolchain: host_git_toolchain(),
             running: Arc::default(),
             workspace_limits: Arc::default(),
+            policy: NodePolicy::default(),
+            allowed_repo_ids: None,
             execution_lock: Arc::default(),
         }
+    }
+
+    /// Applies the owner's local policy to every command. The hub policy is
+    /// advisory for scheduling; these checks are the node's enforcement point.
+    pub fn with_policy(
+        mut self,
+        policy: NodePolicy,
+        allowed_repo_ids: Option<Vec<String>>,
+    ) -> Self {
+        self.policy = policy;
+        self.allowed_repo_ids = allowed_repo_ids.map(|ids| {
+            ids.into_iter()
+                .map(|id| id.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        });
+        self
     }
 
     /// Overrides the helper executable, primarily to exercise the built CLI integration path.
@@ -311,6 +331,7 @@ impl CommandRunner {
         let op = command.op.as_ref().ok_or("command operation is missing")?;
         match op {
             Proto::command::Op::Prepare(prepare) => {
+                self.check_prepare_policy(prepare)?;
                 let reference = prepare
                     .bundle
                     .as_ref()
@@ -698,6 +719,39 @@ impl CommandRunner {
         }
     }
 
+    fn check_prepare_policy(&self, prepare: &Proto::PrepareWorkspace) -> Result<(), String> {
+        if let Some(allowed) = &self.allowed_repo_ids {
+            let repo = prepare.repo_id.to_ascii_lowercase();
+            if repo.is_empty() || !allowed.iter().any(|candidate| candidate == &repo) {
+                return Err("repository is not trusted by this node".into());
+            }
+        }
+        if let Some(profile) = &prepare.profile {
+            if let Some(max_cores) = self.policy.max_cores {
+                let requested = if profile.cpu_cores.is_finite() && profile.cpu_cores > 0.0 {
+                    profile.cpu_cores
+                } else {
+                    1.0
+                };
+                if requested > f32::from(max_cores) {
+                    return Err(format!(
+                        "requested CPU ceiling {requested} exceeds this node's {} core limit",
+                        max_cores
+                    ));
+                }
+            }
+            if let Some(max_memory) = self.policy.max_memory
+                && profile.memory > max_memory.0
+            {
+                return Err(format!(
+                    "requested memory ceiling {} exceeds this node's {} byte limit",
+                    profile.memory, max_memory.0
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn workspace(&self, id: &str) -> Result<PathBuf, String> {
         if id.is_empty()
             || !id
@@ -1005,6 +1059,76 @@ mod tests {
                 Ok(Vec::new())
             })
         }
+    }
+
+    fn prepare_request(repo_id: &str, cores: f32, memory: u64) -> Proto::PrepareWorkspace {
+        Proto::PrepareWorkspace {
+            bundle: Some(Proto::BlobRef {
+                sha256: vec![0; 32],
+                size: 0,
+            }),
+            repo_id: repo_id.into(),
+            base: "main".into(),
+            branch: "result".into(),
+            profile: Some(Proto::SandboxProfile {
+                writable: Vec::new(),
+                readable: Vec::new(),
+                egress: Vec::new(),
+                cpu_cores: cores,
+                memory,
+                pids: 8,
+                disk: 1024,
+            }),
+        }
+    }
+
+    #[test]
+    fn local_policy_rejects_oversized_profiles_and_untrusted_repositories() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let journal =
+            CommandJournal::open(directory.path().join("commands.json")).expect("journal opens");
+        let policy = NodePolicy {
+            max_cores: Some(2),
+            max_memory: Some(Bytes(1024)),
+            ..NodePolicy::default()
+        };
+        let runner = CommandRunner::new(directory.path(), journal, NoBundleSource)
+            .with_policy(policy, Some(vec!["a".repeat(40)]));
+
+        assert!(
+            runner
+                .check_prepare_policy(&prepare_request(&"a".repeat(40), 2.0, 1024))
+                .is_ok()
+        );
+        assert!(
+            runner
+                .check_prepare_policy(&prepare_request(&"b".repeat(40), 1.0, 1024))
+                .is_err()
+        );
+        assert!(
+            runner
+                .check_prepare_policy(&prepare_request(&"a".repeat(40), 3.0, 1024))
+                .is_err()
+        );
+        assert!(
+            runner
+                .check_prepare_policy(&prepare_request(&"a".repeat(40), 1.0, 2048))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_empty_trust_list_denies_every_repository() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let journal =
+            CommandJournal::open(directory.path().join("commands.json")).expect("journal opens");
+        let runner = CommandRunner::new(directory.path(), journal, NoBundleSource)
+            .with_policy(NodePolicy::default(), Some(Vec::new()));
+        assert!(
+            runner
+                .check_prepare_policy(&prepare_request(&"a".repeat(40), 1.0, 1024))
+                .is_err()
+        );
     }
 
     #[tokio::test]
