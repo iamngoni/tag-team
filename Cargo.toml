@@ -9,6 +9,7 @@ members = [
   "crates/tagteam-proxy",
   "crates/tagteam-hub",
   "crates/tagteam-node",
+  "crates/tagteam-service",
   "tests/integration",
 ]
 

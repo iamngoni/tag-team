@@ -1774,6 +1774,7 @@ dependencies = [
  "tagteam-git",
  "tagteam-pki",
  "tagteam-proto",
+ "tagteam-service",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1821,6 +1822,7 @@ dependencies = [
  "tagteam-proto",
  "tagteam-proxy",
  "tagteam-sandbox",
+ "tagteam-service",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1878,6 +1880,10 @@ dependencies = [
  "thiserror",
  "tokio",
 ]
+
+[[package]]
+name = "tagteam-service"
+version = "0.1.0"
 
 [[package]]
 name = "tempfile"

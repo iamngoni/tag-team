@@ -10,3 +10,5 @@
 *.dSYM
 coverage/
 .tagteam/
+**/.build/
+**/.swiftpm/

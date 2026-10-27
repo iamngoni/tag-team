@@ -34,6 +34,11 @@ enum Command {
     Hub,
     /// Run the stdio MCP shim for one Claude Code session.
     Mcp,
+    /// Manage the per-user background service.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
     /// Print the hub version.
     Version,
     /// Create a single-use node invite.
@@ -53,6 +58,7 @@ enum Command {
     /// List enrolled nodes.
     Nodes,
     /// Show subtask status.
+    /// Print one stable state word, or a JSON object with `--json`.
     Status {
         #[arg(long)]
         id: Vec<SubtaskId>,
@@ -109,6 +115,20 @@ enum Command {
     Brief { claude_session: String },
 }
 
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    Install,
+    Start,
+    Stop,
+    Restart,
+    Status {
+        /// Print stable JSON for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    Uninstall,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -123,6 +143,7 @@ async fn main() -> Result<()> {
         }
         Command::Hub => run_hub(cli.config.as_deref()).await,
         Command::Mcp => run_mcp(cli.config.as_deref()).await,
+        Command::Service { action } => run_service(action, cli.config.as_deref()),
         command => {
             let config = HubConfig::load(cli.config.as_deref())?;
             let paths = config.prepare_data_dir()?;
@@ -477,9 +498,68 @@ async fn run_client(command: Command, client: &mut LocalClient) -> Result<()> {
                 other => bail!("unexpected reply: {other:?}"),
             }
         }
-        Command::Hub | Command::Mcp | Command::Version => {
+        Command::Hub | Command::Mcp | Command::Service { .. } | Command::Version => {
             bail!("command is handled before the local client")
         }
+    }
+    Ok(())
+}
+
+fn run_service(action: ServiceCommand, config_path: Option<&std::path::Path>) -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot determine service paths"))?;
+    let home = if home.is_absolute() {
+        home
+    } else {
+        std::env::current_dir()?.join(home)
+    };
+    let selected_config = config_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config/tagteam/hub.toml"));
+    let selected_config = if selected_config.is_absolute() {
+        selected_config
+    } else {
+        std::env::current_dir()?.join(selected_config)
+    };
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let log_dir = if cfg!(target_os = "macos") {
+        home.join("Library/Logs/TagTeam")
+    } else {
+        home.join(".local/state/tagteam")
+    };
+    let spec = tagteam_service::ServiceSpec {
+        label: "com.tagteam.hub".into(),
+        executable,
+        args: vec![
+            "hub".into(),
+            "--config".into(),
+            selected_config.to_string_lossy().into_owned(),
+        ],
+        config_path: selected_config,
+        stdout_path: log_dir.join("hub.out.log"),
+        stderr_path: log_dir.join("hub.err.log"),
+        working_directory: home,
+    };
+    let (action, json) = match action {
+        ServiceCommand::Install => (tagteam_service::ServiceAction::Install, false),
+        ServiceCommand::Start => (tagteam_service::ServiceAction::Start, false),
+        ServiceCommand::Stop => (tagteam_service::ServiceAction::Stop, false),
+        ServiceCommand::Restart => (tagteam_service::ServiceAction::Restart, false),
+        ServiceCommand::Status { json } => (tagteam_service::ServiceAction::Status, json),
+        ServiceCommand::Uninstall => (tagteam_service::ServiceAction::Uninstall, false),
+    };
+    let state = tagteam_service::manage(&spec, action)?;
+    if json {
+        println!(
+            "{{\"label\":{},\"state\":{}}}",
+            serde_json::to_string(&spec.label)?,
+            serde_json::to_string(state.as_str())?
+        );
+    } else if matches!(action, tagteam_service::ServiceAction::Status) {
+        println!("{}", state.as_str());
+    } else {
+        println!("service {}: {}", spec.label, state.as_str());
     }
     Ok(())
 }
@@ -538,4 +618,34 @@ fn parse_duration(value: &str) -> Result<Duration> {
         .checked_mul(multiplier)
         .context("duration is too large")?;
     Ok(Duration::from_secs(seconds))
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{Cli, Command, ServiceCommand};
+    use clap::Parser;
+    use std::path::Path;
+
+    #[test]
+    fn service_commands_accept_inherited_config_and_json_status() {
+        let cli = Cli::try_parse_from([
+            "tagteam",
+            "service",
+            "status",
+            "--json",
+            "--config",
+            "/tmp/hub.toml",
+        ])
+        .expect("service status args parse");
+        assert_eq!(cli.config.as_deref(), Some(Path::new("/tmp/hub.toml")));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Service {
+                action: ServiceCommand::Status { json: true }
+            })
+        ));
+        for verb in ["install", "start", "stop", "restart", "uninstall"] {
+            assert!(Cli::try_parse_from(["tagteam", "service", verb]).is_ok());
+        }
+    }
 }

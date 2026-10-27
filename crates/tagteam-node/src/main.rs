@@ -38,6 +38,11 @@ enum Command {
     },
     /// Connect to the configured hub and serve commands.
     Run,
+    /// Manage the per-user background service.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
     /// Print local identity, effective config, and connection controls.
     Status,
     /// Stop a running local session and keep it stopped across restarts.
@@ -54,6 +59,21 @@ enum Command {
     Fsop { encoded: Option<String> },
     #[command(name = "__exec", hide = true)]
     Exec { encoded: Option<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    Install,
+    Start,
+    Stop,
+    Restart,
+    /// Print one stable state word, or a JSON object with `--json`.
+    Status {
+        /// Print stable JSON for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    Uninstall,
 }
 
 #[tokio::main]
@@ -89,7 +109,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Run => run(config).await?,
         Command::Status => status(&config)?,
-        Command::Pause => set_control(&config.data_dir, "paused", true)?,
+        Command::Pause => {
+            set_control(&config.data_dir, "paused", true)?;
+            stop_service_if_installed(&config, config_path.as_deref())?;
+        }
         Command::Resume => {
             if is_left(&config.data_dir) {
                 anyhow::bail!(
@@ -97,11 +120,36 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             set_control(&config.data_dir, "paused", false)?;
+            start_service_if_installed(&config, config_path.as_deref())?;
         }
         Command::Leave => {
             set_control(&config.data_dir, "paused", false)?;
             set_control(&config.data_dir, "left", true)?;
+            stop_service_if_installed(&config, config_path.as_deref())?;
             println!("local reconnect disabled; node identity retained");
+        }
+        Command::Service { action } => {
+            let spec = node_service_spec(&config, config_path.as_deref())?;
+            let (action, json) = match action {
+                ServiceCommand::Install => (tagteam_service::ServiceAction::Install, false),
+                ServiceCommand::Start => (tagteam_service::ServiceAction::Start, false),
+                ServiceCommand::Stop => (tagteam_service::ServiceAction::Stop, false),
+                ServiceCommand::Restart => (tagteam_service::ServiceAction::Restart, false),
+                ServiceCommand::Status { json } => (tagteam_service::ServiceAction::Status, json),
+                ServiceCommand::Uninstall => (tagteam_service::ServiceAction::Uninstall, false),
+            };
+            let state = tagteam_service::manage(&spec, action)?;
+            if json {
+                println!(
+                    "{{\"label\":{},\"state\":{}}}",
+                    serde_json::to_string(&spec.label)?,
+                    serde_json::to_string(state.as_str())?
+                );
+            } else if matches!(action, tagteam_service::ServiceAction::Status) {
+                println!("{}", state.as_str());
+            } else {
+                println!("service {}: {}", spec.label, state.as_str());
+            }
         }
         Command::Probe => {
             let heartbeat = HostHeartbeat::with_policy_and_workspace(
@@ -130,6 +178,79 @@ async fn main() -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?;
             std::process::exit(code);
         }
+    }
+    Ok(())
+}
+
+fn node_service_spec(
+    config: &tagteam_node::config::NodeConfig,
+    config_path: Option<&Path>,
+) -> anyhow::Result<tagteam_service::ServiceSpec> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot determine service paths"))?;
+    let home = make_absolute(home)?;
+    let selected_config = match config_path {
+        Some(path) => path.to_path_buf(),
+        None => tagteam_node::config::default_config_path()?
+            .unwrap_or_else(|| home.join(".config/tagteam/node.toml")),
+    };
+    let selected_config = make_absolute(selected_config)?;
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let log_dir = if cfg!(target_os = "macos") {
+        home.join("Library/Logs/TagTeam")
+    } else {
+        home.join(".local/state/tagteam")
+    };
+    Ok(tagteam_service::ServiceSpec {
+        label: "com.tagteam.node".into(),
+        executable,
+        args: vec![
+            "run".into(),
+            "--config".into(),
+            selected_config.to_string_lossy().into_owned(),
+            "--data-dir".into(),
+            make_absolute(config.data_dir.clone())?
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        config_path: selected_config,
+        stdout_path: log_dir.join("node.out.log"),
+        stderr_path: log_dir.join("node.err.log"),
+        working_directory: home,
+    })
+}
+
+fn make_absolute(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn stop_service_if_installed(
+    config: &tagteam_node::config::NodeConfig,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let spec = node_service_spec(config, config_path)?;
+    if tagteam_service::manage(&spec, tagteam_service::ServiceAction::Status)?
+        != tagteam_service::ServiceState::NotInstalled
+    {
+        tagteam_service::manage(&spec, tagteam_service::ServiceAction::Stop)?;
+    }
+    Ok(())
+}
+
+fn start_service_if_installed(
+    config: &tagteam_node::config::NodeConfig,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let spec = node_service_spec(config, config_path)?;
+    if tagteam_service::manage(&spec, tagteam_service::ServiceAction::Status)?
+        != tagteam_service::ServiceState::NotInstalled
+    {
+        tagteam_service::manage(&spec, tagteam_service::ServiceAction::Start)?;
     }
     Ok(())
 }
@@ -306,8 +427,9 @@ fn current_platform() -> tagteam_proto::v1::Platform {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, ServiceCommand};
     use clap::Parser;
+    use std::path::Path;
 
     #[test]
     fn cli_accepts_operational_commands_and_join_run_option() {
@@ -325,5 +447,31 @@ mod tests {
         ])
         .expect("join args parse");
         assert!(matches!(cli.command, Some(Command::Join { run: true, .. })));
+    }
+
+    #[test]
+    fn service_commands_accept_global_paths_and_json_status() {
+        let cli = Cli::try_parse_from([
+            "tagteam-node",
+            "service",
+            "status",
+            "--json",
+            "--config",
+            "/tmp/node.toml",
+            "--data-dir",
+            "/tmp/node-data",
+        ])
+        .expect("service status args parse");
+        assert_eq!(cli.config.as_deref(), Some(Path::new("/tmp/node.toml")));
+        assert_eq!(cli.data_dir.as_deref(), Some(Path::new("/tmp/node-data")));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Service {
+                action: ServiceCommand::Status { json: true }
+            })
+        ));
+        for verb in ["install", "start", "stop", "restart", "uninstall"] {
+            assert!(Cli::try_parse_from(["tagteam-node", "service", verb]).is_ok());
+        }
     }
 }

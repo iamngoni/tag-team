@@ -15,6 +15,7 @@ tagteam-proto = { path = "../tagteam-proto" }
 tagteam-pki = { path = "../tagteam-pki" }
 tagteam-sandbox = { path = "../tagteam-sandbox" }
 tagteam-proxy = { path = "../tagteam-proxy" }
+tagteam-service = { path = "../tagteam-service" }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
