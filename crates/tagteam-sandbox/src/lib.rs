@@ -8,7 +8,7 @@ use std::{
     collections::{HashMap, VecDeque},
     ffi::OsString,
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     net::SocketAddr,
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
@@ -127,6 +127,7 @@ pub struct SandboxProfile {
     resource_limits: ResourceLimits,
     toolchain_roots: Vec<PathBuf>,
     environment: Vec<(String, String)>,
+    stdin: Vec<u8>,
     nice_hint: NiceHint,
     job_hint: JobHint,
 }
@@ -197,6 +198,7 @@ impl SandboxProfile {
             resource_limits,
             toolchain_roots: Vec::new(),
             environment: Vec::new(),
+            stdin: Vec::new(),
             nice_hint: NiceHint(10),
             job_hint: JobHint(NonZeroU32::new(4).ok_or_else(|| {
                 SandboxError::InvalidProfile("default job hint cannot be zero".into())
@@ -214,6 +216,15 @@ impl SandboxProfile {
         }
         self.toolchain_roots.push(root);
         Ok(self)
+    }
+
+    /// Sets the bounded request bytes delivered to the confined process on stdin.
+    ///
+    /// This avoids OS argument-length limits for bundle preparation and larger
+    /// tool requests; callers remain responsible for bounding the payload.
+    pub fn with_stdin(mut self, input: impl Into<Vec<u8>>) -> Self {
+        self.stdin = input.into();
+        self
     }
 
     /// Sets the lower scheduling priority hint used for the command process.
@@ -563,11 +574,17 @@ impl Drop for AsyncCancellationGuard {
 }
 
 fn spawn_confined_blocking(
-    profile: SandboxProfile,
+    mut profile: SandboxProfile,
     token: CancellationToken,
     task_cancelled: Arc<AtomicBool>,
 ) -> Result<SandboxOutcome, SandboxError> {
     let mut command = platform_command(&profile)?;
+    let stdin_bytes = std::mem::take(&mut profile.stdin);
+    let stdin = if stdin_bytes.is_empty() {
+        Stdio::null()
+    } else {
+        Stdio::piped()
+    };
     command
         .env_clear()
         .env("HOME", host_fake_home(&profile))
@@ -576,7 +593,7 @@ fn spawn_confined_blocking(
         .env("HTTPS_PROXY", proxy_url(&profile))
         .env("HTTP_PROXY", proxy_url(&profile))
         .current_dir(&profile.repo)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (key, value) in &profile.environment {
@@ -586,6 +603,14 @@ fn spawn_confined_blocking(
     let mut child = command.spawn().map_err(SandboxError::Spawn)?;
     let pid = child.id();
     let mut group_guard = ChildGroupGuard::new(pid);
+    let stdin_writer = if stdin_bytes.is_empty() {
+        None
+    } else {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            SandboxError::Process(io::Error::other("sandbox stdin pipe was not created"))
+        })?;
+        Some(thread::spawn(move || stdin.write_all(&stdin_bytes)))
+    };
     let stdout = child.stdout.take().ok_or_else(|| {
         SandboxError::Process(io::Error::other("sandbox stdout pipe was not created"))
     })?;
@@ -637,6 +662,11 @@ fn spawn_confined_blocking(
 
     join_reader(stdout_reader)?;
     join_reader(stderr_reader)?;
+    if let Some(writer) = stdin_writer {
+        // A child may exit before consuming all input; its exit status remains
+        // the authoritative outcome rather than a broken-pipe write error.
+        let _ = writer.join();
+    }
     let mut output = capture
         .lock()
         .map_err(|_| SandboxError::Process(io::Error::other("output capture lock poisoned")))?;

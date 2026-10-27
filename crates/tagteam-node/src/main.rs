@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use tagteam_node::{
-    CommandJournal, CommandRunner, FileIdentityStore, HostHeartbeat, IdentityStore, NoBundleSource,
-    NodeEnrollment, NodeSession, SessionEvent,
+    CommandJournal, CommandRunner, FileIdentityStore, HostHeartbeat, HubBundleSource,
+    IdentityStore, NodeEnrollment, NodeSession, SessionEvent,
 };
 
 #[derive(Debug, Parser)]
@@ -31,9 +31,9 @@ enum Command {
     /// Print the node version.
     Version,
     #[command(name = "__fsop", hide = true)]
-    Fsop { encoded: String },
+    Fsop { encoded: Option<String> },
     #[command(name = "__exec", hide = true)]
-    Exec { encoded: String },
+    Exec { encoded: Option<String> },
 }
 
 #[tokio::main]
@@ -49,10 +49,20 @@ async fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Version) {
         Command::Version => println!("tagteam-node {}", tagteam_node::NODE_VERSION),
         Command::Join { invite, name } => join(&invite, name, data_dir).await?,
-        Command::Fsop { encoded } => println!("{}", tagteam_node::fsop::run_encoded(&encoded)),
+        Command::Fsop { encoded } => {
+            let response = match encoded {
+                Some(encoded) => tagteam_node::fsop::run_encoded(&encoded),
+                None => tagteam_node::fsop::run_encoded_from_reader(std::io::stdin().lock())
+                    .map_err(anyhow::Error::msg)?,
+            };
+            println!("{response}");
+        }
         Command::Exec { encoded } => {
-            let code =
-                tagteam_node::fsop::run_exec_encoded(&encoded).map_err(anyhow::Error::msg)?;
+            let code = match encoded {
+                Some(encoded) => tagteam_node::fsop::run_exec_encoded(&encoded),
+                None => tagteam_node::fsop::run_exec_encoded_from_reader(std::io::stdin().lock()),
+            }
+            .map_err(anyhow::Error::msg)?;
             std::process::exit(code);
         }
     }
@@ -67,8 +77,14 @@ async fn join(invite: &str, name: String, data_dir: PathBuf) -> anyhow::Result<(
     let platform = current_platform();
     let identity = NodeEnrollment::enroll(invite, name, platform).await?;
     store.persist(&identity)?;
+    let (_, identity) = store
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("persisted node identity is unavailable"))?;
     let journal = CommandJournal::open(data_dir.join("commands.json"))?;
-    let runner = CommandRunner::new(&data_dir, journal.clone(), NoBundleSource);
+    let bundles = HubBundleSource::new(&identity)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let runner = CommandRunner::new(&data_dir, journal.clone(), bundles);
     let session = NodeSession::new(identity, HostHeartbeat)
         .pending_source(journal)
         .start();

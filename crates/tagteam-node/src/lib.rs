@@ -4,6 +4,7 @@
 //! persistence is delegated through [`IdentityStore`]; callers must never log identity
 //! material, invites, or one-time enrollment codes.
 
+mod blob_source;
 mod enrollment;
 pub mod fsop;
 mod heartbeat;
@@ -13,6 +14,7 @@ mod runtime;
 mod session;
 mod transport;
 
+pub use blob_source::HubBundleSource;
 pub use enrollment::{IdentityStore, IdentityStoreError, NodeEnrollment, NodeError, NodeIdentity};
 pub use heartbeat::HostHeartbeat;
 pub use identity_store::{FileIdentityError, FileIdentityStore};

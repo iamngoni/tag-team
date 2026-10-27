@@ -9,6 +9,9 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+/// Maximum size of one repository or result bundle transferred over node RPC.
+pub const MAX_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+
 macro_rules! ulid_id {
     ($name:ident) => {
         #[derive(

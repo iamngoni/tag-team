@@ -40,7 +40,7 @@ use proto::{
 };
 
 /// Maximum accepted content-addressed blob size (64 MiB).
-pub const MAX_BLOB_SIZE: u64 = 64 * 1024 * 1024;
+pub const MAX_BLOB_SIZE: u64 = tagteam_core::MAX_BLOB_BYTES;
 /// Maximum data bytes in a single blob stream chunk (1 MiB).
 pub const MAX_CHUNK_SIZE: usize = 1024 * 1024;
 const HEARTBEAT_MS: u32 = 15_000;

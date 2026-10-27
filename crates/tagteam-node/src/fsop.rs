@@ -13,6 +13,10 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tagteam_core::MAX_BLOB_BYTES;
+
+/// The encoded helper envelope can exceed the blob limit by base64 and JSON overhead.
+const MAX_HELPER_REQUEST_BYTES: u64 = MAX_BLOB_BYTES * 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -75,6 +79,12 @@ pub struct ExecRequest {
     pub cwd: String,
     pub env: std::collections::BTreeMap<String, String>,
     pub stdin: String,
+}
+
+/// Reads one bounded, base64-encoded command request from stdin and executes it.
+pub fn run_exec_encoded_from_reader(reader: impl Read) -> Result<i32, String> {
+    let encoded = read_encoded_request(reader)?;
+    run_exec_encoded(&encoded)
 }
 
 pub fn run_exec_encoded(encoded: &str) -> Result<i32, String> {
@@ -179,7 +189,10 @@ fn safe_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
+    // The supervisor injects the resolved macOS developer Git when the system
+    // shim would otherwise need host-only Xcode state. Linux keeps PATH lookup.
+    let executable = std::env::var_os("TAGTEAM_GIT_BIN").unwrap_or_else(|| "git".into());
+    let output = Command::new(executable)
         .args(args)
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -259,12 +272,34 @@ fn wildcard(pattern: &str, value: &str) -> bool {
     p == pattern.len()
 }
 
+/// Reads one bounded, base64-encoded filesystem request from stdin and executes it.
+pub fn run_encoded_from_reader(reader: impl Read) -> Result<String, String> {
+    read_encoded_request(reader).map(|encoded| run_encoded(&encoded))
+}
+
 pub fn run_encoded(encoded: &str) -> String {
     let response = match run_request(encoded) {
         Ok(value) => serde_json::json!({"ok": true, "value": value}),
         Err(error) => serde_json::json!({"ok": false, "error": error}),
     };
     STANDARD.encode(serde_json::to_vec(&response).unwrap_or_default())
+}
+
+fn read_encoded_request(mut reader: impl Read) -> Result<String, String> {
+    let mut encoded = String::new();
+    reader
+        .by_ref()
+        .take(MAX_HELPER_REQUEST_BYTES + 1)
+        .read_to_string(&mut encoded)
+        .map_err(|_| "helper request could not be read")?;
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_HELPER_REQUEST_BYTES {
+        return Err("helper request exceeds the allowed size".into());
+    }
+    let encoded = encoded.trim();
+    if encoded.is_empty() {
+        return Err("helper request is empty".into());
+    }
+    Ok(encoded.to_owned())
 }
 
 fn run_request(encoded: &str) -> Result<Value, String> {

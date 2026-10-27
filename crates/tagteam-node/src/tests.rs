@@ -7,12 +7,13 @@ use std::{net::SocketAddr, time::Duration};
 
 use data_encoding::BASE32_NOPAD;
 use tagteam_core::{Thermal, Timestamp};
-use tagteam_hub::{journal::Journal, nodes::NodePlane};
+use tagteam_hub::{blobs::BlobStore, journal::Journal, nodes::NodePlane};
 use tagteam_pki::{CertificateFingerprint, HubCa, Invite};
 use tokio::{sync::oneshot, time::timeout};
 
 use crate::{
-    FileIdentityStore, HeartbeatSource, IdentityStore, NodeEnrollment, NodeSession, SessionEvent,
+    BundleSource, FileIdentityStore, HeartbeatSource, HubBundleSource, IdentityStore,
+    NodeEnrollment, NodeSession, SessionEvent,
 };
 
 struct StaticHeartbeat;
@@ -172,6 +173,56 @@ async fn wrong_pinned_ca_fails_before_the_invite_is_consumed() {
         .expect("load invite")
         .expect("invite still exists");
     assert!(invite_row.used_at.is_none());
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn authenticated_bundle_source_downloads_and_rejects_wrong_references() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let ca = HubCa::generate().expect("hub CA");
+    let fingerprint = ca.fingerprint();
+    let (address, shutdown) = start_node_plane(&directory, ca).await;
+    let invite = create_invite(&directory, address, fingerprint, [13; 32]).await;
+    let identity = NodeEnrollment::enroll(
+        &invite,
+        "blob node",
+        tagteam_proto::v1::Platform {
+            os: tagteam_proto::v1::Os::Linux as i32,
+            arch: tagteam_proto::v1::Arch::X64 as i32,
+            os_version: "test".into(),
+        },
+    )
+    .await
+    .expect("enrollment succeeds");
+
+    let bytes = b"verified workspace bundle";
+    let reference = BlobStore::open(directory.path().join("blobs"))
+        .expect("blob store opens")
+        .put(bytes)
+        .expect("blob is seeded");
+    let source = HubBundleSource::new(&identity)
+        .await
+        .expect("authenticated hub source connects");
+    let wire_reference = tagteam_proto::v1::BlobRef {
+        sha256: reference.sha256.to_vec(),
+        size: reference.size,
+    };
+    assert_eq!(
+        source
+            .bundle_bytes(&wire_reference)
+            .await
+            .expect("bundle downloads and verifies"),
+        bytes
+    );
+
+    let mut wrong_digest = wire_reference.clone();
+    wrong_digest.sha256[0] ^= 1;
+    assert!(source.bundle_bytes(&wrong_digest).await.is_err());
+
+    let mut wrong_size = wire_reference;
+    wrong_size.size += 1;
+    assert!(source.bundle_bytes(&wrong_size).await.is_err());
+
     let _ = shutdown.send(());
 }
 

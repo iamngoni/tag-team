@@ -6,8 +6,10 @@
 use std::{
     collections::HashMap,
     fs,
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -32,14 +34,20 @@ use tagteam_proto::v1 as Proto;
 
 /// Supplies already downloaded repository bundles without coupling this crate to hub blob transport.
 pub trait BundleSource: Send + Sync + 'static {
-    fn bundle_bytes(&self, reference: &Proto::BlobRef) -> Result<Vec<u8>, String>;
+    fn bundle_bytes(
+        &self,
+        reference: &Proto::BlobRef,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>>;
 }
 
 pub struct NoBundleSource;
 
 impl BundleSource for NoBundleSource {
-    fn bundle_bytes(&self, _reference: &Proto::BlobRef) -> Result<Vec<u8>, String> {
-        Err("bundle source is not configured".into())
+    fn bundle_bytes(
+        &self,
+        _reference: &Proto::BlobRef,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
+        Box::pin(async { Err("bundle source is not configured".into()) })
     }
 }
 
@@ -49,6 +57,7 @@ pub struct CommandRunner {
     executable: Option<PathBuf>,
     journal: CommandJournal,
     bundles: Arc<dyn BundleSource>,
+    git_toolchain: Option<GitToolchain>,
     running: Arc<Mutex<HashMap<String, CancellationHandle>>>,
     workspace_limits: Arc<Mutex<HashMap<String, WorkspaceLimits>>>,
     execution_lock: Arc<tokio::sync::Mutex<()>>,
@@ -58,6 +67,34 @@ pub struct CommandRunner {
 struct WorkspaceLimits {
     resources: ResourceLimits,
     jobs: u32,
+}
+
+/// The active macOS developer toolchain used to avoid the Xcode command shim.
+///
+/// `/usr/bin/git` shells out through `xcode-select`, which reads host-only
+/// paths that the workspace sandbox deliberately denies. Resolving the active
+/// developer directory once lets the confined helper run its real Git binary
+/// from a read-only toolchain root instead.
+#[derive(Clone)]
+struct GitToolchain {
+    developer_dir: PathBuf,
+    executable: PathBuf,
+}
+
+fn host_git_toolchain() -> Option<GitToolchain> {
+    #[cfg(target_os = "macos")]
+    {
+        let developer_dir = fs::read_link("/var/select/developer_dir").ok()?;
+        let executable = developer_dir.join("usr/bin/git");
+        executable.is_file().then_some(GitToolchain {
+            developer_dir,
+            executable,
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 impl CommandRunner {
@@ -71,6 +108,7 @@ impl CommandRunner {
             executable: std::env::current_exe().ok(),
             journal,
             bundles: Arc::new(bundles),
+            git_toolchain: host_git_toolchain(),
             running: Arc::default(),
             workspace_limits: Arc::default(),
             execution_lock: Arc::default(),
@@ -192,7 +230,7 @@ impl CommandRunner {
                     .bundle
                     .as_ref()
                     .ok_or("bundle reference is missing")?;
-                let bytes = self.bundles.bundle_bytes(reference)?;
+                let bytes = self.bundles.bundle_bytes(reference).await?;
                 let workspace = self.prepare_workspace(&command.workspace)?;
                 let response = self
                     .run_fsop(
@@ -247,17 +285,23 @@ impl CommandRunner {
                     serde_json::to_vec(&request).map_err(|_| "command could not be encoded")?,
                 );
                 let command_line = format!(
-                    "exec {} __exec {}",
+                    "exec {} __exec",
                     shell_quote(
                         executable
                             .to_str()
                             .ok_or("node executable path is invalid")?
-                    ),
-                    shell_quote(&encoded)
+                    )
                 );
                 let limits = limits_for(exec.timeout_ms, exec.output_cap);
                 let (outcome, _listener) = self
-                    .spawn(&workspace, command_line, token, limits, Vec::new())
+                    .spawn(
+                        &workspace,
+                        command_line,
+                        token,
+                        limits,
+                        Vec::new(),
+                        encoded.into_bytes(),
+                    )
                     .await?;
                 let mut result = Proto::ExecDone {
                     exit_code: outcome.exit_code.unwrap_or(-1),
@@ -579,12 +623,24 @@ impl CommandRunner {
             .as_ref()
             .ok_or("node executable unavailable")?;
         let command = format!(
-            "exec {} __fsop {}",
-            shell_quote(&executable.display().to_string()),
-            shell_quote(&encoded)
+            "exec {} __fsop",
+            shell_quote(&executable.display().to_string())
         );
+        let environment = self
+            .git_toolchain
+            .as_ref()
+            .and_then(|toolchain| toolchain.executable.to_str())
+            .map(|path| vec![("TAGTEAM_GIT_BIN".into(), path.to_owned())])
+            .unwrap_or_default();
         let (outcome, _listener) = self
-            .spawn(workspace, command, token, limits, Vec::new())
+            .spawn(
+                workspace,
+                command,
+                token,
+                limits,
+                environment,
+                encoded.into_bytes(),
+            )
             .await?;
         if outcome.exit_code != Some(0) {
             return Err("sandboxed workspace operation failed".into());
@@ -617,6 +673,7 @@ impl CommandRunner {
         token: CancellationToken,
         limits: Limits,
         environment: Vec<(String, String)>,
+        stdin: Vec<u8>,
     ) -> Result<(tagteam_sandbox::SandboxOutcome, UnixListener), String> {
         self.ensure_workspace(workspace)?;
         let executable = self
@@ -655,7 +712,8 @@ impl CommandRunner {
             )
         };
         let mut profile = SandboxProfile::new(workspace, command, proxy, limits, resource_limits)
-            .map_err(|_| "sandbox profile is invalid")?;
+            .map_err(|_| "sandbox profile is invalid")?
+            .with_stdin(stdin);
         profile = profile.with_job_hint(JobHint::new(
             std::num::NonZeroU32::new(jobs).ok_or("invalid CPU limit")?,
         ));
@@ -666,6 +724,11 @@ impl CommandRunner {
         profile = profile
             .with_toolchain_root(executable_dir)
             .map_err(|_| "sandbox toolchain root is invalid")?;
+        if let Some(toolchain) = &self.git_toolchain {
+            profile = profile
+                .with_toolchain_root(toolchain.developer_dir.clone())
+                .map_err(|_| "sandbox Git toolchain root is invalid")?;
+        }
         for (key, value) in environment {
             profile = profile
                 .with_environment(key, value)

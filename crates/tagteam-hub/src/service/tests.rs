@@ -14,17 +14,17 @@ use std::{
 
 use semver::VersionReq;
 use tagteam_core::{
-    Bytes, Capacity, Limits, MainSessionId, Needs, Node, NodeId, NodePolicy, NodeState, Os,
-    OwnerPresence, Platform, SubtaskId, SubtaskSpec, SubtaskState, Thermal, Timestamp, Trust,
+    Bytes, Capacity, FailReason, Limits, MainSessionId, Needs, Node, NodeId, NodePolicy, NodeState,
+    Os, OwnerPresence, Platform, SubtaskId, SubtaskSpec, SubtaskState, Thermal, Timestamp, Trust,
     local_api::{DispatchInput, DispatchReply, LocalRequest, LocalResponseBody},
     schedule::{NoFitReason, Placement},
 };
 use tagteam_pki::HubCa;
 use tempfile::TempDir;
 
-use crate::config::HubConfig;
+use crate::{blobs::BlobStore, config::HubConfig};
 
-use super::{HubService, branch_name, normalize_and_validate_spec};
+use super::{HubService, branch_name, ensure_prepare_succeeded, normalize_and_validate_spec};
 
 fn config(directory: &TempDir) -> HubConfig {
     HubConfig {
@@ -238,6 +238,170 @@ async fn dispatch_without_nodes_is_queued_with_an_explicit_reason() {
     let task = load_subtask(&service, reply.subtasks[0].0).await;
     assert_eq!(task.state, SubtaskState::Queued);
     assert_eq!(task.node, None);
+}
+
+#[tokio::test]
+async fn source_bundle_is_verified_and_content_addressed() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (repository, _) = init_repository(&directory);
+    let service = service(&directory).await;
+    let reply = dispatch(
+        &service,
+        &repository,
+        vec![spec(&repository, "Bundle me", false)],
+    )
+    .await;
+    let task = load_subtask(&service, reply.subtasks[0].0).await;
+    let blob = service
+        .create_source_bundle(&task)
+        .await
+        .expect("source bundle is stored");
+    assert!(blob.size > 0);
+
+    let bytes = tokio::task::spawn_blocking({
+        let root = service.paths().blobs.clone();
+        move || BlobStore::open(root).and_then(|store| store.read(&blob))
+    })
+    .await
+    .expect("blob worker")
+    .expect("blob reads back");
+    let bundle_path = directory.path().join("verified.bundle");
+    fs::write(&bundle_path, &bytes).expect("bundle file");
+    tagteam_git::Repository::open(&repository)
+        .expect("repository")
+        .verify_bundle(&bundle_path)
+        .expect("bundle connectivity");
+}
+
+#[tokio::test]
+async fn an_offline_node_does_not_fail_its_durable_placement() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (repository, _) = init_repository(&directory);
+    let service = service(&directory).await;
+    let node = active_node();
+    let node_id = node.id;
+    service
+        .journal(move |journal| journal.create_node(&node))
+        .await
+        .expect("node");
+
+    let reply = dispatch(
+        &service,
+        &repository,
+        vec![spec(&repository, "Prepared later", false)],
+    )
+    .await;
+    assert_eq!(reply.subtasks[0].1, Placement::Placed(node_id));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let task = load_subtask(&service, reply.subtasks[0].0).await;
+    assert_eq!(task.state, SubtaskState::Preparing);
+    assert_eq!(task.node, Some(node_id));
+}
+
+#[tokio::test]
+async fn an_unavailable_node_fails_preparation_after_its_wall_clock_budget() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (repository, _) = init_repository(&directory);
+    let service = service(&directory).await;
+    let node = active_node();
+    let node_id = node.id;
+    service
+        .journal(move |journal| journal.create_node(&node))
+        .await
+        .expect("node");
+
+    let mut task = spec(&repository, "Preparation budget", false);
+    task.limits.wall_clock = Duration::from_millis(1);
+    task.limits.command_timeout = Duration::from_secs(1);
+    let reply = dispatch(&service, &repository, vec![task]).await;
+    assert_eq!(reply.subtasks[0].1, Placement::Placed(node_id));
+    let subtask_id = reply.subtasks[0].0;
+
+    let mut state = None;
+    for _ in 0..100 {
+        let task = load_subtask(&service, subtask_id).await;
+        if matches!(task.state, SubtaskState::Failed { .. }) {
+            state = Some(task.state);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let Some(SubtaskState::Failed {
+        reason: FailReason::Bundle(reason),
+    }) = state
+    else {
+        panic!("preparation must fail terminally after its budget: {state:?}");
+    };
+    assert!(reason.contains("did not acknowledge workspace preparation"));
+}
+
+#[tokio::test]
+async fn cancellation_while_preparing_never_reaches_running() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (repository, _) = init_repository(&directory);
+    let service = service(&directory).await;
+    let node = active_node();
+    let node_id = node.id;
+    service
+        .journal(move |journal| journal.create_node(&node))
+        .await
+        .expect("node");
+
+    let reply = dispatch(
+        &service,
+        &repository,
+        vec![spec(&repository, "Cancel preparation", false)],
+    )
+    .await;
+    assert_eq!(reply.subtasks[0].1, Placement::Placed(node_id));
+    let subtask_id = reply.subtasks[0].0;
+    service
+        .handle(LocalRequest::Cancel {
+            subtask: subtask_id,
+            reason: "operator cancelled".into(),
+        })
+        .await
+        .expect("cancel preparing task");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        load_subtask(&service, subtask_id).await.state,
+        SubtaskState::Cancelled
+    );
+}
+
+#[test]
+fn prepare_command_requires_a_positive_done_result() {
+    assert!(
+        ensure_prepare_succeeded(&tagteam_proto::v1::CommandResult {
+            command_id: "prepare".into(),
+            result: Some(tagteam_proto::v1::command_result::Result::Done(
+                tagteam_proto::v1::Done { ok: true }
+            )),
+        })
+        .is_ok()
+    );
+    assert!(
+        ensure_prepare_succeeded(&tagteam_proto::v1::CommandResult {
+            command_id: "prepare".into(),
+            result: Some(tagteam_proto::v1::command_result::Result::Done(
+                tagteam_proto::v1::Done { ok: false }
+            )),
+        })
+        .is_err()
+    );
+    assert!(
+        ensure_prepare_succeeded(&tagteam_proto::v1::CommandResult {
+            command_id: "prepare".into(),
+            result: Some(tagteam_proto::v1::command_result::Result::Error(
+                tagteam_proto::v1::Error {
+                    code: 0,
+                    message: "failed".into(),
+                    retryable: false,
+                }
+            )),
+        })
+        .is_err()
+    );
 }
 
 #[tokio::test]

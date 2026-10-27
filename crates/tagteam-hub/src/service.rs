@@ -6,6 +6,7 @@
 
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
+    fs,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -13,8 +14,8 @@ use std::{
 
 use data_encoding::BASE32_NOPAD;
 use tagteam_core::{
-    Dispatch, DispatchId, Event, EventKind, MainSessionId, RepoId, Subtask, SubtaskId, SubtaskSpec,
-    SubtaskState, Timestamp,
+    BlobRef, Dispatch, DispatchId, Event, EventKind, FailReason, MAX_BLOB_BYTES, MainSessionId,
+    RepoId, Subtask, SubtaskId, SubtaskSpec, SubtaskState, Timestamp,
     local_api::{
         BriefReply, CollectReply, DispatchInput, DispatchReply, InviteReply,
         LOCAL_PROTOCOL_VERSION, LocalRequest, LocalResponseBody, LogsReply, NodeView, StatusReply,
@@ -25,10 +26,12 @@ use tagteam_core::{
 };
 use tagteam_git::Repository;
 use tagteam_pki::{HubCa, Invite};
+use tagteam_proto::v1 as Proto;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
+    blobs::BlobStore,
     config::{DataPaths, HubConfig},
     journal::{EventFilter, EventScope, Journal, JournalError},
     nodes::{NodePlane, NodePlaneError},
@@ -43,6 +46,10 @@ pub enum ServiceError {
     Journal(#[from] JournalError),
     #[error("node plane failed: {0}")]
     NodePlane(#[from] NodePlaneError),
+    #[error("blob storage failed: {0}")]
+    Blob(#[from] crate::blobs::BlobError),
+    #[error("workspace preparation failed: {0}")]
+    Preparation(String),
     #[error("request is invalid: {0}")]
     Invalid(String),
     #[error("record was not found: {0}")]
@@ -417,6 +424,44 @@ impl HubService {
                 journal.transition(subtask_id, transition, Timestamp::now())
             })
             .await?;
+            if let Placement::Placed(node) = placement {
+                let service = self.clone();
+                let task = self
+                    .journal(move |journal| journal.load_subtask(subtask_id))
+                    .await?
+                    .ok_or_else(|| ServiceError::NotFound(format!("subtask {subtask_id}")))?;
+                tokio::spawn(async move {
+                    match service.prepare_subtask(&task, node).await {
+                        Ok(()) => {}
+                        Err(ServiceError::NodePlane(
+                            NodePlaneError::Offline | NodePlaneError::Timeout,
+                        )) => {
+                            // The durable placement remains valid. A later
+                            // reconciliation pass can prepare it when the node
+                            // reconnects; dispatch must not turn a transient
+                            // disconnect into a terminal task failure.
+                            tracing::debug!(subtask = %task.id, node = %node, "node unavailable during preparation");
+                        }
+                        Err(error) => {
+                            tracing::warn!(subtask = %task.id, node = %node, %error, "workspace preparation failed");
+                            let message = bounded_error(&error.to_string());
+                            let _ = service
+                                .journal(move |journal| {
+                                    journal
+                                        .transition(
+                                            subtask_id,
+                                            SubtaskInput::Fail {
+                                                reason: FailReason::Bundle(message),
+                                            },
+                                            Timestamp::now(),
+                                        )
+                                        .map(|_| ())
+                                })
+                                .await;
+                        }
+                    }
+                });
+            }
             placements.push((subtask_id, placement));
         }
 
@@ -428,6 +473,134 @@ impl HubService {
             excluded_paths,
             watch_command: format!("tagteam watch --dispatch {id}"),
         })
+    }
+
+    /// Creates a verified source bundle, uploads it to the hub blob store and
+    /// asks the assigned node to prepare its private workspace. The command ID
+    /// is deterministic so node reconnects cannot replay a partial checkout.
+    async fn prepare_subtask(
+        &self,
+        task: &Subtask,
+        node: tagteam_core::NodeId,
+    ) -> Result<(), ServiceError> {
+        if task.state != SubtaskState::Preparing || task.node != Some(node) {
+            return Ok(());
+        }
+        let blob = self.create_source_bundle(task).await?;
+        let command_id = format!("prepare-{}", task.id);
+        let command = Proto::Command {
+            command_id,
+            subtask_id: task.id.to_string(),
+            workspace: task.id.to_string(),
+            op: Some(Proto::command::Op::Prepare(Proto::PrepareWorkspace {
+                bundle: Some(Proto::BlobRef {
+                    sha256: blob.sha256.to_vec(),
+                    size: blob.size,
+                }),
+                repo_id: task.repo_id.0.0.clone(),
+                base: task.base.0.clone(),
+                branch: task.branch.clone(),
+                profile: Some(Proto::SandboxProfile {
+                    writable: Vec::new(),
+                    readable: Vec::new(),
+                    egress: task.spec.egress.clone(),
+                    cpu_cores: f32::from(task.spec.needs.cores),
+                    memory: task.spec.needs.memory.0,
+                    pids: 64,
+                    disk: task.spec.needs.disk.0,
+                }),
+            })),
+        };
+        let timeout = std::cmp::max(task.spec.limits.command_timeout, Duration::from_secs(60));
+        let id = task.id;
+        let retry_until = std::time::Instant::now() + task.spec.limits.wall_clock;
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            let current = self
+                .journal(move |journal| journal.load_subtask_state(id))
+                .await?;
+            if current != Some(SubtaskState::Preparing) {
+                return Ok(());
+            }
+            match self
+                .nodes
+                .execute_command(node, command.clone(), timeout)
+                .await
+            {
+                Ok(result) => {
+                    ensure_prepare_succeeded(&result)?;
+                    self.journal(move |journal| {
+                        journal
+                            .transition(id, SubtaskInput::Prepared, Timestamp::now())
+                            .map(|_| ())
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                Err(NodePlaneError::Offline | NodePlaneError::Timeout)
+                    if std::time::Instant::now() < retry_until =>
+                {
+                    // The command is durably journaled before it leaves the hub.
+                    // Retrying the same ID recovers either a result stored while
+                    // the node was reconnecting or a redelivery of the same work.
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                }
+                Err(NodePlaneError::Offline | NodePlaneError::Timeout) => {
+                    return Err(ServiceError::Preparation(format!(
+                        "node {node} did not acknowledge workspace preparation within the wall-clock limit"
+                    )));
+                }
+                Err(error) => return Err(ServiceError::NodePlane(error)),
+            }
+        }
+    }
+
+    async fn create_source_bundle(&self, task: &Subtask) -> Result<BlobRef, ServiceError> {
+        let repository = task.spec.repo.clone();
+        let base = task.base.0.clone();
+        let bytes = tokio::task::spawn_blocking(move || {
+            let repository = Repository::open(&repository)?;
+            let directory = tempfile::tempdir().map_err(|error| tagteam_git::GitError::Io {
+                path: std::env::temp_dir(),
+                source: error,
+            })?;
+            let bundle = repository.create_bundle(
+                &base,
+                directory.path().join("workspace.bundle"),
+                &[],
+                None,
+            )?;
+            repository.verify_bundle(&bundle.path)?;
+            if bundle.bytes > MAX_BLOB_BYTES {
+                return Err(ServiceError::Invalid(format!(
+                    "source bundle is {} bytes; the node limit is {MAX_BLOB_BYTES}",
+                    bundle.bytes
+                )));
+            }
+            Ok::<Vec<u8>, ServiceError>(fs::read(&bundle.path).map_err(|source| {
+                tagteam_git::GitError::Io {
+                    path: bundle.path.clone(),
+                    source,
+                }
+            })?)
+        })
+        .await
+        .map_err(|_| ServiceError::Worker)??;
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if size > MAX_BLOB_BYTES {
+            return Err(ServiceError::Invalid(format!(
+                "source bundle exceeds the {MAX_BLOB_BYTES}-byte node limit"
+            )));
+        }
+        let root = self.paths.blobs.clone();
+        tokio::task::spawn_blocking(move || {
+            BlobStore::open(root)
+                .and_then(|store| store.put(&bytes))
+                .map_err(ServiceError::from)
+        })
+        .await
+        .map_err(|_| ServiceError::Worker)?
     }
 
     async fn status(&self, ids: Option<Vec<SubtaskId>>) -> Result<StatusReply, ServiceError> {
@@ -808,6 +981,26 @@ fn branch_name(title: &str, id: SubtaskId) -> String {
     let encoded_id = id.to_string();
     let suffix = &encoded_id[encoded_id.len().saturating_sub(6)..];
     format!("tagteam/{slug}-{}", suffix.to_ascii_lowercase())
+}
+
+fn ensure_prepare_succeeded(result: &Proto::CommandResult) -> Result<(), ServiceError> {
+    match result.result.as_ref() {
+        Some(Proto::command_result::Result::Done(done)) if done.ok => Ok(()),
+        Some(Proto::command_result::Result::Error(error)) => Err(ServiceError::Invalid(format!(
+            "node rejected workspace preparation: {}",
+            bounded_error(&error.message)
+        ))),
+        Some(_) => Err(ServiceError::Invalid(
+            "node returned an unexpected result for workspace preparation".into(),
+        )),
+        None => Err(ServiceError::Invalid(
+            "node returned no result for workspace preparation".into(),
+        )),
+    }
+}
+
+fn bounded_error(message: &str) -> String {
+    message.chars().take(512).collect()
 }
 
 #[derive(Clone, Copy)]

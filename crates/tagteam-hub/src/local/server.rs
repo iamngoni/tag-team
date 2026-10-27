@@ -184,7 +184,10 @@ fn safe_error(error: &ServiceError) -> String {
         ServiceError::Git(error) => error.to_string(),
         ServiceError::NodePlane(error) => error.to_string(),
         ServiceError::Random => "secure random generation failed".into(),
-        ServiceError::Worker | ServiceError::Internal => "internal service error".into(),
+        ServiceError::Blob(_)
+        | ServiceError::Preparation(_)
+        | ServiceError::Worker
+        | ServiceError::Internal => "internal service error".into(),
     }
 }
 
