@@ -1,0 +1,5 @@
+[build]
+jobs = 4
+
+[profile.dev]
+debug = "line-tables-only"

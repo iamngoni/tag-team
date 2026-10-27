@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:tagteam:hub",
+            "tool": "hook_brief",
+            "input": { "session_id": "${session_id}" },
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

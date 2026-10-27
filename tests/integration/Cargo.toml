@@ -1,0 +1,19 @@
+[package]
+name = "tagteam-it"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tagteam-core = { path = "../../crates/tagteam-core" }
+tagteam-hub = { path = "../../crates/tagteam-hub" }
+tagteam-node = { path = "../../crates/tagteam-node" }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

@@ -1,0 +1,19 @@
+{
+  "v": 1,
+  "type": "tool_call",
+  "call_id": "call_01",
+  "call": {
+    "tool": "finish",
+    "outcome": "completed",
+    "summary": "Fixed the test and verified it.",
+    "assumptions": [],
+    "checks": [
+      {
+        "what": "cargo test passes",
+        "command": "cargo test",
+        "passed": true,
+        "output_tail": "test result: ok"
+      }
+    ]
+  }
+}

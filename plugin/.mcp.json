@@ -1,0 +1,6 @@
+{
+  "hub": {
+    "command": "tagteam",
+    "args": ["mcp"]
+  }
+}

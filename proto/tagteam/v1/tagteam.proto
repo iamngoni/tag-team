@@ -1,0 +1,288 @@
+syntax = "proto3";
+
+package tagteam.v1;
+
+// The hub is the only network peer a node ever talks to. Nodes always dial out.
+service Hub {
+  // Server-authenticated TLS only. A one-time invite plus this CSR earns a
+  // client certificate. Approval happens later through the local CLI.
+  rpc Enroll(EnrollRequest) returns (EnrollReply);
+
+  // One long-lived bidirectional session per node. Many command lanes share it.
+  rpc Session(stream NodeMessage) returns (stream HubMessage);
+
+  // Bulk bytes are kept off the heartbeat/tool-call stream.
+  rpc GetBlob(BlobRef) returns (stream Chunk);
+  rpc PutBlob(stream Chunk) returns (BlobRef);
+}
+
+enum Os { OS_UNSPECIFIED = 0; OS_MACOS = 1; OS_LINUX = 2; }
+enum Arch { ARCH_UNSPECIFIED = 0; ARCH_ARM64 = 1; ARCH_X64 = 2; }
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_ENROLLED = 1;
+  NODE_STATE_ACTIVE = 2;
+  NODE_STATE_OWNER_BUSY = 3;
+  NODE_STATE_PAUSED = 4;
+  NODE_STATE_DRAINING = 5;
+  NODE_STATE_LOST = 6;
+  NODE_STATE_REMOVED = 7;
+}
+
+enum OwnerPresence {
+  OWNER_PRESENCE_UNSPECIFIED = 0;
+  OWNER_PRESENCE_AWAY = 1;
+  OWNER_PRESENCE_PRESENT = 2;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_BAD_REQUEST = 1;
+  ERROR_CODE_UNAUTHORIZED = 2;
+  ERROR_CODE_NOT_FOUND = 3;
+  ERROR_CODE_CONFLICT = 4;
+  ERROR_CODE_LIMIT = 5;
+  ERROR_CODE_UNAVAILABLE = 6;
+  ERROR_CODE_INTERNAL = 7;
+  ERROR_CODE_CANCELLED = 8;
+}
+
+enum StreamKind { STREAM_KIND_STDOUT = 0; STREAM_KIND_STDERR = 1; }
+
+message Platform {
+  Os os = 1;
+  Arch arch = 2;
+  string os_version = 3;
+}
+
+message EnrollRequest {
+  string code = 1;
+  bytes csr_der = 2;
+  string name = 3;
+  Platform platform = 4;
+}
+
+message EnrollReply {
+  bytes cert_der = 1;
+  string node_id = 2;
+}
+
+message BlobRef {
+  bytes sha256 = 1;
+  uint64 size = 2;
+}
+
+message Chunk {
+  oneof body {
+    BlobHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message BlobHeader {
+  bytes sha256 = 1;
+  uint64 size = 2;
+}
+
+message Capacity {
+  uint32 cores_total = 1;
+  float cores_free = 2;
+  uint64 memory_free = 3;
+  uint64 disk_free = 4;
+  uint32 running = 5;
+  bool on_battery = 6;
+  string thermal = 7;
+}
+
+message Toolchain {
+  string name = 1;
+  string version = 2;
+  string path = 3;
+}
+
+message CachedRepo {
+  string repo_id = 1;
+  repeated string heads = 2;
+}
+
+message HourRange {
+  uint32 start_minutes = 1;
+  uint32 end_minutes = 2;
+}
+
+message NodePolicy {
+  bool only_when_idle = 1;
+  uint64 idle_after_ms = 2;
+  string on_owner_return = 3;
+  optional uint32 max_cores = 4;
+  optional uint64 max_memory = 5;
+  uint32 max_subtasks = 6;
+  repeated HourRange hours = 7;
+  bool never_on_battery = 8;
+  repeated string extra_hosts = 9;
+}
+
+message Heartbeat {
+  Capacity capacity = 1;
+  OwnerPresence presence = 2;
+  repeated Toolchain toolchains = 3;
+  repeated CachedRepo repos = 4;
+  repeated string running = 5;
+}
+
+message CommandAck {
+  string command_id = 1;
+  CommandResult result = 2;
+}
+
+message Hello {
+  string node_id = 1;
+  string version = 2;
+  repeated string workspaces = 3;
+  repeated CommandAck pending = 4;
+}
+
+message Welcome {
+  string session_id = 1;
+  uint32 heartbeat_ms = 2;
+  NodeState node_state = 3;
+}
+
+message Cancel { string command_id = 1; string reason = 2; }
+message Drain { uint32 grace_ms = 1; }
+
+message NodeMessage {
+  oneof msg {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    OutputChunk output = 3;
+    CommandResult result = 4;
+  }
+}
+
+message HubMessage {
+  oneof msg {
+    Welcome welcome = 1;
+    Command command = 2;
+    Cancel cancel = 3;
+    Drain drain = 4;
+  }
+}
+
+message SandboxProfile {
+  repeated string writable = 1;
+  repeated string readable = 2;
+  repeated string egress = 3;
+  float cpu_cores = 4;
+  uint64 memory = 5;
+  uint32 pids = 6;
+  uint64 disk = 7;
+}
+
+message FileRange { string path = 1; uint64 offset = 2; uint64 limit = 3; }
+message FileBody { string path = 1; bytes data = 2; optional bytes expected_sha256 = 3; }
+
+message PrepareWorkspace {
+  BlobRef bundle = 1;
+  string repo_id = 2;
+  string base = 3;
+  string branch = 4;
+  SandboxProfile profile = 5;
+}
+
+message Exec {
+  repeated string argv = 1;
+  string cwd = 2;
+  map<string, string> env = 3;
+  bytes stdin = 4;
+  uint32 timeout_ms = 5;
+  uint32 output_cap = 6;
+}
+
+message ReadFiles { repeated FileRange files = 1; }
+message WriteFiles { repeated FileBody files = 1; }
+
+message EditFile {
+  string path = 1;
+  string old = 2;
+  string new = 3;
+  bool replace_all = 4;
+}
+
+message Glob { string pattern = 1; string cwd = 2; uint32 limit = 3; }
+message Grep {
+  string pattern = 1;
+  string path = 2;
+  string glob = 3;
+  bool ignore_case = 4;
+  uint32 context = 5;
+  uint32 limit = 6;
+}
+message Commit { string message = 1; }
+message Collect { string base = 1; }
+message Cleanup { bool keep_cache = 1; }
+
+message Command {
+  string command_id = 1;
+  string subtask_id = 2;
+  string workspace = 3;
+  oneof op {
+    PrepareWorkspace prepare = 10;
+    Exec exec = 11;
+    ReadFiles read = 12;
+    WriteFiles write = 13;
+    EditFile edit = 14;
+    Glob glob = 15;
+    Grep grep = 16;
+    Commit commit = 17;
+    Collect collect = 18;
+    Cleanup cleanup = 19;
+  }
+}
+
+message OutputChunk {
+  string command_id = 1;
+  StreamKind stream = 2;
+  bytes data = 3;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message ExecDone {
+  int32 exit_code = 1;
+  int32 signal = 2;
+  bool timed_out = 3;
+  bool killed = 4;
+  bytes stdout_tail = 5;
+  bytes stderr_tail = 6;
+  bool truncated = 7;
+  uint64 took_ms = 8;
+  uint64 peak_memory = 9;
+}
+
+message FilesRead { repeated FileBody files = 1; }
+message Written { repeated string paths = 1; }
+message Edited { string path = 1; uint32 replacements = 2; }
+message Matches { repeated string lines = 1; bool truncated = 2; }
+message Committed { string oid = 1; }
+message Done { bool ok = 1; }
+
+message CommandResult {
+  string command_id = 1;
+  oneof result {
+    ExecDone exec = 10;
+    FilesRead read = 11;
+    Written written = 12;
+    Edited edited = 13;
+    Matches matches = 14;
+    Committed committed = 15;
+    BlobRef collected = 16;
+    Done done = 17;
+    Error error = 18;
+  }
+}

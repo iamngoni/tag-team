@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "type": "start",
+  "subtask": "01JY0000000000000000000001",
+  "prompt": "Fix the flaky test and prove it with cargo test.",
+  "system_append": "You run on behalf of the main Tag Team session.",
+  "cwd": "/Users/example/project",
+  "max_turns": 60,
+  "wall_clock_ms": 2700000,
+  "tool_timeout_ms": 660000,
+  "resume": null
+}
