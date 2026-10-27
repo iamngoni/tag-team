@@ -6,13 +6,37 @@
 use tagteam_node::{CommandJournal, CommandRunner};
 use tagteam_sandbox::CancellationToken;
 
+fn sandbox_runtime_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::path::Path;
+
+        if !Path::new("/usr/bin/systemd-run").exists()
+            || !Path::new("/usr/bin/bwrap").exists()
+            || std::env::var_os("XDG_RUNTIME_DIR").is_none()
+            || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
+        {
+            return false;
+        }
+        std::process::Command::new("/usr/bin/systemd-run")
+            .args(["--user", "--scope", "--quiet", "--", "/usr/bin/true"])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 #[tokio::test]
 async fn exec_command_runs_through_spawn_confined() {
-    if cfg!(target_os = "linux")
-        && (!std::path::Path::new("/usr/bin/systemd-run").exists()
-            || !std::path::Path::new("/usr/bin/bwrap").exists())
-    {
-        eprintln!("sandbox tools unavailable; confined Exec path not available on this Linux host");
+    if !sandbox_runtime_available() {
+        let message = "a working Linux user systemd manager, /usr/bin/systemd-run, and /usr/bin/bwrap are required; skipping confined Exec test";
+        if std::env::var_os("TAGTEAM_REQUIRE_LINUX_SANDBOX").is_some() {
+            panic!("{message}");
+        }
+        eprintln!("{message}");
         return;
     }
 
