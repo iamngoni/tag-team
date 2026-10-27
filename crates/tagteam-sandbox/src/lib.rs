@@ -596,6 +596,12 @@ fn spawn_confined_blocking(
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(target_os = "linux")]
+    for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
     for (key, value) in &profile.environment {
         command.env(key, value);
     }
