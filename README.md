@@ -838,7 +838,7 @@ The original custom-channel design is not implemented. Answer and steering deliv
 
 1. A journal state change and its event commit in the same SQLite WAL transaction.
 2. Every runner-requested Bash, Read, Write, Edit, Glob, or Grep operation becomes an idempotent node command. Bash and filesystem helpers execute through the macOS Seatbelt or Linux bubblewrap sandbox. Workspace preparation, collection, and cleanup remain node-controlled lifecycle operations with path, digest, and size checks.
-3. The runner allow-list is enforced in layers: `allowedTools`, `disallowedTools`, `canUseTool`, a `PreToolUse` hook, and `permission_policy: "always_ask"` on every remote tool. `settingSources` is `[]`, so user/project/local Claude settings and hooks cannot override Tag Team policy.
+3. The runner allow-list is enforced by `allowedTools`, `disallowedTools`, a `PreToolUse` hook, and `permission_policy: "always_ask"` on every remote tool. The SDK auto-approves bare `allowedTools` entries before `canUseTool`, so `PreToolUse` is the effective per-call gate; `canUseTool` remains a fallback for tools outside that list. `settingSources` is `[]`, so user/project/local Claude settings and hooks cannot override Tag Team policy.
 4. The node receives the owner's `NodePolicy` in the authenticated Hello. It independently rejects repositories outside `allowed_repo_ids`, resource profiles above local `max_cores`/`max_memory`, oversized egress lists, and malformed exact DNS hosts. The hub also schedules against node capacity, owner hours, battery state, repository head, and toolchain requirements.
 5. Every node action is idempotent by `command_id`. A completed result survives reconnect; an interrupted pre-result command becomes a durable non-retryable failure instead of remaining `InProgress` forever.
 6. Result branches are never merged automatically. The hub verifies bundle digest and connectivity, checks ancestry, enforces the aggregate patch limit for every command path including Bash, re-runs `done_when`, and only then creates the review branch.
@@ -989,6 +989,8 @@ The live runner acceptance is opt-in because it spends provider tokens and requi
 TAGTEAM_LIVE_SDK=1 ./scripts/acceptance-live-sdk.sh
 ```
 
+Set `CLAUDE_CONFIG_DIR` to select a signed-in Claude Code profile when needed. The test confirms the model calls the exact `Finish` payload and simulates the hub’s post-Finish termination by closing the runner input after acknowledging that call.
+
 ### Verified in this checkpoint
 
 On 2026-10-27, a local macOS arm64 run produced:
@@ -998,15 +1000,16 @@ On 2026-10-27, a local macOS arm64 run produced:
 - `cargo test --workspace`: all tests passed, including the real loopback execution spine, macOS exec and egress confinement, sandbox escape tests, and two-node recovery;
 - `./scripts/acceptance-loopback.sh`: passed in full;
 - `pnpm -C runner typecheck`: passed;
-- `pnpm -C runner test`: 9 passed, 1 live-SDK test skipped by opt-in guard;
+- `pnpm -C runner test`: 9 passed, 1 live-SDK test skipped by the opt-in guard; the live test was then run separately and passed;
 - `swift test --package-path apps/tagteam-menubar`: 8 passed;
-- menu-bar app bundle build, ad-hoc codesign verification, and Info.plist lint: passed.
+- menu-bar app bundle build, ad-hoc codesign verification, and Info.plist lint: passed;
+- live Agent SDK acceptance: passed at 2026-10-27 19:38 SAST; the model called `Finish` exactly once with outcome `no_change`, summary `live SDK acceptance passed`, and empty assumptions/checks; the runner exited `success` with `cost_usd: null` because the hub terminates the runner immediately after `Finish`.
 
 ### Not verified
 
 These are separate proof boundaries, not extensions of the local result:
 
-- a live signed-in Claude Agent SDK/model run (`live-sdk.test.ts` was skipped; provider quota blocked it);
+- full live Agent SDK conversation behavior beyond the bounded `Finish` call, including questions, steering, and model continuation across a real session;
 - two real machines over a tailnet; the recovery proof is a loopback hub with two node identities;
 - Linux runtime and sandbox acceptance; Linux logic is compiled and tested, but this checkpoint ran on macOS;
 - a deployed hub with tailnet-only ingress, service hardening, and production DNS/TLS;

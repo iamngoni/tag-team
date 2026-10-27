@@ -36,8 +36,10 @@ test.skipIf(!liveEnabled)(
 
     let ready = false;
     let finished = false;
+    let finishCalls = 0;
+    let finishCall: { outcome?: string; summary?: string; assumptions?: unknown[]; checks?: unknown[] } | undefined;
     let rateLimited = false;
-    let exited: { subtype?: string; error?: string | null; cost_usd?: number | null } | undefined;
+    let exited: { subtype?: string; error?: string | null; cost_usd?: number | null; session_id?: string | null } | undefined;
 
     while (true) {
       const next = await iterator.next();
@@ -48,7 +50,7 @@ test.skipIf(!liveEnabled)(
         error?: string | null;
         cost_usd?: number | null;
         call_id?: string;
-        call?: { tool?: string };
+        call?: { tool?: string; outcome?: string; summary?: string; assumptions?: unknown[]; checks?: unknown[] };
       };
       if (message.type === "ready") {
         ready = true;
@@ -64,6 +66,8 @@ test.skipIf(!liveEnabled)(
         if (!callId) throw new Error("live tool call is missing call_id");
         if (message.call?.tool === "finish") {
           finished = true;
+          finishCalls += 1;
+          finishCall = message.call;
           input.write(`${JSON.stringify({
             v: 2,
             type: "tool_result",
@@ -80,6 +84,9 @@ test.skipIf(!liveEnabled)(
             is_error: true,
           })}\n`);
         }
+        // The hub terminates the runner after accepting Finish. Close stdin
+        // to reproduce that boundary instead of waiting for another model turn.
+        input.end();
       } else if (message.type === "exited") {
         exited = message;
         break;
@@ -88,7 +95,6 @@ test.skipIf(!liveEnabled)(
 
     await runner;
     outputLines.close();
-    input.end();
 
     expect(
       rateLimited,
@@ -96,8 +102,18 @@ test.skipIf(!liveEnabled)(
     ).toBe(false);
     expect(ready, "the live SDK must complete its protocol handshake").toBe(true);
     expect(finished, "the model must call the remote Finish tool exactly as asked").toBe(true);
+    expect(finishCalls, "the model must call Finish exactly once").toBe(1);
+    expect(finishCall?.outcome).toBe("no_change");
+    expect(finishCall?.summary).toBe("live SDK acceptance passed");
+    expect(finishCall?.assumptions).toEqual([]);
+    expect(finishCall?.checks).toEqual([]);
     expect(exited?.subtype, exited?.error ?? "live SDK did not exit successfully").toBe("success");
-    expect(typeof exited?.cost_usd, "the live SDK must report provider cost").toBe("number");
+    console.info(JSON.stringify({
+      live_sdk: "passed",
+      session_id: exited?.session_id ?? null,
+      cost_usd: exited?.cost_usd ?? null,
+      finish_call: finishCall,
+    }));
   },
   180_000,
 );
