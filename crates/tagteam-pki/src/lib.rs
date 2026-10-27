@@ -2,7 +2,7 @@
 
 use std::{
     fs, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -10,9 +10,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use data_encoding::BASE32_NOPAD;
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, CertifiedIssuer,
-    DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
-    PKCS_ED25519,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
+    DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ED25519,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -46,6 +45,8 @@ pub enum PkiError {
     EmptyPrivateKey,
     #[error("system clock is before the Unix epoch")]
     InvalidClock(#[from] std::time::SystemTimeError),
+    #[error("hub CA material is incomplete or inconsistent")]
+    InvalidCaMaterial(&'static str),
     #[error("key storage I/O failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -379,8 +380,13 @@ fn validate_address(address: &str) -> Result<(), PkiError> {
 }
 
 /// Private hub CA and the signing key kept in memory by the hub process.
+///
+/// The certificate and key are persisted as PEM files by [`HubCa::load_or_generate`].
+/// The private-key file must be owned by the hub account and have no group or other
+/// permissions; an existing CA is never silently replaced.
 pub struct HubCa {
-    issuer: CertifiedIssuer<'static, KeyPair>,
+    certificate_der: Vec<u8>,
+    issuer: Issuer<'static, KeyPair>,
 }
 
 impl HubCa {
@@ -393,12 +399,78 @@ impl HubCa {
             .push(DnType::CommonName, "Tag Team Private Hub CA");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        let issuer = CertifiedIssuer::self_signed(params, key_pair)?;
-        Ok(Self { issuer })
+        let certificate = params.clone().self_signed(&key_pair)?;
+        let certificate_der = certificate.der().as_ref().to_vec();
+        Ok(Self {
+            certificate_der,
+            issuer: Issuer::new(params, key_pair),
+        })
+    }
+
+    /// Loads the persisted CA, or creates it exactly once when both files are absent.
+    ///
+    /// A half-written or unreadable CA fails closed. The key permissions are checked
+    /// before the key is parsed, and the certificate/key pair is proven by signing and
+    /// verifying a throwaway node certificate.
+    pub fn load_or_generate(
+        certificate_path: impl AsRef<Path>,
+        private_key_path: impl AsRef<Path>,
+    ) -> Result<Self, PkiError> {
+        let certificate_path = certificate_path.as_ref();
+        let private_key_path = private_key_path.as_ref();
+        let certificate_exists = regular_file_exists(certificate_path)?;
+        let key_exists = regular_file_exists(private_key_path)?;
+        match (certificate_exists, key_exists) {
+            (true, true) => Self::load(certificate_path, private_key_path),
+            (false, false) => {
+                let ca = Self::generate()?;
+                persist_ca(certificate_path, private_key_path, &ca)?;
+                Ok(ca)
+            }
+            _ => Err(PkiError::InvalidCaMaterial(
+                "certificate and private key must either both exist or both be absent",
+            )),
+        }
+    }
+
+    /// Loads and validates a persisted CA without creating replacement material.
+    pub fn load(
+        certificate_path: impl AsRef<Path>,
+        private_key_path: impl AsRef<Path>,
+    ) -> Result<Self, PkiError> {
+        let certificate_pem = read_regular_file(certificate_path.as_ref())?;
+        let (_, certificate) = x509_parser::pem::parse_x509_pem(&certificate_pem)
+            .map_err(|_| PkiError::InvalidCaMaterial("CA certificate PEM is invalid"))?;
+        if certificate.label != "CERTIFICATE" || certificate.contents.is_empty() {
+            return Err(PkiError::InvalidCaMaterial(
+                "CA file does not contain a certificate",
+            ));
+        }
+        let certificate_der = certificate.contents;
+        let private_key_pem = read_private_key(private_key_path.as_ref())?;
+        let key_pair = KeyPair::from_pkcs8_pem_and_sign_algo(&private_key_pem, &PKCS_ED25519)
+            .map_err(|_| PkiError::InvalidCaMaterial("CA private key is invalid"))?;
+        let issuer = Issuer::from_ca_cert_der(
+            &rustls::pki_types::CertificateDer::from(certificate_der.clone()),
+            key_pair,
+        )
+        .map_err(|_| PkiError::InvalidCaMaterial("CA certificate is invalid"))?;
+        let ca = Self {
+            certificate_der,
+            issuer,
+        };
+        let proof = NodeKeyRequest::generate("tagteam-hub-ca-load-proof")?;
+        let certificate = ca.sign_node_csr(&proof.csr_der)?;
+        ca.verify_issued_certificate(&certificate)?;
+        Ok(ca)
     }
 
     pub fn certificate_der(&self) -> &[u8] {
-        self.issuer.der().as_ref()
+        &self.certificate_der
+    }
+
+    pub fn certificate_pem(&self) -> String {
+        encode_pem("CERTIFICATE", self.certificate_der())
     }
 
     pub fn fingerprint(&self) -> CertificateFingerprint {
@@ -433,10 +505,8 @@ impl HubCa {
         params.crl_distribution_points.clear();
         params.custom_extensions.clear();
         params.use_authority_key_identifier_extension = true;
-        let issuer = Issuer::from_ca_cert_der(self.issuer.der(), self.issuer.key())
-            .map_err(PkiError::Certificate)?;
         let certificate = csr
-            .signed_by(&issuer)
+            .signed_by(&self.issuer)
             .map_err(|error| PkiError::InvalidCsr(error.to_string()))?;
         Ok(certificate.der().as_ref().to_vec())
     }
@@ -445,6 +515,98 @@ impl HubCa {
     pub fn verify_issued_certificate(&self, certificate_der: &[u8]) -> Result<(), PkiError> {
         verify_chain(certificate_der, self.certificate_der())
     }
+}
+
+fn persist_ca(
+    certificate_path: &Path,
+    private_key_path: &Path,
+    ca: &HubCa,
+) -> Result<(), PkiError> {
+    if let Some(parent) = certificate_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = private_key_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_new_file(certificate_path, ca.certificate_pem().as_bytes(), 0o644)?;
+    write_new_file(
+        private_key_path,
+        ca.issuer.key().serialize_pem().as_bytes(),
+        0o600,
+    )?;
+    Ok(())
+}
+
+fn write_new_file(path: &Path, contents: &[u8], mode: u32) -> Result<(), PkiError> {
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    io::Write::write_all(&mut file, contents)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn regular_file_exists(path: &Path) -> Result<bool, PkiError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                Err(PkiError::InvalidCaMaterial(
+                    "CA material must be a regular file",
+                ))
+            } else {
+                Ok(true)
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_regular_file(path: &Path) -> Result<Vec<u8>, PkiError> {
+    if !regular_file_exists(path)? {
+        return Err(PkiError::InvalidCaMaterial("CA material is missing"));
+    }
+    Ok(fs::read(path)?)
+}
+
+fn read_private_key(path: &Path) -> Result<String, PkiError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(PkiError::InvalidCaMaterial(
+                "CA private key must be a regular file",
+            ));
+        }
+        if metadata.permissions().mode() & 0o777 & !0o600 != 0 {
+            return Err(PkiError::InsecureKeyPermissions);
+        }
+    }
+    String::from_utf8(read_regular_file(path)?)
+        .map_err(|_| PkiError::InvalidCaMaterial("CA private key is not UTF-8 PEM"))
+}
+
+fn encode_pem(label: &str, der: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = format!("-----BEGIN {label}-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        pem.extend(chunk.iter().map(|byte| char::from(*byte)));
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {label}-----\n"));
+    pem
 }
 
 /// DER certificate and PKCS#8 private key, returned when generating a server identity.
@@ -891,6 +1053,57 @@ mod tests {
             ca.certificate_der()
         ));
         assert_eq!(fingerprint.to_hex().len(), 64);
+    }
+
+    #[test]
+    fn persisted_ca_round_trips_and_keeps_its_fingerprint() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let certificate = directory.path().join("ca.pem");
+        let key = directory.path().join("ca-key.pem");
+        let generated = HubCa::load_or_generate(&certificate, &key).expect("generate CA");
+        let fingerprint = generated.fingerprint();
+        let loaded = HubCa::load_or_generate(&certificate, &key).expect("load CA");
+        assert_eq!(loaded.fingerprint(), fingerprint);
+        assert_eq!(loaded.certificate_der(), generated.certificate_der());
+        let request = NodeKeyRequest::generate("restart-proof").expect("key request");
+        let leaf = loaded
+            .sign_node_csr(&request.csr_der)
+            .expect("sign after reload");
+        loaded
+            .verify_issued_certificate(&leaf)
+            .expect("chain after reload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_ca_requires_a_private_key_and_complete_material() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let certificate = directory.path().join("ca.pem");
+        let key = directory.path().join("ca-key.pem");
+        HubCa::load_or_generate(&certificate, &key).expect("generate CA");
+        assert_eq!(
+            fs::metadata(&key)
+                .expect("key metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o640)).expect("broaden key");
+        assert!(matches!(
+            HubCa::load(&certificate, &key),
+            Err(PkiError::InsecureKeyPermissions)
+        ));
+
+        let other = tempfile::tempdir().expect("tempdir");
+        let lone_certificate = other.path().join("ca.pem");
+        let lone_key = other.path().join("ca-key.pem");
+        fs::write(&lone_certificate, b"not a CA").expect("partial material");
+        assert!(matches!(
+            HubCa::load_or_generate(&lone_certificate, &lone_key),
+            Err(PkiError::InvalidCaMaterial(_))
+        ));
     }
 
     #[cfg(unix)]

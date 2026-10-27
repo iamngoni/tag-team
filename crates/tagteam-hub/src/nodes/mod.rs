@@ -75,6 +75,15 @@ impl NodePlane {
         blob_root: impl AsRef<Path>,
         ca: HubCa,
     ) -> Result<Self, NodePlaneError> {
+        Self::with_ca(journal_path, blob_root, Arc::new(ca)).await
+    }
+
+    /// Opens the node plane with an already-loaded hub CA shared by the local API.
+    pub async fn with_ca(
+        journal_path: impl AsRef<Path>,
+        blob_root: impl AsRef<Path>,
+        ca: Arc<HubCa>,
+    ) -> Result<Self, NodePlaneError> {
         let journal_path = journal_path.as_ref().to_path_buf();
         let blob_root = blob_root.as_ref().to_path_buf();
         let blob_root_for_open = blob_root.clone();
@@ -88,11 +97,20 @@ impl NodePlane {
             inner: Arc::new(Inner {
                 journal: Mutex::new(journal),
                 blob_root,
-                ca: Arc::new(ca),
+                ca,
                 sessions: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
             }),
         })
+    }
+
+    /// Returns whether a node currently has a live session.
+    pub fn is_online(&self, node_id: NodeId) -> bool {
+        self.inner
+            .sessions
+            .lock()
+            .map(|sessions| sessions.contains_key(&node_id))
+            .unwrap_or(false)
     }
 
     /// Sends one durable command to the node and waits for its first result.
@@ -399,6 +417,31 @@ impl Hub for NodeService {
         if let Some(previous) = previous {
             previous.cancel.send_replace(true);
         }
+        // Replay after returning the response stream. Sending an unbounded set of
+        // journaled commands through the bounded channel before the node can consume
+        // the response would deadlock once the channel fills.
+        let replay_inner = Arc::clone(&self.inner);
+        let replay_sender = sender.clone();
+        tokio::spawn(async move {
+            let pending = match load_pending_commands(&replay_inner, id).await {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::warn!(%error, %id, "could not load pending node commands");
+                    return;
+                }
+            };
+            for command in pending {
+                if replay_sender
+                    .send(Ok(HubMessage {
+                        msg: Some(hub_message::Msg::Command(command)),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
             let mut cancellation = cancellation;
@@ -853,6 +896,41 @@ fn result_from_json(value: &serde_json::Value) -> Result<proto::CommandResult, N
         .map_err(|_| NodePlaneError::Protocol("stored command result is not base64".into()))?;
     proto::CommandResult::decode(bytes.as_slice())
         .map_err(|_| NodePlaneError::Protocol("stored command result is invalid protobuf".into()))
+}
+
+async fn load_pending_commands(
+    inner: &Arc<Inner>,
+    node_id: NodeId,
+) -> Result<Vec<proto::Command>, Status> {
+    let worker_inner = Arc::clone(inner);
+    tokio::task::spawn_blocking(move || {
+        let journal = worker_inner
+            .journal
+            .lock()
+            .map_err(|_| Status::internal("journal lock is unavailable"))?;
+        let commands = journal.pending_commands(node_id).map_err(journal_status)?;
+        commands
+            .into_iter()
+            .map(|command| command_from_json(&command.operation))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| Status::internal("stored command is malformed"))
+    })
+    .await
+    .map_err(|_| Status::internal("pending command worker stopped"))?
+}
+
+fn command_from_json(value: &serde_json::Value) -> Result<proto::Command, NodePlaneError> {
+    use base64::Engine as _;
+    use prost::Message as _;
+    let encoded = value
+        .get("proto_b64")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| NodePlaneError::Protocol("stored command is malformed".into()))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| NodePlaneError::Protocol("stored command is not base64".into()))?;
+    proto::Command::decode(bytes.as_slice())
+        .map_err(|_| NodePlaneError::Protocol("stored command is invalid protobuf".into()))
 }
 
 #[cfg(test)]

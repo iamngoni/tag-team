@@ -17,10 +17,10 @@ use tonic::{
 };
 
 use super::{
-    NodePlane, certificate_pem, chunk, private_key_pem,
+    NodePlane, certificate_pem, chunk, json_command, private_key_pem,
     proto::{self, hub_client::HubClient},
 };
-use crate::journal::Journal;
+use crate::journal::{Command as JournalCommand, Journal};
 
 fn sample_node(id: NodeId, name: &str, certificate: [u8; 32]) -> Node {
     Node {
@@ -489,6 +489,78 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
         })) if state == proto::NodeState::Active as i32 && !session_id.is_empty()
     ));
 
+    let replay_subtask = tagteam_core::SubtaskId::new();
+    let replay_dispatch = tagteam_core::DispatchId::new();
+    let replay_total = 24_u32;
+    tokio::task::spawn_blocking({
+        let path = directory.path().join("journal.sqlite");
+        move || {
+            let mut journal = Journal::open(path).expect("journal");
+            let dispatch = tagteam_core::Dispatch {
+                id: replay_dispatch,
+                main_session: tagteam_core::MainSessionId::new(),
+                claude_session: None,
+                repo: std::path::PathBuf::from("/workspace/repo"),
+                created: Timestamp(1),
+            };
+            journal.create_dispatch(&dispatch).expect("store dispatch");
+            journal
+                .create_subtask(&tagteam_core::Subtask {
+                    id: replay_subtask,
+                    dispatch: replay_dispatch,
+                    spec: tagteam_core::SubtaskSpec {
+                        title: "replay".into(),
+                        prompt: "replay pending commands".into(),
+                        done_when: Vec::new(),
+                        repo: std::path::PathBuf::from("/workspace/repo"),
+                        base_ref: "main".into(),
+                        include_uncommitted: false,
+                        needs: tagteam_core::Needs::default(),
+                        limits: tagteam_core::Limits::default(),
+                        egress: Vec::new(),
+                        node_hint: None,
+                    },
+                    state: tagteam_core::SubtaskState::Queued,
+                    node: None,
+                    attempt: 0,
+                    base: tagteam_core::GitOid("0123456789012345678901234567890123456789".into()),
+                    repo_id: tagteam_core::RepoId(tagteam_core::GitOid(
+                        "1123456789012345678901234567890123456789".into(),
+                    )),
+                    branch: "tagteam/replay".into(),
+                    runner_session: None,
+                    created: Timestamp(2),
+                    started: None,
+                    finished: None,
+                    usage: tagteam_core::Usage::default(),
+                })
+                .expect("store subtask");
+            for index in 0..replay_total {
+                let command = proto::Command {
+                    command_id: format!("replay-{index:02}"),
+                    subtask_id: replay_subtask.to_string(),
+                    workspace: "workspace".into(),
+                    op: Some(proto::command::Op::Cleanup(proto::Cleanup {
+                        keep_cache: false,
+                    })),
+                };
+                journal
+                    .store_command(&JournalCommand {
+                        id: command.command_id.clone(),
+                        node_id: id,
+                        subtask_id: replay_subtask,
+                        operation: json_command(&command).expect("encode command"),
+                        state: "pending".into(),
+                        result: None,
+                        sent_at: Some(Timestamp(i64::from(index))),
+                        done_at: None,
+                    })
+                    .expect("store pending command");
+            }
+        }
+    })
+    .await
+    .expect("pending command seed");
     let (second_sender, second_messages) = tokio::sync::mpsc::channel(4);
     second_sender
         .send(proto::NodeMessage {
@@ -501,11 +573,14 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
         })
         .await
         .expect("send replacement Hello");
-    let mut second_session = hub
-        .session(tokio_stream::wrappers::ReceiverStream::new(second_messages))
-        .await
-        .expect("replacement session")
-        .into_inner();
+    let mut second_session = tokio::time::timeout(
+        Duration::from_secs(2),
+        hub.session(tokio_stream::wrappers::ReceiverStream::new(second_messages)),
+    )
+    .await
+    .expect("bounded replay must not block the session response")
+    .expect("replacement session")
+    .into_inner();
     let welcome = second_session
         .message()
         .await
@@ -518,6 +593,24 @@ async fn loopback_mtls_enrolls_and_authenticates_blob_calls() {
             ..
         }))
     ));
+    let mut replayed = Vec::new();
+    for _ in 0..replay_total {
+        let message = tokio::time::timeout(Duration::from_secs(2), second_session.message())
+            .await
+            .expect("replay command arrives")
+            .expect("replay stream remains open")
+            .expect("replay command");
+        let Some(proto::hub_message::Msg::Command(command)) = message.msg else {
+            panic!("expected a replayed command");
+        };
+        replayed.push(command.command_id);
+    }
+    replayed.sort();
+    let mut expected = (0..replay_total)
+        .map(|index| format!("replay-{index:02}"))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(replayed, expected);
     second_sender
         .send(proto::NodeMessage {
             msg: Some(proto::node_message::Msg::Heartbeat(proto::Heartbeat {

@@ -1594,6 +1594,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "x509-parser",
 ]
 
 [[package]]
