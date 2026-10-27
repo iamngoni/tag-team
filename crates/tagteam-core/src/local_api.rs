@@ -7,6 +7,9 @@ use crate::{
     schedule::Placement,
 };
 
+/// Version carried by the private CLI/MCP attach handshake.
+pub const LOCAL_PROTOCOL_VERSION: u8 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "scope", content = "id", rename_all = "snake_case")]
 pub enum WatchScope {

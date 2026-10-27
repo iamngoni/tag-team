@@ -15,9 +15,13 @@ tagteam-proto = { path = "../tagteam-proto" }
 tagteam-pki = { path = "../tagteam-pki" }
 tagteam-sandbox = { path = "../tagteam-sandbox" }
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
+sha2.workspace = true
+prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

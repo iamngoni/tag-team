@@ -41,10 +41,7 @@ impl Service<Uri> for TlsService {
                 io::Error::new(io::ErrorKind::InvalidInput, "hub address is invalid")
             })?;
             let host = authority.host();
-            let port = match authority.port_u16() {
-                Some(port) => port,
-                None => 443,
-            };
+            let port = authority.port_u16().unwrap_or(443);
             let socket = TcpStream::connect((host, port)).await?;
             let server_name = ServerName::try_from(SERVICE_DNS_NAME.to_owned()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "hub service name is invalid")

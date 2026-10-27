@@ -31,6 +31,7 @@ pub enum ConfigError {
 #[derive(Debug, Clone)]
 pub struct HubConfig {
     pub listen: SocketAddr,
+    pub public_address: String,
     pub data_dir: PathBuf,
     pub max_concurrent_per_account: usize,
     pub runner_program: String,
@@ -43,6 +44,7 @@ pub struct HubConfig {
 #[serde(deny_unknown_fields)]
 struct HubFile {
     listen: Option<String>,
+    public_address: Option<String>,
     data_dir: Option<PathBuf>,
     max_concurrent_per_account: Option<usize>,
     runner_program: Option<String>,
@@ -80,6 +82,7 @@ impl HubConfig {
             }
             None => HubFile {
                 listen: None,
+                public_address: None,
                 data_dir: None,
                 max_concurrent_per_account: None,
                 runner_program: None,
@@ -98,6 +101,16 @@ impl HubConfig {
             .unwrap_or(DEFAULT_LISTEN)
             .parse()
             .map_err(|_| ConfigError::Invalid("listen must be a socket address".into()))?;
+        let default_public_address = format!("https://{listen}");
+        let public_address = raw.public_address.unwrap_or(default_public_address);
+        tagteam_pki::Invite::new(
+            public_address.clone(),
+            tagteam_pki::CertificateFingerprint::from_certificate(b"configuration-validation"),
+            [0; 32],
+        )
+        .map_err(|_| {
+            ConfigError::Invalid("public_address must be a valid https:// host:port address".into())
+        })?;
         let data_dir = expand_path(
             raw.data_dir
                 .unwrap_or_else(|| PathBuf::from("~/.local/share/tagteam")),
@@ -109,7 +122,7 @@ impl HubConfig {
             ));
         }
         let heartbeat_timeout = raw.heartbeat_timeout_seconds.unwrap_or(90);
-        if heartbeat_timeout < 15 || heartbeat_timeout > 3_600 {
+        if !(15..=3_600).contains(&heartbeat_timeout) {
             return Err(ConfigError::Invalid(
                 "heartbeat_timeout_seconds must be between 15 and 3600".into(),
             ));
@@ -149,6 +162,7 @@ impl HubConfig {
         }
         Ok(Self {
             listen,
+            public_address,
             data_dir,
             max_concurrent_per_account: concurrency,
             runner_program,

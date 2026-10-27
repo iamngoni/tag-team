@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 tagteam-core = { path = "../tagteam-core" }
 tagteam-pki = { path = "../tagteam-pki" }
+tagteam-git = { path = "../tagteam-git" }
 tagteam-proto = { path = "../tagteam-proto" }
 anyhow.workspace = true
 clap.workspace = true
@@ -25,6 +26,10 @@ sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 data-encoding.workspace = true
+getrandom.workspace = true
+nix.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
 tonic.workspace = true
 prost.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }

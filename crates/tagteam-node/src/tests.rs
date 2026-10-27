@@ -11,7 +11,9 @@ use tagteam_hub::{journal::Journal, nodes::NodePlane};
 use tagteam_pki::{CertificateFingerprint, HubCa, Invite};
 use tokio::{sync::oneshot, time::timeout};
 
-use crate::{HeartbeatSource, NodeEnrollment, NodeSession, SessionEvent};
+use crate::{
+    FileIdentityStore, HeartbeatSource, IdentityStore, NodeEnrollment, NodeSession, SessionEvent,
+};
 
 struct StaticHeartbeat;
 
@@ -101,6 +103,38 @@ async fn enrollment_verifies_pinned_ca_and_returns_matching_certificate_identity
     assert!(!identity.private_key_der.is_empty());
     assert_eq!(identity.hub_fingerprint, fingerprint);
     assert_eq!(identity.hub_address, format!("https://{address}"));
+    let identity_dir = directory.path().join("node-data");
+    let identity_store = FileIdentityStore::new(&identity_dir);
+    identity_store
+        .persist(&identity)
+        .expect("identity persists");
+    let (stored_invite, restored) = identity_store
+        .load()
+        .expect("identity loads")
+        .expect("identity exists");
+    assert_eq!(stored_invite, invite);
+    assert_eq!(restored.node_id, identity.node_id);
+    assert_eq!(restored.certificate_der, identity.certificate_der);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&identity_dir)
+                .expect("data dir metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(identity_dir.join("identity.json"))
+                .expect("identity metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     let saved_node = Journal::open(directory.path().join("journal.sqlite"))
         .expect("open journal")
         .load_node(identity.node_id)

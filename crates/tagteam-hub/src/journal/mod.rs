@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tagteam_core::{
-    CachedRepo, Capacity, Dispatch, DispatchId, Event, EventKind, GitOid, Node, NodeId, NodePolicy,
-    NodeState, OwnerPresence, Platform, RepoId, ResultSummary, Subtask, SubtaskId, SubtaskState,
-    Timestamp, Toolchain, Usage,
+    CachedRepo, Capacity, Dispatch, DispatchId, Event, EventKind, GitOid, MainSessionId, Node,
+    NodeId, NodePolicy, NodeState, OwnerPresence, Platform, RepoId, ResultSummary, Subtask,
+    SubtaskId, SubtaskState, Timestamp, Toolchain, Usage,
     state::{self, IllegalTransition, SubtaskInput},
 };
 use thiserror::Error;
@@ -567,6 +567,29 @@ impl Journal {
         }
         self.connection.execute("INSERT INTO dispatches(id,main_session,claude_session,repo,created_at) VALUES (?1,?2,?3,?4,?5)", params![dispatch.id.to_string(),dispatch.main_session.to_string(),dispatch.claude_session,dispatch.repo.to_string_lossy(),dispatch.created.0])?;
         Ok(())
+    }
+
+    /// Loads the dispatch record that owns a subtask or main-session hint.
+    pub fn load_dispatch(&self, id: DispatchId) -> Result<Option<Dispatch>, JournalError> {
+        let raw: Option<(String, Option<String>, String, i64)> = self
+            .connection
+            .query_row(
+                "SELECT main_session,claude_session,repo,created_at FROM dispatches WHERE id=?1",
+                [id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        raw.map(|(session, claude_session, repo, created)| {
+            Ok(Dispatch {
+                id,
+                main_session: MainSessionId::from_str(&session)
+                    .map_err(|error| JournalError::IdempotencyConflict(error.to_string()))?,
+                claude_session,
+                repo: std::path::PathBuf::from(repo),
+                created: Timestamp(created),
+            })
+        })
+        .transpose()
     }
 
     /// Stores a new queued work item idempotently by subtask ID.

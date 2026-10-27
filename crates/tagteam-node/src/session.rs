@@ -22,12 +22,17 @@ pub trait HeartbeatSource: Send + Sync + 'static {
     fn heartbeat(&self) -> tagteam_proto::v1::Heartbeat;
 }
 
+/// Provides current durable command results when each reconnect Hello is built.
+pub trait PendingResultSource: Send + Sync + 'static {
+    fn pending_results(&self) -> Result<Vec<tagteam_proto::v1::CommandAck>, SessionError>;
+}
+
 /// Session inputs copied into each reconnect's initial Hello message.
 pub struct NodeSession {
     identity: NodeIdentity,
     version: String,
     workspaces: Vec<String>,
-    pending: Vec<tagteam_proto::v1::CommandAck>,
+    pending: Arc<dyn PendingResultSource>,
     heartbeat_source: Arc<dyn HeartbeatSource>,
     reconnect: ReconnectPolicy,
 }
@@ -38,7 +43,7 @@ impl NodeSession {
             identity,
             version: NODE_VERSION.to_owned(),
             workspaces: Vec::new(),
-            pending: Vec::new(),
+            pending: Arc::new(StaticPending(Vec::new())),
             heartbeat_source: Arc::new(heartbeat_source),
             reconnect: ReconnectPolicy::default(),
         }
@@ -52,7 +57,12 @@ impl NodeSession {
     ) -> Self {
         self.version = version.into();
         self.workspaces = workspaces;
-        self.pending = pending;
+        self.pending = Arc::new(StaticPending(pending));
+        self
+    }
+
+    pub fn pending_source(mut self, source: impl PendingResultSource) -> Self {
+        self.pending = Arc::new(source);
         self
     }
 
@@ -126,16 +136,7 @@ impl NodeSession {
             .map_err(|_| SessionError::Channel)?;
         let (stream_sender, stream_receiver) = mpsc::channel(MESSAGE_CAPACITY);
         stream_sender
-            .send(tagteam_proto::v1::NodeMessage {
-                msg: Some(tagteam_proto::v1::node_message::Msg::Hello(
-                    tagteam_proto::v1::Hello {
-                        node_id: self.identity.node_id.to_string(),
-                        version: self.version.clone(),
-                        workspaces: self.workspaces.clone(),
-                        pending: self.pending.clone(),
-                    },
-                )),
-            })
+            .send(self.hello_message()?)
             .await
             .map_err(|_| SessionError::Channel)?;
         let mut client = tagteam_proto::v1::hub_client::HubClient::new(channel);
@@ -192,7 +193,7 @@ impl NodeSession {
                 message = incoming.message() => match message {
                     Ok(Some(message)) => {
                         let event = match message.msg {
-                            Some(tagteam_proto::v1::hub_message::Msg::Command(value)) => Some(SessionEvent::Command(value)),
+                            Some(tagteam_proto::v1::hub_message::Msg::Command(value)) => Some(SessionEvent::Command(Box::new(value))),
                             Some(tagteam_proto::v1::hub_message::Msg::Cancel(value)) => Some(SessionEvent::Cancel(value)),
                             Some(tagteam_proto::v1::hub_message::Msg::Drain(value)) => Some(SessionEvent::Drain(value)),
                             Some(tagteam_proto::v1::hub_message::Msg::Welcome(_)) | None => return Err(SessionError::InvalidWelcome),
@@ -206,6 +207,27 @@ impl NodeSession {
                 }
             }
         }
+    }
+
+    fn hello_message(&self) -> Result<tagteam_proto::v1::NodeMessage, SessionError> {
+        Ok(tagteam_proto::v1::NodeMessage {
+            msg: Some(tagteam_proto::v1::node_message::Msg::Hello(
+                tagteam_proto::v1::Hello {
+                    node_id: self.identity.node_id.to_string(),
+                    version: self.version.clone(),
+                    workspaces: self.workspaces.clone(),
+                    pending: self.pending.pending_results()?,
+                },
+            )),
+        })
+    }
+}
+
+struct StaticPending(Vec<tagteam_proto::v1::CommandAck>);
+
+impl PendingResultSource for StaticPending {
+    fn pending_results(&self) -> Result<Vec<tagteam_proto::v1::CommandAck>, SessionError> {
+        Ok(self.0.clone())
     }
 }
 
@@ -237,7 +259,7 @@ impl ReconnectPolicy {
 /// Messages sent by the hub to the node command layer.
 pub enum SessionEvent {
     Welcome(tagteam_proto::v1::Welcome),
-    Command(tagteam_proto::v1::Command),
+    Command(Box<tagteam_proto::v1::Command>),
     Cancel(tagteam_proto::v1::Cancel),
     Drain(tagteam_proto::v1::Drain),
     Reconnecting { attempt: u32, delay: Duration },
@@ -251,7 +273,53 @@ pub struct SessionHandle {
     shutdown: watch::Sender<bool>,
 }
 
+#[derive(Clone)]
+pub struct SessionSender {
+    messages: mpsc::Sender<tagteam_proto::v1::NodeMessage>,
+}
+
+impl SessionSender {
+    pub async fn send_output(
+        &self,
+        output: tagteam_proto::v1::OutputChunk,
+    ) -> Result<(), SessionError> {
+        self.send(tagteam_proto::v1::node_message::Msg::Output(output))
+            .await
+    }
+
+    pub async fn send_result(
+        &self,
+        result: tagteam_proto::v1::CommandResult,
+    ) -> Result<(), SessionError> {
+        self.send(tagteam_proto::v1::node_message::Msg::Result(result))
+            .await
+    }
+
+    pub async fn send_ack(&self, ack: tagteam_proto::v1::CommandAck) -> Result<(), SessionError> {
+        let result = ack.result.ok_or(SessionError::InvalidAcknowledgement)?;
+        if result.command_id != ack.command_id {
+            return Err(SessionError::InvalidAcknowledgement);
+        }
+        self.send_result(result).await
+    }
+
+    async fn send(
+        &self,
+        message: tagteam_proto::v1::node_message::Msg,
+    ) -> Result<(), SessionError> {
+        self.messages
+            .send(tagteam_proto::v1::NodeMessage { msg: Some(message) })
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
+}
+
 impl SessionHandle {
+    pub fn sender(&self) -> SessionSender {
+        SessionSender {
+            messages: self.messages.clone(),
+        }
+    }
     pub async fn send_output(
         &self,
         output: tagteam_proto::v1::OutputChunk,
@@ -313,6 +381,8 @@ pub enum SessionError {
     Unauthenticated,
     #[error("command acknowledgement is incomplete")]
     InvalidAcknowledgement,
+    #[error("pending command results could not be loaded")]
+    PendingResults,
     #[error("hub session failed ({0:?})")]
     Rpc(Code),
 }
@@ -332,8 +402,17 @@ fn status_error(status: Status) -> SessionError {
 
 #[cfg(test)]
 mod tests {
-    use super::ReconnectPolicy;
+    use super::{HeartbeatSource, NodeSession, ReconnectPolicy};
+    use crate::{BeginCommand, CommandJournal, NodeIdentity};
     use std::time::Duration;
+
+    struct EmptyHeartbeat;
+
+    impl HeartbeatSource for EmptyHeartbeat {
+        fn heartbeat(&self) -> tagteam_proto::v1::Heartbeat {
+            tagteam_proto::v1::Heartbeat::default()
+        }
+    }
 
     #[test]
     fn reconnect_backoff_grows_and_stays_bounded() {
@@ -346,5 +425,50 @@ mod tests {
         assert_eq!(policy.delay(2), Duration::from_millis(400));
         assert_eq!(policy.delay(3), Duration::from_millis(450));
         assert_eq!(policy.delay(u32::MAX), Duration::from_millis(450));
+    }
+
+    #[test]
+    fn reconnect_hello_reads_results_completed_after_session_startup() {
+        let directory = tempfile::tempdir().expect("temporary data directory");
+        let journal =
+            CommandJournal::open(directory.path().join("commands.json")).expect("journal opens");
+        let identity = NodeIdentity {
+            node_id: tagteam_core::NodeId::new(),
+            invite: String::new(),
+            certificate_der: Vec::new(),
+            private_key_der: Vec::new(),
+            hub_address: "https://localhost".into(),
+            hub_fingerprint: tagteam_pki::CertificateFingerprint::from_certificate(b"test"),
+        };
+        let session = NodeSession::new(identity, EmptyHeartbeat).pending_source(journal.clone());
+        let initial = session.hello_message().expect("initial Hello builds");
+        let Some(tagteam_proto::v1::node_message::Msg::Hello(initial)) = initial.msg else {
+            panic!("initial message is Hello");
+        };
+        assert!(initial.pending.is_empty());
+
+        let command_id = tagteam_core::CommandId::new().to_string();
+        assert!(matches!(
+            journal.begin(&command_id),
+            Ok(BeginCommand::Execute)
+        ));
+        journal
+            .complete(&tagteam_proto::v1::CommandAck {
+                command_id: command_id.clone(),
+                result: Some(tagteam_proto::v1::CommandResult {
+                    command_id,
+                    result: Some(tagteam_proto::v1::command_result::Result::Done(
+                        tagteam_proto::v1::Done { ok: true },
+                    )),
+                }),
+            })
+            .expect("completed result persists");
+
+        let reconnect = session.hello_message().expect("reconnect Hello builds");
+        let Some(tagteam_proto::v1::node_message::Msg::Hello(reconnect)) = reconnect.msg else {
+            panic!("reconnect message is Hello");
+        };
+        assert_eq!(reconnect.pending.len(), 1);
+        assert!(reconnect.pending[0].result.is_some());
     }
 }

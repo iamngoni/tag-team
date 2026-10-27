@@ -16,6 +16,7 @@ use crate::transport;
 /// The private key is deliberately excluded from `Debug`; callers must treat it as a secret.
 pub struct NodeIdentity {
     pub node_id: NodeId,
+    pub invite: String,
     pub certificate_der: Vec<u8>,
     pub private_key_der: Vec<u8>,
     pub hub_address: String,
@@ -84,6 +85,7 @@ impl NodeEnrollment {
         let node_id = NodeId::from_str(&reply.node_id).map_err(|_| NodeError::InvalidIdentity)?;
         Ok(NodeIdentity {
             node_id,
+            invite: encoded_invite.to_owned(),
             certificate_der: reply.cert_der,
             private_key_der: key.private_key_der,
             hub_address: invite.address,

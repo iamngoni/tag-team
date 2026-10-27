@@ -5,5 +5,8 @@ pub const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod blobs;
 pub mod config;
 pub mod journal;
+pub mod local;
+pub mod mcp;
 pub mod nodes;
 pub mod runner;
+pub mod service;

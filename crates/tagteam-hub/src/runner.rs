@@ -53,32 +53,36 @@ pub struct RunnerProcess {
     stdout: FramedRead<ChildStdout, LinesCodec>,
 }
 
+/// Immutable process and protocol settings for one runner launch.
+#[derive(Debug, Clone)]
+pub struct RunnerStart {
+    pub program: String,
+    pub args: Vec<String>,
+    pub subtask: SubtaskId,
+    pub prompt: String,
+    pub system_append: String,
+    pub cwd: PathBuf,
+    pub max_turns: u32,
+    pub wall_clock_ms: u64,
+    pub tool_timeout_ms: u64,
+    pub resume: Option<String>,
+}
+
 impl RunnerProcess {
     /// Starts a runner and sends the one startup message before returning.
     ///
     /// `cwd` is the user's repository so the SDK can load CLAUDE.md and project
     /// instructions, while all file access still goes through the remote tools.
-    pub async fn start(
-        program: &str,
-        args: &[String],
-        subtask: SubtaskId,
-        prompt: String,
-        system_append: String,
-        cwd: PathBuf,
-        max_turns: u32,
-        wall_clock_ms: u64,
-        tool_timeout_ms: u64,
-        resume: Option<String>,
-    ) -> Result<Self, RunnerError> {
-        if program.trim().is_empty() {
+    pub async fn start(start: RunnerStart) -> Result<Self, RunnerError> {
+        if start.program.trim().is_empty() {
             return Err(RunnerError::Spawn(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "runner program must not be empty",
             )));
         }
-        let mut child = Command::new(program)
-            .args(args)
-            .current_dir(&cwd)
+        let mut child = Command::new(&start.program)
+            .args(&start.args)
+            .current_dir(&start.cwd)
             .env(
                 "TAGTEAM_RUNNER_PROTOCOL",
                 RUNNER_PROTOCOL_VERSION.to_string(),
@@ -111,14 +115,14 @@ impl RunnerProcess {
         };
         process
             .send(HubToRunnerMessage::Start {
-                subtask,
-                prompt,
-                system_append,
-                cwd,
-                max_turns,
-                wall_clock_ms,
-                tool_timeout_ms,
-                resume,
+                subtask: start.subtask,
+                prompt: start.prompt,
+                system_append: start.system_append,
+                cwd: start.cwd,
+                max_turns: start.max_turns,
+                wall_clock_ms: start.wall_clock_ms,
+                tool_timeout_ms: start.tool_timeout_ms,
+                resume: start.resume,
             })
             .await?;
         Ok(process)
