@@ -19,9 +19,10 @@ use std::io::ErrorKind;
 #[cfg(target_os = "macos")]
 use std::net::TcpListener;
 use tagteam_core::types::{Bytes, Limits};
+#[cfg(target_os = "macos")]
+use tagteam_sandbox::{CancellationToken, spawn_confined};
 use tagteam_sandbox::{
-    CancellationToken, ProxyEndpoint, ResourceLimits, SandboxProfile, build_linux_launch_plan,
-    build_seatbelt_profile, spawn_confined,
+    ProxyEndpoint, ResourceLimits, SandboxProfile, build_linux_launch_plan, build_seatbelt_profile,
 };
 use tempfile::{Builder, TempDir};
 
