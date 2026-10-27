@@ -38,6 +38,9 @@ tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = "0.1.18"
+tokio-util = { version = "0.7.20", features = ["codec"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+hyper-util = { version = "0.1.17", features = ["tokio"] }
 toml = "1.1.8"
 tonic = { version = "0.14.7", features = ["transport", "codegen", "tls-ring"] }
 tonic-prost = "0.14.7"

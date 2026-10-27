@@ -352,6 +352,29 @@ impl Repository {
         self.resolve_commit(&destination).map(GitOid)
     }
 
+    /// Create a local review branch at a fetched result without checking it out
+    /// or changing the index or working tree. The branch must not already exist.
+    pub fn create_review_branch(&self, branch: &str, commit: &str) -> Result<GitOid> {
+        validate_ref_component(branch)?;
+        let reference = format!("refs/heads/{branch}");
+        self.validate_git_ref(&reference)?;
+        let commit = self.resolve_commit(commit)?;
+        self.command_named(
+            "create review branch",
+            [
+                OsString::from("-c"),
+                OsString::from("core.hooksPath=/dev/null"),
+                OsString::from("-c"),
+                OsString::from("core.fsmonitor=false"),
+                OsString::from("update-ref"),
+                OsString::from(&reference),
+                OsString::from(&commit),
+                OsString::from(GitOid::zero().0),
+            ],
+        )?;
+        Ok(GitOid(commit))
+    }
+
     /// Ensure `base` is an ancestor of `head` in this repository.
     pub fn check_ancestry(&self, base: &str, head: &str) -> Result<()> {
         let base = self.resolve_commit(base)?;

@@ -3,7 +3,7 @@
 use std::{
     fs, io,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -48,6 +48,133 @@ pub enum PkiError {
     InvalidClock(#[from] std::time::SystemTimeError),
     #[error("key storage I/O failed: {0}")]
     Io(#[from] io::Error),
+}
+
+/// A rustls server verifier pinned to the hub CA fingerprint from an enrollment invite.
+///
+/// The hub CA must be sent as the final certificate in the server's presented chain. Its
+/// fingerprint establishes the trust anchor; WebPKI then validates the leaf, chain, validity
+/// periods, and fixed `tagteam-hub` service name. TLS handshake signatures use WebPKI's
+/// configured cryptographic provider.
+#[derive(Debug)]
+pub struct PinnedHubVerifier {
+    fingerprint: CertificateFingerprint,
+    signature_algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+    root_certificate_der: Mutex<Option<Vec<u8>>>,
+}
+
+impl PinnedHubVerifier {
+    /// Creates a verifier for the hub CA fingerprint encoded in the enrollment invite.
+    pub fn new(fingerprint: CertificateFingerprint) -> Result<Self, PkiError> {
+        Ok(Self {
+            fingerprint,
+            signature_algorithms: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms,
+            root_certificate_der: Mutex::new(None),
+        })
+    }
+
+    /// Returns the pinned CA DER retained from the most recently verified hub chain.
+    ///
+    /// This is `None` until a server certificate has passed chain and DNS validation.
+    pub fn root_certificate_der(&self) -> Option<Vec<u8>> {
+        self.root_certificate_der.lock().ok()?.clone()
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedHubVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use rustls::{RootCertStore, client::WebPkiServerVerifier, pki_types::CertificateDer};
+
+        let has_service_name = matches!(server_name,
+            rustls::pki_types::ServerName::DnsName(name)
+                if name.as_ref() == SERVICE_DNS_NAME
+        );
+        if !has_service_name {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName,
+            ));
+        }
+
+        let Some(root_certificate) = intermediates.last() else {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        };
+        if !self
+            .fingerprint
+            .matches_certificate(root_certificate.as_ref())
+        {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(root_certificate.as_ref().to_vec()))
+            .map_err(|_| {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+            })?;
+        let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|_| {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+            })?;
+
+        // The pinned root is a trust anchor, not an intermediate in the path being validated.
+        let verified = verifier.verify_server_cert(
+            end_entity,
+            &intermediates[..intermediates.len() - 1],
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        self.root_certificate_der
+            .lock()
+            .map_err(|_| rustls::Error::General("hub verifier state is unavailable".into()))?
+            .replace(root_certificate.as_ref().to_vec());
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            dss,
+            &self.signature_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            dss,
+            &self.signature_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.signature_algorithms.supported_schemes()
+    }
 }
 
 /// SHA-256 fingerprint of the exact DER-encoded certificate bytes.
@@ -367,6 +494,18 @@ fn verify_chain(certificate_der: &[u8], ca_der: &[u8]) -> Result<(), PkiError> {
         .map_err(|_| PkiError::WrongCa)
 }
 
+/// Verifies an enrolled node certificate against the exact CA pinned by its invite.
+pub fn verify_node_certificate(
+    certificate_der: &[u8],
+    ca_der: &[u8],
+    fingerprint: CertificateFingerprint,
+) -> Result<(), PkiError> {
+    if !fingerprint.matches_certificate(ca_der) {
+        return Err(PkiError::WrongCa);
+    }
+    verify_chain(certificate_der, ca_der)
+}
+
 /// Pluggable boundary for future macOS Keychain and Linux file-backed storage.
 pub trait KeyStore {
     fn store_private_key(&self, key_id: &str, private_key_der: &[u8]) -> Result<(), PkiError>;
@@ -581,6 +720,161 @@ mod tests {
                     .expect("client validates server and CA");
             }
         }
+    }
+
+    #[test]
+    fn pinned_hub_verifier_checks_root_dns_and_retains_the_verified_root() {
+        use rustls::{
+            client::danger::ServerCertVerifier,
+            pki_types::{ServerName, UnixTime},
+        };
+
+        let ca = HubCa::generate().expect("CA");
+        let server = ca.issue_server_certificate().expect("server cert");
+        let verifier = PinnedHubVerifier::new(ca.fingerprint()).expect("pinned verifier");
+        let leaf = rustls::pki_types::CertificateDer::from(server.certificate_der);
+        let root = rustls::pki_types::CertificateDer::from(ca.certificate_der().to_vec());
+        let name = ServerName::try_from(SERVICE_DNS_NAME).expect("server DNS name");
+
+        assert!(verifier.root_certificate_der().is_none());
+        verifier
+            .verify_server_cert(&leaf, &[root], &name, &[], UnixTime::now())
+            .expect("pinned server chain and DNS name");
+        assert_eq!(
+            verifier.root_certificate_der().as_deref(),
+            Some(ca.certificate_der())
+        );
+    }
+
+    #[test]
+    fn pinned_hub_verifier_rejects_wrong_root_missing_root_and_wrong_dns() {
+        use rustls::{
+            client::danger::ServerCertVerifier,
+            pki_types::{ServerName, UnixTime},
+        };
+
+        let ca = HubCa::generate().expect("CA");
+        let other_ca = HubCa::generate().expect("other CA");
+        let server = ca.issue_server_certificate().expect("server cert");
+        let verifier = PinnedHubVerifier::new(other_ca.fingerprint()).expect("pinned verifier");
+        let leaf = rustls::pki_types::CertificateDer::from(server.certificate_der);
+        let root = rustls::pki_types::CertificateDer::from(ca.certificate_der().to_vec());
+        let name = ServerName::try_from(SERVICE_DNS_NAME).expect("server DNS name");
+        let wrong_name = ServerName::try_from("other-service").expect("other DNS name");
+        let now = UnixTime::now();
+
+        assert!(
+            verifier
+                .verify_server_cert(&leaf, std::slice::from_ref(&root), &name, &[], now)
+                .is_err()
+        );
+        assert!(
+            verifier
+                .verify_server_cert(&leaf, &[], &name, &[], now)
+                .is_err()
+        );
+        assert!(
+            verifier
+                .verify_server_cert(&leaf, &[root], &wrong_name, &[], now)
+                .is_err()
+        );
+        assert!(verifier.root_certificate_der().is_none());
+    }
+
+    #[test]
+    fn node_certificate_verification_checks_pinned_ca_and_client_auth_chain() {
+        let ca = HubCa::generate().expect("CA");
+        let other_ca = HubCa::generate().expect("other CA");
+        let node_key = NodeKeyRequest::generate("node-1").expect("node CSR");
+        let node_certificate = ca
+            .sign_node_csr(&node_key.csr_der)
+            .expect("node certificate");
+        let server_certificate = ca.issue_server_certificate().expect("server certificate");
+
+        verify_node_certificate(&node_certificate, ca.certificate_der(), ca.fingerprint())
+            .expect("pinned node client certificate");
+        assert!(
+            verify_node_certificate(
+                &server_certificate.certificate_der,
+                ca.certificate_der(),
+                ca.fingerprint()
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            verify_node_certificate(
+                &node_certificate,
+                other_ca.certificate_der(),
+                ca.fingerprint()
+            ),
+            Err(PkiError::WrongCa)
+        ));
+        assert!(matches!(
+            verify_node_certificate(
+                &node_certificate,
+                ca.certificate_der(),
+                other_ca.fingerprint()
+            ),
+            Err(PkiError::WrongCa)
+        ));
+    }
+
+    #[test]
+    fn loopback_tls_rejects_a_hub_with_a_different_pinned_ca() {
+        use rustls::{
+            ClientConfig, ClientConnection, ServerConfig, ServerConnection,
+            pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName},
+        };
+        use std::{
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        let server_ca = HubCa::generate().expect("server CA");
+        let pinned_ca = HubCa::generate().expect("pinned CA");
+        let identity = server_ca.issue_server_certificate().expect("server cert");
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![
+                        CertificateDer::from(identity.certificate_der),
+                        CertificateDer::from(server_ca.certificate_der().to_vec()),
+                    ],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key_der)),
+                )
+                .expect("server TLS config"),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_thread = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept loopback client");
+            let mut connection = ServerConnection::new(server_config).expect("server connection");
+            while connection.is_handshaking() {
+                if connection.complete_io(&mut socket).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let verifier = PinnedHubVerifier::new(pinned_ca.fingerprint()).expect("pinned verifier");
+        let client_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        let mut socket = TcpStream::connect(address).expect("connect loopback server");
+        let name = ServerName::try_from(SERVICE_DNS_NAME).expect("server DNS name");
+        let mut connection =
+            ClientConnection::new(Arc::new(client_config), name).expect("client connection");
+        let mut handshake_error = None;
+        while connection.is_handshaking() {
+            if let Err(error) = connection.complete_io(&mut socket) {
+                handshake_error = Some(error);
+                break;
+            }
+        }
+        server_thread.join().expect("server thread");
+        assert!(handshake_error.is_some(), "wrong pinned CA completed TLS");
     }
 
     #[test]

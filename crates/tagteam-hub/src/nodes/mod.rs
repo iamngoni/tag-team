@@ -17,7 +17,7 @@ use tagteam_core::{
     OwnerPresence, Platform, Thermal, Timestamp, Toolchain,
 };
 use tagteam_pki::{CertificateFingerprint, HubCa, Invite};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
     Request, Response, Status,
@@ -26,7 +26,7 @@ use tonic::{
 
 use crate::{
     blobs::BlobStore,
-    journal::{Journal, JournalError},
+    journal::{Command as JournalCommand, Journal, JournalError},
 };
 
 pub mod proto {
@@ -58,12 +58,14 @@ struct Inner {
     blob_root: PathBuf,
     ca: Arc<HubCa>,
     sessions: Mutex<HashMap<NodeId, SessionHandle>>,
+    pending: Mutex<HashMap<String, oneshot::Sender<proto::CommandResult>>>,
 }
 
 #[derive(Clone)]
 struct SessionHandle {
     id: String,
     cancel: watch::Sender<bool>,
+    outbound: mpsc::Sender<Result<HubMessage, Status>>,
 }
 
 impl NodePlane {
@@ -88,8 +90,123 @@ impl NodePlane {
                 blob_root,
                 ca: Arc::new(ca),
                 sessions: Mutex::new(HashMap::new()),
+                pending: Mutex::new(HashMap::new()),
             }),
         })
+    }
+
+    /// Sends one durable command to the node and waits for its first result.
+    ///
+    /// The command is journaled before it leaves the hub. If the node reconnects
+    /// with a stored acknowledgement, the persisted result is returned instead of
+    /// running the operation again.
+    pub async fn execute_command(
+        &self,
+        node_id: NodeId,
+        command: proto::Command,
+        timeout: Duration,
+    ) -> Result<proto::CommandResult, NodePlaneError> {
+        let command_id = command.command_id.clone();
+        if command_id.is_empty() {
+            return Err(NodePlaneError::Protocol(
+                "command_id must not be empty".into(),
+            ));
+        }
+        if let Some(result) = self.load_stored_result(&command_id).await? {
+            return Ok(result);
+        }
+        let subtask_id = tagteam_core::SubtaskId::from_str(&command.subtask_id)
+            .map_err(|_| NodePlaneError::Protocol("command subtask_id is invalid".into()))?;
+        let journal_command = JournalCommand {
+            id: command_id.clone(),
+            node_id,
+            subtask_id,
+            operation: json_command(&command)?,
+            state: "pending".into(),
+            result: None,
+            sent_at: Some(Timestamp::now()),
+            done_at: None,
+        };
+        let journal = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut journal = journal
+                .journal
+                .lock()
+                .map_err(|_| NodePlaneError::Protocol("journal lock is unavailable".into()))?;
+            journal
+                .store_command(&journal_command)
+                .map_err(NodePlaneError::Journal)?;
+            Ok::<_, NodePlaneError>(())
+        })
+        .await
+        .map_err(|_| NodePlaneError::Internal)??;
+
+        let (completion, receiver) = oneshot::channel();
+        self.inner
+            .pending
+            .lock()
+            .map_err(|_| NodePlaneError::Internal)?
+            .insert(command_id.clone(), completion);
+        let outbound = {
+            let sessions = self
+                .inner
+                .sessions
+                .lock()
+                .map_err(|_| NodePlaneError::Internal)?;
+            sessions
+                .get(&node_id)
+                .map(|session| session.outbound.clone())
+                .ok_or(NodePlaneError::Offline)?
+        };
+        if outbound
+            .send(Ok(HubMessage {
+                msg: Some(hub_message::Msg::Command(command)),
+            }))
+            .await
+            .is_err()
+        {
+            self.inner
+                .pending
+                .lock()
+                .map_err(|_| NodePlaneError::Internal)?
+                .remove(&command_id);
+            return Err(NodePlaneError::Offline);
+        }
+        match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(NodePlaneError::Offline),
+            Err(_) => {
+                self.inner
+                    .pending
+                    .lock()
+                    .map_err(|_| NodePlaneError::Internal)?
+                    .remove(&command_id);
+                Err(NodePlaneError::Timeout)
+            }
+        }
+    }
+
+    async fn load_stored_result(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<proto::CommandResult>, NodePlaneError> {
+        let journal = Arc::clone(&self.inner);
+        let command_id = command_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let journal = journal
+                .journal
+                .lock()
+                .map_err(|_| NodePlaneError::Internal)?;
+            let stored = journal
+                .load_command(&command_id)
+                .map_err(NodePlaneError::Journal)?;
+            stored
+                .and_then(|command| command.result)
+                .map(|value| result_from_json(&value))
+                .transpose()
+        })
+        .await
+        .map_err(|_| NodePlaneError::Internal)?
     }
 
     /// Serves the generated Hub service over mutual TLS until shutdown resolves.
@@ -103,7 +220,11 @@ impl NodePlane {
     {
         let issued = self.inner.ca.issue_server_certificate()?;
         let identity = Identity::from_pem(
-            certificate_pem(&issued.certificate_der),
+            format!(
+                "{}{}",
+                certificate_pem(&issued.certificate_der),
+                certificate_pem(self.inner.ca.certificate_der()),
+            ),
             private_key_pem(&issued.private_key_der),
         );
         let tls = ServerTlsConfig::new()
@@ -140,6 +261,14 @@ pub enum NodePlaneError {
     Transport(#[from] tonic::transport::Error),
     #[error("blocking worker stopped: {0}")]
     Blocking(#[from] tokio::task::JoinError),
+    #[error("node is not connected")]
+    Offline,
+    #[error("node command timed out")]
+    Timeout,
+    #[error("node protocol error: {0}")]
+    Protocol(String),
+    #[error("internal node-plane error")]
+    Internal,
 }
 
 #[derive(Clone)]
@@ -234,6 +363,12 @@ impl Hub for NodeService {
                 "Hello node ID does not match client certificate",
             ));
         }
+        for ack in hello.pending {
+            let Some(result) = ack.result else {
+                continue;
+            };
+            record_command_result(&self.inner, result).await?;
+        }
         let id = node.id;
         let session_id = tagteam_core::MainSessionId::new().to_string();
         let (sender, receiver) = mpsc::channel(16);
@@ -258,6 +393,7 @@ impl Hub for NodeService {
                 SessionHandle {
                     id: session_id.clone(),
                     cancel,
+                    outbound: sender.clone(),
                 },
             );
         if let Some(previous) = previous {
@@ -274,11 +410,21 @@ impl Hub for NodeService {
                 let Ok(Some(message)) = next else {
                     break;
                 };
-                if let Some(node_message::Msg::Heartbeat(heartbeat)) = message.msg
-                    && let Err(error) = update_heartbeat(&inner, id, heartbeat).await
-                {
-                    let _ = sender.send(Err(error)).await;
-                    break;
+                match message.msg {
+                    Some(node_message::Msg::Heartbeat(heartbeat)) => {
+                        if let Err(error) = update_heartbeat(&inner, id, heartbeat).await {
+                            let _ = sender.send(Err(error)).await;
+                            break;
+                        }
+                    }
+                    Some(node_message::Msg::Result(result)) => {
+                        if let Err(error) = record_command_result(&inner, result).await {
+                            let _ = sender.send(Err(error)).await;
+                            break;
+                        }
+                    }
+                    Some(node_message::Msg::Hello(_)) => {}
+                    Some(node_message::Msg::Output(_)) | None => {}
                 }
             }
             if let Ok(mut sessions) = inner.sessions.lock()
@@ -647,6 +793,66 @@ fn pem(kind: &str, der: &[u8]) -> String {
     }
     pem.push_str(&format!("-----END {kind}-----\n"));
     pem
+}
+
+async fn record_command_result(
+    inner: &Arc<Inner>,
+    result: proto::CommandResult,
+) -> Result<(), Status> {
+    let command_id = result.command_id.clone();
+    let stored_id = command_id.clone();
+    let encoded =
+        result_to_json(&result).map_err(|_| Status::internal("command result encoding failed"))?;
+    let worker_inner = Arc::clone(inner);
+    tokio::task::spawn_blocking(move || {
+        let mut journal = worker_inner
+            .journal
+            .lock()
+            .map_err(|_| Status::internal("journal lock is unavailable"))?;
+        journal
+            .store_command_result(&stored_id, &encoded, Timestamp::now())
+            .map_err(journal_status)
+    })
+    .await
+    .map_err(|_| Status::internal("command result worker stopped"))??;
+    if let Ok(mut pending) = inner.pending.lock()
+        && let Some(completion) = pending.remove(&command_id)
+    {
+        let _ = completion.send(result);
+    }
+    Ok(())
+}
+
+fn json_command(command: &proto::Command) -> Result<serde_json::Value, NodePlaneError> {
+    use base64::Engine as _;
+    use prost::Message as _;
+    let bytes = command.encode_to_vec();
+    Ok(serde_json::json!({
+        "proto_b64": base64::engine::general_purpose::STANDARD.encode(bytes)
+    }))
+}
+
+fn result_to_json(result: &proto::CommandResult) -> Result<serde_json::Value, NodePlaneError> {
+    use base64::Engine as _;
+    use prost::Message as _;
+    let bytes = result.encode_to_vec();
+    Ok(serde_json::json!({
+        "proto_b64": base64::engine::general_purpose::STANDARD.encode(bytes)
+    }))
+}
+
+fn result_from_json(value: &serde_json::Value) -> Result<proto::CommandResult, NodePlaneError> {
+    use base64::Engine as _;
+    use prost::Message as _;
+    let encoded = value
+        .get("proto_b64")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| NodePlaneError::Protocol("stored command result is malformed".into()))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| NodePlaneError::Protocol("stored command result is not base64".into()))?;
+    proto::CommandResult::decode(bytes.as_slice())
+        .map_err(|_| NodePlaneError::Protocol("stored command result is invalid protobuf".into()))
 }
 
 #[cfg(test)]

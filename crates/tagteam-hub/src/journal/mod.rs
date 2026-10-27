@@ -301,6 +301,40 @@ impl Journal {
         .transpose()
     }
 
+    /// Lists every durable node in stable name order.
+    pub fn list_nodes(&self) -> Result<Vec<Node>, JournalError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM nodes ORDER BY name,id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let ids = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut nodes = Vec::with_capacity(ids.len());
+        for encoded in ids {
+            let id = NodeId::from_str(&encoded)
+                .map_err(|error| JournalError::IdempotencyConflict(error.to_string()))?;
+            if let Some(node) = self.load_node(id)? {
+                nodes.push(node);
+            }
+        }
+        Ok(nodes)
+    }
+
+    /// Finds a node by its owner-visible unique name.
+    pub fn find_node_by_name(&self, name: &str) -> Result<Option<Node>, JournalError> {
+        let encoded: Option<String> = self
+            .connection
+            .query_row("SELECT id FROM nodes WHERE name=?1", [name], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        let id = NodeId::from_str(&encoded)
+            .map_err(|error| JournalError::IdempotencyConflict(error.to_string()))?;
+        self.load_node(id)
+    }
+
     /// Finds an active durable node by the SHA-256 fingerprint from its TLS
     /// client certificate. Blob RPCs carry no node ID, so this lookup keeps
     /// certificate authorization inside the journal boundary.
@@ -636,6 +670,24 @@ impl Journal {
                 kind: event_kind,
             },
         })
+    }
+
+    /// Lists every subtask in creation order.
+    pub fn list_subtasks(&self) -> Result<Vec<Subtask>, JournalError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM subtasks ORDER BY created_at,id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let ids = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut subtasks = Vec::with_capacity(ids.len());
+        for encoded in ids {
+            let id = SubtaskId::from_str(&encoded)
+                .map_err(|error| JournalError::IdempotencyConflict(error.to_string()))?;
+            if let Some(subtask) = self.load_subtask(id)? {
+                subtasks.push(subtask);
+            }
+        }
+        Ok(subtasks)
     }
 
     /// Reads a subtask's current state without changing it.
