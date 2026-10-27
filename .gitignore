@@ -1,6 +1,8 @@
 /target
+/dist
 /node_modules
 **/node_modules
+/runner/dist/
 *.log
 .env
 .env.*

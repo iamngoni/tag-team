@@ -102,9 +102,12 @@ public struct NodeCommandRunner: Sendable {
 
   private func environmentWithNodeSearchPath() -> [String: String] {
     var environment = ProcessInfo.processInfo.environment
+    let localBin = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent(".local/bin", isDirectory: true)
+      .path
     let preferred = [
-      "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
-      "/usr/sbin", "/sbin",
+      localBin, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin",
+      "/bin", "/usr/sbin", "/sbin",
     ]
     let inherited = (environment["PATH"] ?? "").split(separator: ":").map(String.init)
     var seen = Set<String>()

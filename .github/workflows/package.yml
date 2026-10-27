@@ -1,0 +1,73 @@
+name: Package
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Semantic version written into the release archives
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  package:
+    name: Package / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Linux prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes protobuf-compiler
+
+      - name: Install macOS prerequisites
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.93.1 --profile minimal
+          rustup default 1.93.1
+          rustc --version
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6.1.0
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: runner/pnpm-lock.yaml
+
+      - name: Build release archive
+        run: ./scripts/package-release.sh --version "${{ inputs.version }}" --target "${{ matrix.target }}" --output-dir dist
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: tagteam-${{ matrix.target }}
+          path: dist/tagteam-*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

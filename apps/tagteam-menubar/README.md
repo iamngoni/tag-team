@@ -16,7 +16,7 @@ The helper creates `dist/TagTeam.app`, writes its Info.plist, and applies an ad-
 
 ## Node CLI
 
-The app searches the inherited `PATH` plus common Homebrew and system binary directories for `tagteam-node`. It reads `tagteam-node status` every three seconds. Pause, resume, and leave map to the corresponding fixed CLI commands. Leave always asks for confirmation.
+The app searches `~/.local/bin`, the inherited `PATH`, and common Homebrew and system binary directories for `tagteam-node`. It reads `tagteam-node status` every three seconds. Pause, resume, and leave map to the corresponding fixed CLI commands. Leave always asks for confirmation.
 
 Service controls call `tagteam-node service install`, `start`, `stop`, `status --json`, and `uninstall`. Install and uninstall ask for confirmation. Optional capacity, workspace count, connection, and policy details are displayed only when returned by the CLI.
 
