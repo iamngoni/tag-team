@@ -253,17 +253,12 @@ impl NodeState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trust {
+    #[default]
     Own,
     Friend,
-}
-
-impl Default for Trust {
-    fn default() -> Self {
-        Self::Own
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

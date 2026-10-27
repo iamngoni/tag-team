@@ -10,7 +10,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-tagteam-core = { path = "../tagteam-core" }
-serde.workspace = true
+base64.workspace = true
+data-encoding.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

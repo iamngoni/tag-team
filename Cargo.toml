@@ -16,10 +16,16 @@ members = [
 edition = "2024"
 rust-version = "1.93"
 license = "UNLICENSED"
-repository = "https://github.com/modestnerd/tag-team"
+repository = "https://github.com/iamngoni/tag-team"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+base64 = "0.22.1"
+data-encoding = "2.9.0"
+sysinfo = "0.39.6"
+nix = { version = "0.31.3", features = ["fs", "process", "resource", "sched", "signal", "user"] }
+x509-parser = "0.18.1"
+httparse = "1.10.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 prost = "0.14.4"
 rmcp = { version = "3.8.0", features = ["server", "transport-io", "macros"] }

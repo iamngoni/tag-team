@@ -1,6 +1,6 @@
 # Tag Team: Claude subtasks on other machines
 
-Design note, 2026-10-26. Nothing here is built. GridOps' fleet agent was the inspiration; this is a separate project.
+Design note, 2026-10-26. The implementation is underway; see the [implementation addendum](#implementation-addendum--2026-10-27) for decisions and the verified status boundary. GridOps' fleet agent was the inspiration; this is a separate project.
 
 You type `/tag-team` and Claude splits the work into independent subtasks. Those run on other machines on your network: a Mac Mini, or a friend's laptop while they aren't using it. Every subtask's agent loop runs on your main machine with your Claude setup. The lent machines only run commands, inside a sandbox. You and your main Claude stay in the conversation the whole time: subtasks report progress, ask questions, take new directions, and hand back branches to review.
 

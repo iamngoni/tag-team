@@ -31,15 +31,15 @@ pub struct IllegalTransition {
 pub fn step(
     current: &SubtaskState,
     input: SubtaskInput,
-) -> Result<(SubtaskState, EventKind), IllegalTransition> {
+) -> Result<(SubtaskState, EventKind), Box<IllegalTransition>> {
     if current.is_terminal() {
-        return Err(IllegalTransition {
+        return Err(Box::new(IllegalTransition {
             current: current.clone(),
             input,
-        });
+        }));
     }
 
-    let transition = match (&current, &input) {
+    match (&current, &input) {
         (
             SubtaskState::Queued | SubtaskState::Placing | SubtaskState::Reassigning { .. },
             SubtaskInput::Placed { node },
@@ -105,13 +105,11 @@ pub fn step(
             },
         )),
         (_, SubtaskInput::Cancel { .. }) => Ok((SubtaskState::Cancelled, EventKind::Cancelled)),
-        _ => Err(IllegalTransition {
+        _ => Err(Box::new(IllegalTransition {
             current: current.clone(),
             input,
-        }),
-    };
-
-    transition
+        })),
+    }
 }
 
 #[cfg(test)]
