@@ -23,6 +23,13 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use tokio::net::UnixListener;
+
 /// Default package registry hosts supported by the proxy.
 pub const DEFAULT_EGRESS: &[&str] = &[
     "crates.io",
@@ -56,6 +63,32 @@ pub trait Resolver: Send + Sync + 'static {
 pub trait Connector: Send + Sync + 'static {
     /// Connects to this concrete address; implementations must not resolve a hostname.
     fn connect<'a>(&'a self, address: SocketAddr) -> BoxFuture<'a, io::Result<Box<dyn ProxyIo>>>;
+}
+
+/// DNS resolver backed by Tokio's system hostname lookup.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TokioResolver;
+
+impl Resolver for TokioResolver {
+    fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host, 0)).await?;
+            Ok(addresses.map(|address| address.ip()).collect())
+        })
+    }
+}
+
+/// Direct TCP connector that receives only the concrete addresses validated by this proxy.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TcpConnector;
+
+impl Connector for TcpConnector {
+    fn connect<'a>(&'a self, address: SocketAddr) -> BoxFuture<'a, io::Result<Box<dyn ProxyIo>>> {
+        Box::pin(async move {
+            let stream = TcpStream::connect(address).await?;
+            Ok(Box::new(stream) as Box<dyn ProxyIo>)
+        })
+    }
 }
 
 /// A canonical lowercase DNS hostname admitted by the policy.
@@ -176,6 +209,14 @@ pub enum StartError {
     /// The loopback listener could not be bound.
     #[error("could not bind egress proxy listener: {0}")]
     Bind(#[source] io::Error),
+    /// A Unix socket path was not absolute or traversed a symbolic link.
+    #[cfg(unix)]
+    #[error("Unix socket path must be absolute and contain no symbolic links")]
+    InvalidUnixPath,
+    /// A filesystem entry already exists at the requested Unix socket path.
+    #[cfg(unix)]
+    #[error("Unix socket path already exists: {0}")]
+    UnixPathExists(PathBuf),
 }
 
 /// Policy category for a request rejected with HTTP 403.
@@ -221,8 +262,24 @@ pub enum ConnectionOutcome {
 /// Running loopback proxy and its cancellation handle.
 pub struct ProxyServer {
     addr: SocketAddr,
+    runtime: ProxyRuntime,
+}
+
+struct ProxyRuntime {
     cancel: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Running proxy bound to one Unix-domain socket.
+///
+/// The supplied path must be absolute, unused, and free of symbolic-link components.
+/// The socket is restricted to its owner and removed on shutdown or drop when it is
+/// still the same socket created by this server.
+#[cfg(unix)]
+pub struct UnixProxyServer {
+    path: PathBuf,
+    identity: (u64, u64),
+    runtime: ProxyRuntime,
 }
 
 impl ProxyServer {
@@ -237,23 +294,50 @@ impl ProxyServer {
             .await
             .map_err(StartError::Bind)?;
         let addr = listener.local_addr().map_err(StartError::Bind)?;
-        let (cancel, cancel_rx) = watch::channel(false);
-        let (outcomes_tx, outcomes_rx) = mpsc::channel(OUTCOME_CAPACITY);
-        let task = tokio::spawn(serve(
-            listener,
-            config,
-            resolver,
-            connector,
-            cancel_rx,
-            outcomes_tx,
-        ));
+        let (runtime, outcomes_rx) =
+            start_runtime(Listener::Tcp(listener), config, resolver, connector);
+        Ok((Self { addr, runtime }, outcomes_rx))
+    }
+
+    /// Starts on a fresh absolute Unix-domain socket path with owner-only permissions.
+    ///
+    /// Existing filesystem entries are never removed. Callers should provide a unique,
+    /// fresh path and remove their own stale sockets only after verifying ownership.
+    #[cfg(unix)]
+    pub async fn start_unix(
+        path: impl AsRef<Path>,
+        config: ProxyConfig,
+        resolver: Arc<dyn Resolver>,
+        connector: Arc<dyn Connector>,
+    ) -> Result<(UnixProxyServer, mpsc::Receiver<ConnectionOutcome>), StartError> {
+        config.validate()?;
+        let path = path.as_ref();
+        validate_unix_path(path)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => return Err(StartError::UnixPathExists(path.to_owned())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StartError::Bind(error)),
+        }
+        let listener = UnixListener::bind(path).map_err(StartError::Bind)?;
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            drop(listener);
+            return Err(StartError::Bind(error));
+        }
+        let metadata = std::fs::symlink_metadata(path).map_err(StartError::Bind)?;
+        if !metadata.file_type().is_socket() {
+            drop(listener);
+            return Err(StartError::InvalidUnixPath);
+        }
+        let identity = (metadata.dev(), metadata.ino());
+        let (runtime, outcomes) =
+            start_runtime(Listener::Unix(listener), config, resolver, connector);
         Ok((
-            Self {
-                addr,
-                cancel,
-                task: Some(task),
+            UnixProxyServer {
+                path: path.to_owned(),
+                identity,
+                runtime,
             },
-            outcomes_rx,
+            outcomes,
         ))
     }
 
@@ -264,26 +348,149 @@ impl ProxyServer {
 
     /// Signals shutdown and waits until the listener and its client tasks stop.
     pub async fn shutdown(mut self) {
+        self.runtime.shutdown().await;
+    }
+
+    /// Signals shutdown without waiting.
+    pub fn cancel(&self) {
+        self.runtime.cancel();
+    }
+}
+
+impl Drop for ProxyServer {
+    fn drop(&mut self) {
+        self.runtime.cancel();
+    }
+}
+
+impl ProxyRuntime {
+    async fn shutdown(&mut self) {
         self.cancel();
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
     }
 
-    /// Signals shutdown without waiting.
-    pub fn cancel(&self) {
+    fn cancel(&self) {
         let _ = self.cancel.send(true);
     }
 }
 
-impl Drop for ProxyServer {
+impl Drop for ProxyRuntime {
     fn drop(&mut self) {
-        let _ = self.cancel.send(true);
+        self.cancel();
+    }
+}
+
+#[cfg(unix)]
+impl UnixProxyServer {
+    /// Returns the socket path supplied to [`ProxyServer::start_unix`].
+    pub fn socket_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Signals shutdown and waits until the listener and its client tasks stop.
+    pub async fn shutdown(mut self) {
+        self.runtime.shutdown().await;
+        self.cleanup_socket();
+    }
+
+    /// Signals shutdown without waiting and removes the owned socket path best-effort.
+    pub fn cancel(&self) {
+        self.runtime.cancel();
+        self.cleanup_socket();
+    }
+
+    fn cleanup_socket(&self) {
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+            && metadata.file_type().is_socket()
+            && (metadata.dev(), metadata.ino()) == self.identity
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixProxyServer {
+    fn drop(&mut self) {
+        self.runtime.cancel();
+        self.cleanup_socket();
+    }
+}
+
+#[cfg(unix)]
+fn validate_unix_path(path: &Path) -> Result<(), StartError> {
+    if !path.is_absolute() {
+        return Err(StartError::InvalidUnixPath);
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        ) {
+            return Err(StartError::InvalidUnixPath);
+        }
+        current.push(component);
+        if let Ok(metadata) = std::fs::symlink_metadata(&current)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(StartError::InvalidUnixPath);
+        }
+    }
+    Ok(())
+}
+
+fn start_runtime(
+    listener: Listener,
+    config: ProxyConfig,
+    resolver: Arc<dyn Resolver>,
+    connector: Arc<dyn Connector>,
+) -> (ProxyRuntime, mpsc::Receiver<ConnectionOutcome>) {
+    let (cancel, cancel_rx) = watch::channel(false);
+    let (outcomes_tx, outcomes_rx) = mpsc::channel(OUTCOME_CAPACITY);
+    let task = tokio::spawn(serve(
+        listener,
+        config,
+        resolver,
+        connector,
+        cancel_rx,
+        outcomes_tx,
+    ));
+    (
+        ProxyRuntime {
+            cancel,
+            task: Some(task),
+        },
+        outcomes_rx,
+    )
+}
+
+enum Listener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener),
+}
+
+impl Listener {
+    async fn accept(&self) -> io::Result<Box<dyn ProxyIo>> {
+        match self {
+            Self::Tcp(listener) => listener
+                .accept()
+                .await
+                .map(|(stream, _)| Box::new(stream) as Box<dyn ProxyIo>),
+            #[cfg(unix)]
+            Self::Unix(listener) => listener
+                .accept()
+                .await
+                .map(|(stream, _)| Box::new(stream) as Box<dyn ProxyIo>),
+        }
     }
 }
 
 async fn serve(
-    listener: TcpListener,
+    listener: Listener,
     config: ProxyConfig,
     resolver: Arc<dyn Resolver>,
     connector: Arc<dyn Connector>,
@@ -302,7 +509,7 @@ async fn serve(
             }
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         let config = config.clone();
                         let resolver = Arc::clone(&resolver);
                         let connector = Arc::clone(&connector);
@@ -323,7 +530,7 @@ async fn serve(
 }
 
 async fn handle_client(
-    mut client: TcpStream,
+    mut client: Box<dyn ProxyIo>,
     config: ProxyConfig,
     resolver: Arc<dyn Resolver>,
     connector: Arc<dyn Connector>,
@@ -421,7 +628,7 @@ struct Request {
 }
 
 async fn read_request(
-    client: &mut TcpStream,
+    client: &mut (impl AsyncRead + Unpin),
     limit: usize,
 ) -> Result<Option<Request>, MalformedReason> {
     let mut bytes = Vec::with_capacity(1024);
@@ -618,7 +825,11 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         && !(segments[0] == 0x3fff && segments[1] <= 0x0fff)
 }
 
-async fn respond(client: &mut TcpStream, status: u16, reason: &str) -> io::Result<()> {
+async fn respond(
+    client: &mut (impl AsyncWrite + Unpin),
+    status: u16,
+    reason: &str,
+) -> io::Result<()> {
     let body = format!("{reason}\n");
     client
         .write_all(
@@ -637,6 +848,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    #[cfg(unix)]
+    use tokio::net::UnixStream;
     use tokio::time::timeout;
 
     struct FixedResolver {
@@ -745,6 +958,37 @@ mod tests {
             response.push(byte[0]);
         }
         (response, client)
+    }
+
+    #[cfg(unix)]
+    async fn unix_proxy_request(server: &UnixProxyServer, request: &[u8]) -> (Vec<u8>, UnixStream) {
+        let mut client = UnixStream::connect(server.socket_path()).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        while response.len() < 512 && !response.ends_with(b"\r\n\r\n") {
+            let count = timeout(Duration::from_secs(1), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap();
+            if count == 0 {
+                break;
+            }
+            response.push(byte[0]);
+        }
+        (response, client)
+    }
+
+    #[cfg(unix)]
+    fn fresh_socket_path() -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "tagteam-proxy-{}-{}.sock",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
     }
 
     fn allowed_host() -> AllowedHost {
@@ -876,6 +1120,115 @@ mod tests {
         assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
         server.shutdown().await;
         echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_uses_exact_hostname_policy() {
+        let (unused, echo_task) = echo_server().await;
+        let connector = Arc::new(LocalConnector::new(unused));
+        let (server, mut events, resolver) =
+            start_with(vec![public_ip()], connector.clone(), vec![allowed_host()]).await;
+        let (response, _) =
+            proxy_request(&server, b"CONNECT sub.crates.io:443 HTTP/1.1\r\n\r\n").await;
+        assert!(response.starts_with(b"HTTP/1.1 403"));
+        assert_eq!(
+            events.recv().await,
+            Some(ConnectionOutcome::Denied(DenyReason::HostNotAllowed))
+        );
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+        server.shutdown().await;
+        echo_task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_listener_enforces_policy_permissions_and_owned_socket_cleanup() {
+        let (upstream, echo_task) = echo_server().await;
+        let connector = Arc::new(LocalConnector::new(upstream));
+        let resolver = Arc::new(FixedResolver::new(vec![public_ip()]));
+        let path = fresh_socket_path();
+        let (server, mut events) = ProxyServer::start_unix(
+            &path,
+            ProxyConfig::new(vec![allowed_host()]),
+            resolver.clone(),
+            connector.clone(),
+        )
+        .await
+        .unwrap();
+        let mode = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let (response, mut client) = unix_proxy_request(
+            &server,
+            b"CONNECT crates.io:443 HTTP/1.1\r\n\r\nthrough-tunnel",
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 200 Connection Established"));
+        let mut echoed = [0; 14];
+        timeout(Duration::from_secs(1), client.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&echoed, b"through-tunnel");
+        drop(client);
+        assert_eq!(events.recv().await, Some(ConnectionOutcome::Allowed));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+
+        let (response, _) =
+            unix_proxy_request(&server, b"CONNECT sub.crates.io:443 HTTP/1.1\r\n\r\n").await;
+        assert!(response.starts_with(b"HTTP/1.1 403"));
+        assert_eq!(
+            events.recv().await,
+            Some(ConnectionOutcome::Denied(DenyReason::HostNotAllowed))
+        );
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+
+        server.shutdown().await;
+        assert!(!path.exists());
+        echo_task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_listener_rejects_existing_and_symlink_paths_without_removing_them() {
+        let existing_path = fresh_socket_path();
+        std::fs::write(&existing_path, b"keep").unwrap();
+        let resolver = Arc::new(FixedResolver::new(vec![public_ip()]));
+        let connector = Arc::new(LocalConnector::new("127.0.0.1:1".parse().unwrap()));
+        let result = ProxyServer::start_unix(
+            &existing_path,
+            ProxyConfig::default(),
+            resolver.clone(),
+            connector.clone(),
+        )
+        .await;
+        assert!(matches!(result, Err(StartError::UnixPathExists(_))));
+        assert_eq!(std::fs::read(&existing_path).unwrap(), b"keep");
+        std::fs::remove_file(&existing_path).unwrap();
+
+        let target = fresh_socket_path();
+        std::fs::write(&target, b"keep").unwrap();
+        let link = fresh_socket_path();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let result =
+            ProxyServer::start_unix(&link, ProxyConfig::default(), resolver, connector).await;
+        assert!(matches!(result, Err(StartError::InvalidUnixPath)));
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_file(target).unwrap();
     }
 
     #[tokio::test]
