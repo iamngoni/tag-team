@@ -28,11 +28,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes protobuf-compiler bubblewrap
-
-      - name: Install macOS prerequisites
-        if: runner.os == 'macOS'
-        run: brew install protobuf
+          sudo apt-get install --yes bubblewrap
 
       - name: Install pinned Rust toolchain
         run: |

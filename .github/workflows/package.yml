@@ -35,11 +35,6 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes protobuf-compiler
-
-      - name: Install macOS prerequisites
-        if: runner.os == 'macOS'
-        run: brew install protobuf
 
       - name: Install pinned Rust toolchain
         run: |

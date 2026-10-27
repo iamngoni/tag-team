@@ -1681,6 +1681,11 @@ impl HubService {
         if !patch_within_limit {
             let limit = task.spec.limits.max_patch;
             let estimate = tagteam_core::Bytes(limit.0.saturating_add(1));
+            // A terminal status is the hand-off point: once a caller observes
+            // the failure, the borrowed-machine workspace must already be gone.
+            // This matches the successful landing path and avoids a visible
+            // failed state that still owns an active workspace.
+            self.cleanup_workspace(task, true).await;
             self.journal(move |journal| {
                 journal
                     .transition(
@@ -1696,7 +1701,6 @@ impl HubService {
                     .map(|_| ())
             })
             .await?;
-            self.cleanup_workspace(task, true).await;
             return Err(ServiceError::Invalid(format!(
                 "result patch exceeds the {limit} limit"
             )));

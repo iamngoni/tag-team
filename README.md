@@ -22,7 +22,7 @@ Local macOS arm64 checks and the bounded live Agent SDK acceptance passed on 202
 - Node.js 22+ and Claude Code signed in on the hub machine.
 - Linux nodes require `bubblewrap` (`bwrap`) and a working per-user systemd manager (`systemd-run --user`) for sandboxed execution and cgroup limits.
 - The hub and nodes must be able to reach each other over a private network; Tailscale or WireGuard is recommended.
-- Source builds additionally require Rust 1.93.1, pnpm 10.33+, and `protoc`.
+- Source builds additionally require Rust 1.93.1 and pnpm 10.33+; the pinned protobuf compiler is vendored by the build.
 - Swift/Xcode is needed only to build the optional macOS menu bar app.
 
 ## Install a GitHub release

@@ -84,11 +84,6 @@ esac
 for tool in cargo pnpm node tar; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
 done
-if [[ -n "${PROTOC:-}" ]]; then
-  [[ -x "$PROTOC" ]] || die "PROTOC does not point to an executable: $PROTOC"
-else
-  command -v protoc >/dev/null 2>&1 || die "protoc is required to build the Rust binaries"
-fi
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   die "sha256sum or shasum is required"
 fi

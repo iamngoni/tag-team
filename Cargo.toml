@@ -64,6 +64,9 @@ features = ["ring", "std", "tls12"]
 [workspace.dependencies.tonic-prost-build]
 version = "0.14.7"
 
+[workspace.dependencies.protoc-bin-vendored]
+version = "3.3.0"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 
