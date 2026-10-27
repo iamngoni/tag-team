@@ -7,6 +7,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum NoFitReason {
+    NoNodes,
     NodeNotActive {
         node: NodeId,
         state: NodeState,
@@ -83,26 +84,16 @@ pub fn place(
 ) -> Placement {
     let minute_of_day = u16::try_from((now.0 / 60_000).rem_euclid(1_440)).unwrap_or(0);
 
-    let candidates = nodes
-        .iter()
-        .filter_map(|node| match rejection(spec, node, minute_of_day) {
-            Some(reason) => {
-                if reason.is_hard() {
-                    None
-                } else {
-                    Some(Err(reason))
-                }
-            }
-            None => Some(Ok(node)),
-        })
-        .collect::<Vec<_>>();
+    if nodes.is_empty() {
+        return Placement::Queued(vec![NoFitReason::NoNodes]);
+    }
 
     let mut rejected = Vec::new();
     let mut viable = Vec::new();
-    for candidate in candidates {
-        match candidate {
-            Ok(node) => viable.push(node),
-            Err(reason) => rejected.push(reason),
+    for node in nodes {
+        match rejection(spec, node, minute_of_day) {
+            Some(reason) => rejected.push(reason),
+            None => viable.push(node),
         }
     }
 
@@ -110,30 +101,9 @@ pub fn place(
         .into_iter()
         .max_by_key(|node| score(node, spec, repo, siblings))
         .map_or_else(
-            || {
-                if rejected.is_empty() {
-                    rejected.push(NoFitReason::NodeAtCapacity {
-                        node: NodeId::new(),
-                    });
-                }
-                Placement::Queued(rejected)
-            },
+            || Placement::Queued(rejected),
             |node| Placement::Placed(node.id),
         )
-}
-
-impl NoFitReason {
-    /// Reasons that mean the node is not participating at all are not reported
-    /// individually when every node is in that state.
-    #[must_use]
-    pub fn is_hard(&self) -> bool {
-        matches!(
-            self,
-            Self::NodeNotActive { .. }
-                | Self::OwnerPresent { .. }
-                | Self::OutsideAllowedHours { .. }
-        )
-    }
 }
 
 fn rejection(spec: &SubtaskSpec, node: &Node, minute_of_day: u16) -> Option<NoFitReason> {
@@ -352,5 +322,36 @@ mod tests {
             Timestamp::now(),
         );
         assert_eq!(placement, Placement::Placed(cached.id));
+    }
+
+    #[test]
+    fn no_match_reports_every_specific_reason() {
+        let repo = RepoId(GitOid::zero());
+        assert_eq!(
+            place(&spec(), &repo, &[], &[], Timestamp::now()),
+            Placement::Queued(vec![NoFitReason::NoNodes])
+        );
+
+        let mut paused = node("paused", 4.0);
+        paused.state = NodeState::Paused;
+        let mut present = node("present", 4.0);
+        present.policy.only_when_idle = true;
+        present.presence = OwnerPresence::Present;
+        assert_eq!(
+            place(
+                &spec(),
+                &repo,
+                &[paused.clone(), present.clone()],
+                &[],
+                Timestamp::now()
+            ),
+            Placement::Queued(vec![
+                NoFitReason::NodeNotActive {
+                    node: paused.id,
+                    state: NodeState::Paused,
+                },
+                NoFitReason::OwnerPresent { node: present.id },
+            ])
+        );
     }
 }

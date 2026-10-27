@@ -32,6 +32,8 @@ pub struct DispatchInput {
 pub struct DispatchReply {
     pub dispatch: DispatchId,
     pub subtasks: Vec<(SubtaskId, Placement)>,
+    /// Working-tree files omitted from the snapshot by the secret denylist.
+    pub excluded_paths: Vec<String>,
     pub watch_command: String,
 }
 

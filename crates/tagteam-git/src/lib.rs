@@ -176,6 +176,11 @@ impl Repository {
             })
     }
 
+    /// Resolve a caller-supplied revision to the exact commit the hub records.
+    pub fn resolve_revision(&self, revision: &str) -> Result<GitOid> {
+        self.resolve_commit(revision).map(GitOid)
+    }
+
     /// Create a full bundle or an incremental bundle with a valid advertised
     /// prerequisite. Invalid, unavailable, or unrelated prerequisites use full.
     pub fn create_bundle(

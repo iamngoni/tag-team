@@ -149,7 +149,7 @@ async fn dropped_raw_peer_does_not_stop_the_daemon() {
 }
 
 #[tokio::test]
-async fn unsupported_dispatch_is_a_structured_daemon_error() {
+async fn empty_dispatch_is_a_structured_daemon_error() {
     let directory = tempfile::tempdir().expect("tempdir");
     let config = config(&directory);
     let ca = Arc::new(HubCa::generate().expect("CA"));
@@ -165,8 +165,8 @@ async fn unsupported_dispatch_is_a_structured_daemon_error() {
             },
         ))
         .await
-        .expect_err("dispatch is not implemented");
-    assert!(error.to_string().contains("orchestration"));
+        .expect_err("empty dispatch is rejected");
+    assert!(error.to_string().contains("at least one subtask"));
     shutdown.send_replace(true);
     runner.await.expect("server join").expect("server shutdown");
 }

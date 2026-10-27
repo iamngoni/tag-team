@@ -891,4 +891,11 @@ The loopback spine is designed to use a fake runner so it spends no Claude token
 
 ## Status
 
-Initial repository and contracts are being implemented. The README will be updated as soon as the first end-to-end loopback spine passes; until then, none of the runtime paths above should be described as working.
+Current implementation boundary as of 2026-10-27:
+
+- **Hub foundations:** SQLite WAL journal, atomic state/event transitions, mTLS invite enrolment, node approval/pause/resume/removal, heartbeat and capacity reporting, CA persistence, blob transport, and the private local API are implemented and covered by Rust tests.
+- **Durable MCP dispatch:** the hub validates 1–8 subtasks at the local-socket boundary, snapshots dirty and untracked work through a private Git index, excludes the secret denylist, reuses one snapshot per base/state pair, schedules against live node capacity and requirements, persists each subtask with a review branch name, and returns explicit placement or queued reasons. This path is covered by focused hub tests, including `.env` exclusion and missing-toolchain reporting.
+- **Node execution:** the node has mTLS session handling, durable command receipts, sandboxed execution, output limits, timeout/process-group termination, and workspace filesystem operations. These are tested in isolation.
+- **Runner:** the JSON Lines runner protocol, TypeScript Agent SDK loop skeleton, tool allow-list, and hub-side runner process wrapper exist, but dispatch does not yet launch a runner.
+
+The first complete boundary is **not** live yet. A placed subtask stops at `preparing`: the hub does not yet fetch/prepare the node bundle, send the preparation command, start the Agent SDK runner, bridge remote tool calls, collect the result bundle, verify ancestry, or land the review branch. Until the loopback spine and then a live two-machine run pass, do not describe end-to-end execution, runtime verification, or deployment as working.

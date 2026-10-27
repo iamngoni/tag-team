@@ -5,18 +5,23 @@
 //! validated at this boundary; callers never receive raw SQLite or filesystem errors.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, hash_map::Entry},
+    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use data_encoding::BASE32_NOPAD;
 use tagteam_core::{
-    Event, EventKind, MainSessionId, Subtask, SubtaskId, SubtaskState, Timestamp,
+    Dispatch, DispatchId, Event, EventKind, MainSessionId, RepoId, Subtask, SubtaskId, SubtaskSpec,
+    SubtaskState, Timestamp,
     local_api::{
-        BriefReply, CollectReply, InviteReply, LOCAL_PROTOCOL_VERSION, LocalRequest,
-        LocalResponseBody, LogsReply, NodeView, StatusReply, SubtaskStatus, WatchScope,
+        BriefReply, CollectReply, DispatchInput, DispatchReply, InviteReply,
+        LOCAL_PROTOCOL_VERSION, LocalRequest, LocalResponseBody, LogsReply, NodeView, StatusReply,
+        SubtaskStatus, WatchScope,
     },
+    schedule::{Placement, place},
+    state::SubtaskInput,
 };
 use tagteam_git::Repository;
 use tagteam_pki::{HubCa, Invite};
@@ -141,9 +146,10 @@ impl HubService {
                 Ok(LocalResponseBody::Bound)
             }
             LocalRequest::Nodes => self.node_views().await.map(LocalResponseBody::Nodes),
-            LocalRequest::Dispatch(_) => Err(ServiceError::Unsupported(
-                "the orchestration dispatch path is not wired yet".into(),
-            )),
+            LocalRequest::Dispatch(input) => self
+                .dispatch(input)
+                .await
+                .map(LocalResponseBody::Dispatched),
             LocalRequest::Status { ids } => self.status(ids).await.map(LocalResponseBody::Status),
             LocalRequest::Inbox {
                 since_seq,
@@ -284,6 +290,144 @@ impl HubService {
                 }
             })
             .collect())
+    }
+
+    async fn dispatch(&self, input: DispatchInput) -> Result<DispatchReply, ServiceError> {
+        if input.subtasks.is_empty() {
+            return Err(ServiceError::Invalid(
+                "dispatch needs at least one subtask".into(),
+            ));
+        }
+        if input.subtasks.len() > 8 {
+            return Err(ServiceError::Invalid(
+                "dispatch accepts at most eight subtasks".into(),
+            ));
+        }
+        if input
+            .claude_session
+            .as_deref()
+            .is_some_and(|session| session.trim().is_empty())
+        {
+            return Err(ServiceError::Invalid(
+                "Claude session id must not be empty".into(),
+            ));
+        }
+
+        let DispatchInput {
+            main_session,
+            claude_session,
+            repo,
+            subtasks: raw_subtasks,
+            spread,
+        } = input;
+        let repository_root = repo.canonicalize().map_err(|error| {
+            ServiceError::Invalid(format!("dispatch repository is not accessible: {error}"))
+        })?;
+        let repository = Repository::open(&repository_root)?;
+        if repository.path() != repository_root {
+            return Err(ServiceError::Invalid(
+                "dispatch repository must be the repository root".into(),
+            ));
+        }
+        let repository_path = repository.path().to_path_buf();
+
+        let mut subtasks = raw_subtasks;
+        for spec in &mut subtasks {
+            normalize_and_validate_spec(spec, &repository_path)?;
+        }
+
+        // Resolve every distinct snapshot before creating durable work. A bad
+        // revision or inaccessible worktree must not leave an empty dispatch.
+        let mut snapshots: HashMap<(String, bool), ResolvedSnapshot> = HashMap::new();
+        for spec in &subtasks {
+            let cache_key = (spec.base_ref.clone(), spec.include_uncommitted);
+            if let Entry::Vacant(entry) = snapshots.entry(cache_key) {
+                let resolved = resolve_snapshot(
+                    repository.clone(),
+                    spec.base_ref.clone(),
+                    spec.include_uncommitted,
+                )
+                .await?;
+                entry.insert(resolved);
+            }
+        }
+
+        let id = DispatchId::new();
+        let created = Timestamp::now();
+        let dispatch = Dispatch {
+            id,
+            main_session,
+            claude_session,
+            repo: repository_path.clone(),
+            created,
+        };
+        self.journal(move |journal| journal.create_dispatch(&dispatch))
+            .await?;
+
+        let mut nodes = self.journal(|journal| journal.list_nodes()).await?;
+        let mut siblings = Vec::new();
+        let mut placements = Vec::with_capacity(subtasks.len());
+        let mut excluded_paths = HashSet::new();
+
+        for spec in subtasks {
+            let cache_key = (spec.base_ref.clone(), spec.include_uncommitted);
+            let snapshot = snapshots
+                .get(&cache_key)
+                .cloned()
+                .ok_or_else(|| ServiceError::Internal)?;
+            excluded_paths.extend(snapshot.excluded_paths.iter().cloned());
+
+            let subtask_id = SubtaskId::new();
+            let branch = branch_name(&spec.title, subtask_id);
+            let task = Subtask {
+                id: subtask_id,
+                dispatch: id,
+                spec: spec.clone(),
+                state: SubtaskState::Placing,
+                node: None,
+                attempt: 0,
+                base: snapshot.base,
+                repo_id: snapshot.repo_id.clone(),
+                branch,
+                runner_session: None,
+                created,
+                started: None,
+                finished: None,
+                usage: tagteam_core::Usage::default(),
+            };
+            self.journal(move |journal| journal.create_subtask(&task))
+                .await?;
+
+            let sibling_scope = if spread { siblings.as_slice() } else { &[] };
+            let placement = place(&spec, &snapshot.repo_id, &nodes, sibling_scope, created);
+            let transition = match &placement {
+                Placement::Placed(node) => {
+                    siblings.push(*node);
+                    if let Some(selected) = nodes.iter_mut().find(|node_view| node_view.id == *node)
+                    {
+                        selected.capacity.running = selected.capacity.running.saturating_add(1);
+                    }
+                    SubtaskInput::Placed { node: *node }
+                }
+                Placement::Queued(reasons) => SubtaskInput::NoFit {
+                    reasons: reasons.clone(),
+                },
+            };
+            self.journal(move |journal| {
+                journal.transition(subtask_id, transition, Timestamp::now())
+            })
+            .await?;
+            placements.push((subtask_id, placement));
+        }
+
+        let mut excluded_paths = excluded_paths.into_iter().collect::<Vec<_>>();
+        excluded_paths.sort();
+        Ok(DispatchReply {
+            dispatch: id,
+            subtasks: placements,
+            excluded_paths,
+            watch_command: format!("tagteam watch --dispatch {id}"),
+        })
     }
 
     async fn status(&self, ids: Option<Vec<SubtaskId>>) -> Result<StatusReply, ServiceError> {
@@ -497,6 +641,175 @@ impl HubService {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedSnapshot {
+    base: tagteam_core::GitOid,
+    repo_id: RepoId,
+    excluded_paths: Vec<String>,
+}
+
+/// Resolve and validate direct daemon input. The MCP shim rejects malformed
+/// schemas first, but the local socket is also a trust boundary: callers cannot
+/// smuggle in a different repository, empty checks, or unbounded limits.
+fn normalize_and_validate_spec(
+    spec: &mut SubtaskSpec,
+    repository: &Path,
+) -> Result<(), ServiceError> {
+    spec.title = spec.title.trim().to_owned();
+    if spec.title.is_empty() {
+        return Err(ServiceError::Invalid(
+            "subtask title must not be empty".into(),
+        ));
+    }
+    spec.prompt = spec.prompt.trim().to_owned();
+    if spec.prompt.is_empty() {
+        return Err(ServiceError::Invalid(format!(
+            "subtask {:?} prompt must not be empty",
+            spec.title
+        )));
+    }
+    if spec.done_when.is_empty() {
+        return Err(ServiceError::Invalid(format!(
+            "subtask {:?} needs at least one done_when command",
+            spec.title
+        )));
+    }
+    for command in &mut spec.done_when {
+        *command = command.trim().to_owned();
+        if command.is_empty() {
+            return Err(ServiceError::Invalid(format!(
+                "subtask {:?} has an empty done_when command",
+                spec.title
+            )));
+        }
+    }
+
+    spec.base_ref = spec.base_ref.trim().to_owned();
+    if spec.base_ref.is_empty() {
+        return Err(ServiceError::Invalid("base_ref must not be empty".into()));
+    }
+    for host in &mut spec.egress {
+        *host = host.trim().to_owned();
+        if host.is_empty() {
+            return Err(ServiceError::Invalid(
+                "egress hosts must not be empty".into(),
+            ));
+        }
+    }
+    spec.node_hint = spec
+        .node_hint
+        .take()
+        .map(|hint| hint.trim().to_owned())
+        .filter(|hint| !hint.is_empty());
+    for (name, _) in &mut spec.needs.toolchains {
+        *name = name.trim().to_owned();
+        if name.is_empty() {
+            return Err(ServiceError::Invalid(
+                "toolchain name must not be empty".into(),
+            ));
+        }
+    }
+    if spec.needs.cores == 0 {
+        return Err(ServiceError::Invalid(
+            "needs.cores must be greater than zero".into(),
+        ));
+    }
+    if spec.limits.max_turns == 0 {
+        return Err(ServiceError::Invalid(
+            "limits.max_turns must be greater than zero".into(),
+        ));
+    }
+    for (field, duration) in [
+        ("wall_clock", spec.limits.wall_clock),
+        ("command_timeout", spec.limits.command_timeout),
+        ("question_deadline", spec.limits.question_deadline),
+    ] {
+        if duration.is_zero() {
+            return Err(ServiceError::Invalid(format!(
+                "limits.{field} must be greater than zero"
+            )));
+        }
+    }
+    for (field, bytes) in [
+        ("max_output", spec.limits.max_output),
+        ("model_output", spec.limits.model_output),
+        ("max_patch", spec.limits.max_patch),
+    ] {
+        if bytes.0 == 0 {
+            return Err(ServiceError::Invalid(format!(
+                "limits.{field} must be greater than zero"
+            )));
+        }
+    }
+
+    // Placement and execution always use the dispatch repository. Ignoring a
+    // conflicting per-subtask path here would make the durable record lie.
+    spec.repo = repository.to_path_buf();
+    Ok(())
+}
+
+async fn resolve_snapshot(
+    repository: Repository,
+    base_ref: String,
+    include_uncommitted: bool,
+) -> Result<ResolvedSnapshot, ServiceError> {
+    tokio::task::spawn_blocking(move || {
+        if include_uncommitted {
+            let snapshot = repository.snapshot(&base_ref)?;
+            let repo_id = repository.repo_id(&snapshot.base.0)?;
+            Ok(ResolvedSnapshot {
+                base: snapshot.commit,
+                repo_id,
+                excluded_paths: snapshot.excluded_paths,
+            })
+        } else {
+            let base = repository.resolve_revision(&base_ref)?;
+            let repo_id = repository.repo_id(&base.0)?;
+            Ok(ResolvedSnapshot {
+                base,
+                repo_id,
+                excluded_paths: Vec::new(),
+            })
+        }
+    })
+    .await
+    .map_err(|_| ServiceError::Worker)?
+}
+
+/// Produce a safe, collision-resistant review branch name. The ULID suffix is
+/// unique even when two subtasks share a title, while the slug remains legible
+/// in Git tooling.
+fn branch_name(title: &str, id: SubtaskId) -> String {
+    const MAX_SLUG_BYTES: usize = 40;
+    let mut slug = String::with_capacity(MAX_SLUG_BYTES);
+    let mut pending_separator = false;
+    for character in title.chars() {
+        if slug.len() >= MAX_SLUG_BYTES {
+            break;
+        }
+        if character.is_ascii_alphanumeric() {
+            if pending_separator && !slug.is_empty() {
+                if slug.len() >= MAX_SLUG_BYTES {
+                    break;
+                }
+                slug.push('-');
+            }
+            if slug.len() >= MAX_SLUG_BYTES {
+                break;
+            }
+            pending_separator = false;
+            slug.push(character.to_ascii_lowercase());
+        } else {
+            pending_separator = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "task" } else { slug };
+    let encoded_id = id.to_string();
+    let suffix = &encoded_id[encoded_id.len().saturating_sub(6)..];
+    format!("tagteam/{slug}-{}", suffix.to_ascii_lowercase())
+}
+
 #[derive(Clone, Copy)]
 enum NodeAction {
     Approve,
@@ -582,3 +895,6 @@ fn render_event(event: &Event) -> String {
         }
     )
 }
+
+#[cfg(test)]
+mod tests;
