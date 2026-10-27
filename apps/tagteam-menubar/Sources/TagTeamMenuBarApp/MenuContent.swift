@@ -13,9 +13,10 @@ struct MenuContent: View {
         .accessibilityLabel("Node name: \(status.name)")
       Text(monitor.primaryStatus)
         .accessibilityLabel("Lending status: \(monitor.primaryStatus)")
-      if monitor.serviceStatusWasChecked {
-        Text(monitor.serviceStatus?.summary ?? "Service status unavailable")
-          .accessibilityLabel("Service status: \(monitor.serviceStatus?.summary ?? "unavailable")")
+      if monitor.shouldDisplayServiceStatus {
+        Text(monitor.displayedServiceStatus ?? "Service status unavailable")
+          .accessibilityLabel(
+            "Service status: \(monitor.displayedServiceStatus ?? "unavailable")")
       }
       if let capacity = status.capacitySummary {
         Text("Capacity: \(capacity)")
@@ -55,25 +56,26 @@ struct MenuContent: View {
         Label("Install service", systemImage: "square.and.arrow.down")
       }
       .disabled(monitor.status?.enrolled != true || monitor.isPerformingAction)
-    } else {
-      Button {
-        monitor.perform(.serviceStart)
-      } label: {
-        Label("Start service", systemImage: "play.fill")
-      }
+    }
+
+    Button {
+      monitor.perform(.serviceStart)
+    } label: {
+      Label("Start service", systemImage: "play.fill")
+    }
       .disabled(
-        monitor.serviceStatus?.isInstalled != true || monitor.serviceStatus?.isRunning == true
+        monitor.status?.enrolled != true || monitor.status?.left == true
+          || monitor.serviceStatus?.isInstalled == false || monitor.serviceStatus?.isRunning == true
           || monitor.isPerformingAction)
 
-      Button {
-        monitor.perform(.serviceStop)
-      } label: {
-        Label("Stop service", systemImage: "stop.fill")
-      }
-      .disabled(
-        monitor.serviceStatus?.isInstalled != true || monitor.serviceStatus?.isRunning != true
-          || monitor.isPerformingAction)
+    Button {
+      monitor.perform(.serviceStop)
+    } label: {
+      Label("Stop service", systemImage: "stop.fill")
     }
+      .disabled(
+        monitor.status?.enrolled != true || monitor.serviceStatus?.isInstalled == false
+          || monitor.serviceStatus?.isRunning == false || monitor.isPerformingAction)
 
     Button {
       monitor.perform(.pause)

@@ -56,6 +56,38 @@ send({
   mcp_servers: ["tagteam"],
 });
 
+if (String(start.prompt).includes("recovery")) {
+  const command = start.resume
+    ? "printf 'written by node B\\n' > result.txt"
+    : "touch node-a-started; sleep 34; printf 'written by node A\\n' > result.txt";
+  send({
+    type: "tool_call",
+    call_id: "fake-recovery-bash-1",
+    call: { tool: "bash", command, timeout_ms: 60000 },
+  });
+  for (;;) {
+    const message = await next();
+    if (message.type === "cancel") process.exit(0);
+    if (message.type === "tool_result") {
+      if (message.is_error) throw new Error(`recovery Bash failed: ${JSON.stringify(message)}`);
+      break;
+    }
+  }
+  send({
+    type: "tool_call",
+    call_id: "fake-recovery-finish-1",
+    call: {
+      tool: "finish",
+      outcome: "completed",
+      summary: start.resume ? "Recovered on node B." : "Completed on node A.",
+      assumptions: [],
+      checks: [],
+    },
+  });
+  await next();
+  process.exit(0);
+}
+
 if (String(start.prompt).includes("cancellation")) {
   send({
     type: "tool_call",

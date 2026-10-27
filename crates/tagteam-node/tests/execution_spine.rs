@@ -18,7 +18,11 @@ use tagteam_core::{
     Bytes, Capacity, FailReason, Limits, MainSessionId, Needs, SubtaskSpec, SubtaskState, Thermal,
     local_api::{DispatchInput, LocalRequest, LocalResponseBody},
 };
-use tagteam_hub::{config::HubConfig, journal::Journal, service::HubService};
+use tagteam_hub::{
+    config::{HubConfig, RetentionConfig},
+    journal::Journal,
+    service::HubService,
+};
 use tagteam_node::{
     CommandJournal, CommandRunner, HeartbeatSource, HubBundleSource, NodeEnrollment, NodeSession,
     SessionEvent,
@@ -112,6 +116,8 @@ fn config(
         runner_args,
         limits: Limits::default(),
         heartbeat_timeout: Duration::from_secs(90),
+        default_egress: Vec::new(),
+        retention: RetentionConfig::default(),
     }
 }
 

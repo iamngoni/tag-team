@@ -11,7 +11,7 @@ use std::{
 };
 
 use semver::{Version, VersionReq};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use ulid::Ulid;
 
 /// Maximum size of one repository or result bundle transferred over node RPC.
@@ -344,10 +344,40 @@ pub enum OwnerPresence {
     Present,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HourRange {
     pub start_minutes: u16,
     pub end_minutes: u16,
+}
+
+impl<'de> Deserialize<'de> for HourRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Representation {
+            Clock(String),
+            Minutes {
+                start_minutes: u16,
+                end_minutes: u16,
+            },
+        }
+
+        match Representation::deserialize(deserializer)? {
+            Representation::Clock(value) => {
+                crate::human::parse_hour_range(&value).map_err(serde::de::Error::custom)
+            }
+            Representation::Minutes {
+                start_minutes,
+                end_minutes,
+            } => Ok(Self {
+                start_minutes,
+                end_minutes,
+            }),
+        }
+    }
 }
 
 impl HourRange {

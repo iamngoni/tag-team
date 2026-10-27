@@ -12,7 +12,17 @@ use tagteam_core::NodePolicy;
 
 use crate::{HeartbeatSource, runtime::CommandRunner};
 
-const TOOL_NAMES: &[&str] = &["cargo", "rustc", "node", "pnpm", "git", "python3"];
+const TOOL_NAMES: &[&str] = &[
+    "cargo",
+    "rustc",
+    "node",
+    "pnpm",
+    "git",
+    "python",
+    "python3",
+    "go",
+    "xcodebuild",
+];
 static TOOLCHAINS: OnceLock<Vec<tagteam_proto::v1::Toolchain>> = OnceLock::new();
 
 #[derive(Default)]
@@ -210,22 +220,21 @@ fn probe_toolchain(name: &str) -> Option<tagteam_proto::v1::Toolchain> {
 
 fn version_args(name: &str) -> &'static [&'static str] {
     match name {
-        "rustc" => &["--version"],
-        "python3" => &["--version"],
+        // `go` and `xcodebuild` do not use the GNU-style long version flag.
+        "go" => &["version"],
+        "xcodebuild" => &["-version"],
         _ => &["--version"],
     }
 }
 
 /// Parse a tool's first semantic version, tolerating common leading `v` and labels.
 fn parse_tool_version(name: &str, output: &str) -> Option<String> {
-    let token = output.split_whitespace().find(|token| {
-        token
-            .trim_start_matches('v')
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_digit())
-    })?;
-    let token = token.trim_start_matches('v').trim_end_matches(',');
+    let token = output
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|character: char| matches!(character, ',' | ';' | ')' | '('))
+        })
+        .find_map(|token| version_token(name, token))?;
     let normalized = if token.matches('.').count() == 1 {
         format!("{token}.0")
     } else {
@@ -237,6 +246,20 @@ fn parse_tool_version(name: &str, output: &str) -> Option<String> {
         let _ = name;
         version.to_string()
     })
+}
+
+fn version_token<'a>(name: &str, token: &'a str) -> Option<&'a str> {
+    let token = token.trim_start_matches('v');
+    let token = if name == "go" {
+        token.strip_prefix("go").unwrap_or(token)
+    } else {
+        token
+    };
+    token
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+        .then_some(token)
 }
 
 fn find_executable(name: &str) -> Option<PathBuf> {
@@ -295,6 +318,18 @@ mod tests {
         assert_eq!(
             parse_tool_version("git", "git version 2.45.1").as_deref(),
             Some("2.45.1")
+        );
+        assert_eq!(
+            parse_tool_version("go", "go version go1.23.4 darwin/arm64").as_deref(),
+            Some("1.23.4")
+        );
+        assert_eq!(
+            parse_tool_version("python", "Python 3.12").as_deref(),
+            Some("3.12.0")
+        );
+        assert_eq!(
+            parse_tool_version("xcodebuild", "Xcode 16.0\nBuild version 16A242d\n").as_deref(),
+            Some("16.0.0")
         );
         assert!(parse_tool_version("node", "not installed").is_none());
     }

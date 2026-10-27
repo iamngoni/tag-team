@@ -49,6 +49,14 @@ final class NodeMonitor: ObservableObject {
     "Tag Team: \(primaryStatus)"
   }
 
+  var displayedServiceStatus: String? {
+    status?.connectionStatus?.summary ?? serviceStatus?.summary
+  }
+
+  var shouldDisplayServiceStatus: Bool {
+    serviceStatusWasChecked || status?.connectionStatus?.summary != nil
+  }
+
   var canPause: Bool {
     status?.enrolled == true && status?.paused == false && status?.left == false
   }

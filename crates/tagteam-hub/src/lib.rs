@@ -8,5 +8,6 @@ pub mod journal;
 pub mod local;
 pub mod mcp;
 pub mod nodes;
+pub mod retention;
 pub mod runner;
 pub mod service;

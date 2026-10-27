@@ -35,6 +35,28 @@ struct NodeStatusTests {
   }
 
   @Test
+  func decodesOptionalConnectionFieldsFromNodeStatus() throws {
+    let data = Data(
+      #"{"name":"lent-mac","enrolled":true,"paused":false,"left":false,"connected":false,"reconnecting":true}"#
+        .utf8)
+    let status = try NodeStatus.decode(data)
+
+    #expect(status.connectionStatus?.summary == "Reconnecting")
+  }
+
+  @Test
+  func ignoresMalformedOptionalStatusDetails() throws {
+    let data = Data(
+      #"{"name":"lent-mac","enrolled":true,"paused":false,"left":false,"node_id":42,"workspace_count":"unknown","connected":"unknown"}"#
+        .utf8)
+    let status = try NodeStatus.decode(data)
+
+    #expect(status.nodeID == nil)
+    #expect(status.workspaceCount == nil)
+    #expect(status.connectionStatus?.summary == nil)
+  }
+
+  @Test
   func decodesServiceConnectionAndReconnectStateWhenPresent() throws {
     let connected = try NodeServiceStatus.decode(
       Data(#"{"service":{"running":true,"connected":true}}"#.utf8))

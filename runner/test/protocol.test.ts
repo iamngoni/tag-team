@@ -76,10 +76,22 @@ test("stdio hub tool calls are streamed and wait for their matching result", asy
       "mcp__tagteam__ReportProgress", "mcp__tagteam__Finish", "WebFetch", "WebSearch",
     ],
     strictMcpConfig: true,
-    settingSources: ["user", "project", "local"],
+    settingSources: [],
     permissionMode: "default",
   });
   expect(Object.keys(capturedOptions?.mcpServers ?? {})).toEqual(["tagteam"]);
+  const tagteamServer = capturedOptions?.mcpServers?.["tagteam"];
+  expect(tagteamServer && "tools" in tagteamServer ? tagteamServer.tools : undefined).toEqual([
+    { name: "Bash", permission_policy: "always_ask" },
+    { name: "Read", permission_policy: "always_ask" },
+    { name: "Write", permission_policy: "always_ask" },
+    { name: "Edit", permission_policy: "always_ask" },
+    { name: "Glob", permission_policy: "always_ask" },
+    { name: "Grep", permission_policy: "always_ask" },
+    { name: "AskMain", permission_policy: "always_ask" },
+    { name: "ReportProgress", permission_policy: "always_ask" },
+    { name: "Finish", permission_policy: "always_ask" },
+  ]);
   const originalInput = { command: "pwd" };
   const permissionOptions = { signal: new AbortController().signal, toolUseID: "tool-1", requestId: "request-1" };
   const allowed = await capturedOptions?.canUseTool?.("mcp__tagteam__Bash", originalInput, permissionOptions);
@@ -88,6 +100,29 @@ test("stdio hub tool calls are streamed and wait for their matching result", asy
   expect(allowed).toMatchObject({ behavior: "allow", updatedInput: originalInput });
   expect(web).toMatchObject({ behavior: "allow", updatedInput: originalInput });
   expect(denied).toMatchObject({ behavior: "deny" });
+  const pretool = capturedOptions?.hooks?.PreToolUse?.[0]?.hooks[0];
+  const hookInput = (toolName: string) => ({
+    session_id: "session-1",
+    transcript_path: "/tmp/tagteam-runner-session.jsonl",
+    cwd: start.cwd,
+    permission_mode: "default",
+    hook_event_name: "PreToolUse" as const,
+    tool_name: toolName,
+    tool_input: originalInput,
+    tool_use_id: "tool-1",
+  });
+  const hookAllowed = await pretool?.(hookInput("mcp__tagteam__Bash"), "tool-1", {
+    signal: permissionOptions.signal,
+  });
+  const hookDenied = await pretool?.(hookInput("Bash"), "tool-1", {
+    signal: permissionOptions.signal,
+  });
+  expect(hookAllowed).toMatchObject({
+    hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+  });
+  expect(hookDenied).toMatchObject({
+    hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
+  });
   outputLines.close();
 });
 

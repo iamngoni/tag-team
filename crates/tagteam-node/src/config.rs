@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tagteam_core::{Bytes, HourRange, NodePolicy, OnReturn};
 
 const DEFAULT_CONFIG: &str = ".config/tagteam/node.toml";
@@ -39,13 +39,17 @@ pub struct NodeConfig {
     pub hub_invite: Option<String>,
     #[serde(default)]
     pub only_when_idle: bool,
-    /// Idle threshold in seconds, matching the user-facing TOML convention.
-    #[serde(default = "default_idle_after")]
+    /// Idle threshold in seconds after accepting either an integer or friendly TOML duration.
+    #[serde(
+        default = "default_idle_after",
+        deserialize_with = "deserialize_idle_after"
+    )]
     pub idle_after: u64,
     #[serde(default = "default_on_owner_return")]
     pub on_owner_return: OnReturn,
     pub max_cores: Option<u32>,
-    /// Memory limit in bytes.
+    /// Memory limit in bytes after accepting either an integer or friendly TOML byte size.
+    #[serde(default, deserialize_with = "deserialize_optional_bytes")]
     pub max_memory: Option<u64>,
     #[serde(default = "default_max_subtasks")]
     pub max_subtasks: u32,
@@ -232,6 +236,46 @@ fn default_true() -> bool {
     true
 }
 
+fn deserialize_idle_after<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Input {
+        Seconds(u64),
+        Human(String),
+    }
+
+    match Input::deserialize(deserializer)? {
+        Input::Seconds(seconds) => Ok(seconds),
+        Input::Human(value) => tagteam_core::human::parse_duration(&value)
+            .map(|duration| duration.as_secs())
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+fn deserialize_optional_bytes<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Input {
+        Bytes(u64),
+        Human(String),
+    }
+
+    Option::<Input>::deserialize(deserializer)?
+        .map(|input| match input {
+            Input::Bytes(bytes) => Ok(bytes),
+            Input::Human(value) => {
+                tagteam_core::human::parse_bytes(&value).map_err(serde::de::Error::custom)
+            }
+        })
+        .transpose()
+}
+
 fn expand_path(path: &Path) -> Result<PathBuf, ConfigError> {
     let value = path.to_string_lossy();
     if value == "~" || value.starts_with("~/") {
@@ -272,6 +316,42 @@ mod tests {
         let mut invalid = config;
         invalid.max_subtasks = 0;
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn config_accepts_friendly_durations_bytes_and_hour_ranges() {
+        let config: NodeConfig =
+            toml::from_str("idle_after='10m'\nmax_memory='12G'\nhours=['22:00-07:00']\n")
+                .expect("friendly config parses");
+        assert_eq!(config.idle_after, 600);
+        assert_eq!(config.max_memory, Some(12 * 1024_u64.pow(3)));
+        assert_eq!(
+            config.hours,
+            Some(vec![tagteam_core::HourRange {
+                start_minutes: 1320,
+                end_minutes: 420,
+            }])
+        );
+        assert!(config.validate().is_ok());
+
+        let struct_range: NodeConfig =
+            toml::from_str("hours=[{start_minutes=1320,end_minutes=420}]\n")
+                .expect("legacy hour range parses");
+        assert_eq!(struct_range.hours, config.hours);
+
+        let legacy: NodeConfig =
+            toml::from_str("idle_after=90\nmax_memory=2048\n").expect("legacy values parse");
+        assert_eq!(legacy.idle_after, 90);
+        assert_eq!(legacy.max_memory, Some(2048));
+    }
+
+    #[test]
+    fn config_rejects_ambiguous_or_overflowing_human_values() {
+        assert!(toml::from_str::<NodeConfig>("idle_after='1.5h'\n").is_err());
+        assert!(toml::from_str::<NodeConfig>("idle_after='18446744073709551615w'\n").is_err());
+        assert!(toml::from_str::<NodeConfig>("max_memory='1.5G'\n").is_err());
+        assert!(toml::from_str::<NodeConfig>("max_memory='18446744073709551615T'\n").is_err());
+        assert!(toml::from_str::<NodeConfig>("hours=['24:00-07:00']\n").is_err());
     }
 
     #[test]

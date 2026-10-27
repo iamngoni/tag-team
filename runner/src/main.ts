@@ -18,6 +18,9 @@ const MAX_PENDING_TOOLS = 32;
 const REMOTE_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "AskMain", "ReportProgress", "Finish"] as const;
 const BUILTIN_WEB_TOOLS = ["WebFetch", "WebSearch"] as const;
 const MCP_SERVER = "tagteam";
+const MCP_ALLOWED_TOOLS = REMOTE_TOOLS.map((name) => `mcp__${MCP_SERVER}__${name}`);
+const ALLOWED_RUNNER_TOOLS = [...MCP_ALLOWED_TOOLS, ...BUILTIN_WEB_TOOLS];
+const ALLOWED_RUNNER_TOOL_SET = new Set<string>(ALLOWED_RUNNER_TOOLS);
 
 type DeferredToolResult = {
   resolve: (result: { text: string; is_error: boolean }) => void;
@@ -252,10 +255,17 @@ function toolSchemas(sendToolCall: (call: RemoteCall) => Promise<{ text: string;
 }
 
 function sdkOptions(start: Extract<HubToRunner, { type: "start" }>, server: ReturnType<typeof createSdkMcpServer>, abortController: AbortController): Options {
-  const allowedTools = [
-    ...REMOTE_TOOLS.map((name) => `mcp__${MCP_SERVER}__${name}`),
-    ...BUILTIN_WEB_TOOLS,
-  ];
+  // A bare `allowedTools` entry normally short-circuits the permission
+  // callback. Mark every remote tool `always_ask`, then repeat the allow-list
+  // in PreToolUse so neither SDK defaults nor project settings can silently
+  // auto-approve a tool the runner did not intend to expose.
+  const taggedServer = {
+    ...server,
+    tools: REMOTE_TOOLS.map((name) => ({
+      name,
+      permission_policy: "always_ask" as const,
+    })),
+  };
   return {
     abortController,
     cwd: start.cwd,
@@ -263,7 +273,7 @@ function sdkOptions(start: Extract<HubToRunner, { type: "start" }>, server: Retu
     ...(start.resume ? { resume: start.resume } : {}),
     systemPrompt: { type: "preset", preset: "claude_code", append: start.system_append },
     tools: [...BUILTIN_WEB_TOOLS],
-    allowedTools,
+    allowedTools: ALLOWED_RUNNER_TOOLS,
     disallowedTools: [
       "Agent", "AgentOutput", "AskUserQuestion", "Bash", "Config", "EnterPlanMode", "EnterWorktree",
       "ExitPlanMode", "ExitWorktree", "Glob", "Grep", "KillShell", "ListMcpResources", "ListMcpServers",
@@ -273,12 +283,32 @@ function sdkOptions(start: Extract<HubToRunner, { type: "start" }>, server: Retu
     ],
     permissionMode: "default",
     canUseTool: async (toolName, input) => {
-      if (allowedTools.includes(toolName)) return { behavior: "allow", updatedInput: input };
+      if (ALLOWED_RUNNER_TOOL_SET.has(toolName)) return { behavior: "allow", updatedInput: input };
       return { behavior: "deny", message: `Tool ${toolName} is not allowed by Tag Team runner policy.` };
     },
-    mcpServers: { [MCP_SERVER]: server },
+    hooks: {
+      PreToolUse: [{
+        hooks: [async (input) => {
+          const allowed = input.hook_event_name === "PreToolUse"
+            && ALLOWED_RUNNER_TOOL_SET.has(input.tool_name);
+          return {
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse",
+              permissionDecision: allowed ? "allow" : "deny",
+              permissionDecisionReason: allowed
+                ? "Tool is allowed by Tag Team runner policy."
+                : "Tool is not allowed by Tag Team runner policy.",
+            },
+          };
+        }],
+      }],
+    },
+    mcpServers: { [MCP_SERVER]: taggedServer },
     strictMcpConfig: true,
-    settingSources: ["user", "project", "local"],
+    // The runner is an execution boundary, not an interactive Claude Code
+    // profile. Loading user/project/local settings would also load hooks and
+    // permission policy that run outside Tag Team's tool allow-list.
+    settingSources: [],
   };
 }
 

@@ -24,6 +24,8 @@ fn config(directory: &TempDir) -> HubConfig {
         runner_args: Vec::new(),
         limits: tagteam_core::Limits::default(),
         heartbeat_timeout: Duration::from_secs(90),
+        default_egress: Vec::new(),
+        retention: crate::config::RetentionConfig::default(),
     }
 }
 

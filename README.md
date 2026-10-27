@@ -808,28 +808,21 @@ tagteam/
 
 # Implementation addendum — 2026-10-27
 
-The design note above remains the product source of truth. This section records the decisions made when implementation started.
+The design note above remains the product source of truth. This addendum records the implementation that exists in this repository, the decisions taken while building it, and the proof boundary. Where the design describes a future security boundary, it is called out explicitly rather than presented as finished.
 
-## What is being built
+## Product boundary
 
-Tag Team is a standalone control plane for running independent Claude Code subtasks on enrolled machines:
+Tag Team is a standalone control plane for running Claude Code subtasks on enrolled machines:
 
-- the **hub** keeps the durable journal, chooses nodes, runs the MCP surface, tracks the Agent SDK runners, verifies `done_when`, and lands result branches;
-- each **runner** keeps the Claude agent loop on the main machine and uses only explicitly allowed tools;
-- each **node** runs commands and file operations inside an OS sandbox on a borrowed Mac or Linux box;
-- the **plugin** gives Claude Code the `/tag-team` skill, session identity, MCP wiring and status hint.
+- the **hub** owns the durable journal, placement, node leases, runner supervision, MCP surface, `done_when` verification, review-branch landing, and retention;
+- each **runner** keeps the Claude Agent SDK loop on the main machine and reaches borrowed machines only through Tag Team MCP tools;
+- each **node** executes the resulting commands inside an OS sandbox, with a local command journal, owner policy, egress proxy, and heartbeat;
+- the **plugin** supplies the `/tag-team` skill, session binding, status context, and Stop hook;
+- the **macOS menu bar app** and `tagteam-service` crate provide owner-facing node status and per-user service controls.
 
-The first complete boundary is the real spine, not a mock-up:
+The implemented spine is real rather than a mock-up: a one-time mTLS enrolment is approved on the hub, work is dispatched through the MCP/local API, a runner calls remote tools, the node executes them in confinement, and the hub lands one unmerged review branch after rechecking `done_when`. The owner's HEAD, index, working tree, and current branch are not modified by result landing.
 
-1. Enrol a node with a one-time invite, approve it, and show its live capacity.
-2. Dispatch work through MCP.
-3. Execute every remote operation in the node sandbox.
-4. Run the Claude Agent SDK loop on the main machine.
-5. Collect a reviewable branch, re-check `done_when` on the hub, and leave the owner's checkout untouched.
-
-`ask_main`, steering, reassignment/resume, owner-return policies, managed toolchains, the menu-bar app and friends’ machines remain in the complete design but are not claimed as implemented yet.
-
-## Architecture decisions
+## Architecture
 
 | Process | Where | Transport |
 |---|---|---|
@@ -837,67 +830,191 @@ The first complete boundary is the real spine, not a mock-up:
 | `tagteam mcp` | main machine, one stdio shim per Claude session | length-delimited JSON over a private Unix socket |
 | Agent SDK runner | main machine, one process per subtask | JSON Lines over stdio |
 | `tagteam-node` | borrowed machine | gRPC over mTLS; nodes always dial out |
+| owner surfaces | hub or node machine | CLI, native menu bar, per-user LaunchAgent/systemd user unit |
 
-The note’s original custom channel is not the only wake-up mechanism: channels are a research preview and require `--dangerously-load-development-channels`. The implementation layers `inbox(wait)`, `tagteam watch`, an MCP status hook, and best-effort channel push.
+The original custom-channel design is not implemented. Answer and steering delivery use the runner JSON Lines protocol with durable delivery rows, runner acknowledgement, and replay on reconnect. The main session can also observe work through MCP status, `inbox(wait)`, `tagteam watch`, and the Stop hook.
 
-Hard invariants:
+## Security and execution invariants
 
-1. A state change and its event commit in one SQLite WAL transaction.
-2. The node supervisor never opens workspace files directly; all workspace actions go through the sandbox.
-3. Runners are allow-listed to Tag Team tools, `WebFetch` and `WebSearch`, enforced even under `bypassPermissions`.
-4. Result branches are never merged automatically. The hub verifies bundle integrity, ancestry and `done_when`.
-5. Every node action is idempotent by `command_id`; a reconnect cannot run a command twice.
+1. A journal state change and its event commit in the same SQLite WAL transaction.
+2. Every runner-requested Bash, Read, Write, Edit, Glob, or Grep operation becomes an idempotent node command. Bash and filesystem helpers execute through the macOS Seatbelt or Linux bubblewrap sandbox. Workspace preparation, collection, and cleanup remain node-controlled lifecycle operations with path, digest, and size checks.
+3. The runner allow-list is enforced in layers: `allowedTools`, `disallowedTools`, `canUseTool`, a `PreToolUse` hook, and `permission_policy: "always_ask"` on every remote tool. `settingSources` is `[]`, so user/project/local Claude settings and hooks cannot override Tag Team policy.
+4. The node receives the owner's `NodePolicy` in the authenticated Hello. It independently rejects repositories outside `allowed_repo_ids`, resource profiles above local `max_cores`/`max_memory`, oversized egress lists, and malformed exact DNS hosts. The hub also schedules against node capacity, owner hours, battery state, repository head, and toolchain requirements.
+5. Every node action is idempotent by `command_id`. A completed result survives reconnect; an interrupted pre-result command becomes a durable non-retryable failure instead of remaining `InProgress` forever.
+6. Result branches are never merged automatically. The hub verifies bundle digest and connectivity, checks ancestry, enforces the aggregate patch limit for every command path including Bash, re-runs `done_when`, and only then creates the review branch.
+7. Answers and steering instructions are durable, acknowledged, and replayable. Unanswered questions expire to explicit best-judgment guidance. The Stop hook blocks while work is waiting, treats remote question text as delimited untrusted data, and honours `stop_hook_active`.
+8. Egress is proxy-only inside the sandbox. The proxy requires exact allow-listed DNS hostnames and rejects direct IPs, unlisted names, unsafe or mixed DNS resolution, disallowed ports, and malformed requests. Hub default hosts and node `extra_hosts` are normalized and de-duplicated.
+9. Terminal, cancelled, and failed-preparation work emits a node cleanup command. The current node removes its per-subtask workspace; a persistent repository object cache is not implemented yet.
 
-## Resolved open questions
+## Configuration and operation
 
-- **Default result:** return a branch for review; create a worktree only with `collect { worktree: true }`.
-- **Lending:** the initial boundary supports your own machines. Friends’ machines require a separate `_tagteam` service user and explicit per-repo trust.
-- **Toolchain mismatch:** fail placement with a specific reason. Managed toolchains come later.
-- **Linux idle detection:** treat Linux nodes as dedicated schedules until a tray/service reports reliable idleness.
-- **Dirty work:** snapshot the whole working tree through a temporary Git index, including untracked files, with a secret denylist.
-- **Node git:** use a per-workspace clone with a read-only object cache rather than a shared worktree admin directory.
-- **Concurrency:** default to two runners per account on a loaded main machine, then measure and raise it.
+Node configuration defaults to `~/.config/tagteam/node.toml`. `join` persists a private mode-0600 identity/config and removes the consumed invite from the saved configuration; it does **not** install a background service. A representative configuration is:
+
+```toml
+name = "studio-mac"
+data_dir = "~/.local/share/tagteam-node"
+only_when_idle = true
+idle_after = "10m"
+on_owner_return = "pause"
+max_cores = 4
+max_memory = "12G"
+max_subtasks = 1
+hours = ["22:00-07:00"]
+never_on_battery = true
+extra_hosts = ["git.example"]
+# Root commit IDs this borrowed machine may execute. Omit only on a trusted
+# own machine; [] denies every repository.
+allowed_repo_ids = ["0123456789abcdef0123456789abcdef01234567"]
+```
+
+Durations and byte sizes accept friendly values (`30s`, `45m`, `30d`, `12G`) as well as legacy integer fields where supported. Invalid or conflicting representations fail configuration loading.
+
+Hub configuration defaults to `~/.config/tagteam/hub.toml`:
+
+```toml
+listen = "127.0.0.1:7443"
+public_address = "https://hub.example.ts.net"
+data_dir = "~/.local/share/tagteam"
+max_concurrent_per_account = 2
+heartbeat_timeout_seconds = 90
+runner_program = "node"
+runner_args = ["/absolute/path/to/tag-team/runner/dist/src/main.js"]
+default_egress = [
+  "crates.io",
+  "static.crates.io",
+  "index.crates.io",
+  "registry.npmjs.org",
+  "pypi.org",
+  "files.pythonhosted.org",
+  "proxy.golang.org",
+]
+
+[limits]
+wall_clock = "45m"
+command_timeout = "10m"
+question_deadline = "10m"
+
+[retention]
+events = "30d"
+blobs = "7d"
+```
+
+Retention runs once while the hub opens and then hourly. It removes old terminal event history and unreferenced content-addressed blobs; active journal rows and referenced blobs are retained. A failed sweep is logged without stopping the daemon.
+
+Node lifecycle commands are:
+
+```bash
+tagteam-node join <invite> --name studio-mac
+tagteam-node probe
+tagteam-node run
+tagteam-node status
+tagteam-node pause
+tagteam-node resume
+tagteam-node leave
+tagteam-node service install
+tagteam-node service start
+tagteam-node service stop
+tagteam-node service restart
+tagteam-node service status --json
+tagteam-node service uninstall
+```
+
+`pause` and `leave` use local control files and stop an installed service when present; `resume` starts it again if installed. `leave` retains the local identity but disables reconnects. Hub services use the same install/start/stop/restart/status/uninstall interface through `tagteam service`. On macOS these are per-user LaunchAgents; on Linux they are per-user systemd units.
+
+The menu bar app lives at `apps/tagteam-menubar`. It reads `tagteam-node status` every three seconds and exposes pause, resume, leave, service controls, config opening, and node-ID copy. `Scripts/build-app.sh` builds an ad-hoc signed `TagTeam.app`; installation is a manual copy to `/Applications`.
+
+## Heartbeat and placement evidence
+
+The node heartbeat reports CPU and memory capacity, the free space of the volume containing its workspace path, battery state with a `battery_known` flag, local minute-of-day, idle duration, running workspaces, cached repository heads, and versions for:
+
+`cargo`, `rustc`, `node`, `pnpm`, `git`, `python`, `python3`, `go`, and `xcodebuild`.
+
+Missing idle evidence fails safe to `Present` for idle-only scheduling. Unknown battery evidence fails closed when `never_on_battery` is set. Configured owner hours use the node's local clock, including daylight-saving changes. Placement fails fast with a specific missing-toolchain reason; managed toolchain installation is not implemented.
+
+## Interactive and recovery behavior
+
+`AskMain` persists the question and leaves the runner tool promise pending. `tagteam answer` or the MCP `answer` tool commits the answer and a delivery row before attempting to send it; the runner acknowledges delivery, and an unacknowledged delivery is replayed when a runner becomes ready. `tagteam steer` uses the same durable pattern. The one-second expiry sweep closes overdue questions and resumes the runner with explicit timeout guidance.
+
+Heartbeat loss and owner-return policy are reconciled by the hub. Work can be paused and resumed on the same node, or reassigned to another online node with the original runner session. Reassignment cancels the old runner and remote command, aborts the process-local driver, and prevents a stopped attempt's late result from replacing the new attempt's durable completion. The node command journal preserves completed and cancelled results across reconnect.
+
+The loopback two-node recovery test proves:
+
+- node A starts a slow sandboxed command and then disappears;
+- B is selected after lease expiry and resumes the original runner session;
+- exactly one review branch contains B's result;
+- the owner checkout remains unchanged;
+- A's delayed local side effect stays in A's workspace;
+- reconnecting A and replaying its late result does not replace B's done state or duplicate the branch.
 
 ## Repository map
 
 ```text
-proto/tagteam/v1/tagteam.proto   node ↔ hub gRPC contract
-crates/tagteam-core/             durable types, state machine, scheduling, runner/local protocols
+proto/tagteam/v1/tagteam.proto   node <-> hub gRPC contract
+crates/tagteam-core/             durable types, state machine, scheduling, protocols
 crates/tagteam-proto/            generated gRPC bindings
-crates/tagteam-pki/              invites and mTLS identities
-crates/tagteam-git/              snapshots, bundles, fetching, worktrees
+crates/tagteam-pki/              invites, CA, mTLS identities
+crates/tagteam-git/              snapshots, bundles, ancestry, review branches
 crates/tagteam-sandbox/          Seatbelt / bubblewrap confinement
-crates/tagteam-proxy/            allow-list CONNECT proxy
-crates/tagteam-hub/              hub daemon, journal, scheduler, MCP shim, CLI
-crates/tagteam-node/             enrolment, session, sandboxed exec and fs operations
+crates/tagteam-proxy/            exact-hostname allow-list HTTP(S) proxy
+crates/tagteam-hub/              daemon, journal, scheduler, MCP shim, CLI
+crates/tagteam-node/             enrollment, session, sandboxed commands, heartbeat
+crates/tagteam-service/          per-user LaunchAgent/systemd management
 runner/                          Claude Agent SDK loop and remote tool bridge
-plugin/                          Claude Code plugin, skill and hooks
-tests/                           protocol fixtures, sandbox escapes, end-to-end spine
+plugin/                          Claude Code skill, MCP wiring, hooks
+apps/tagteam-menubar/            native macOS menu bar owner surface
+scripts/                         loopback and opt-in live acceptance entrypoints
+tests/integration/               workspace contract test
+tests/sandbox/                   OS sandbox escape and cancellation tests
+tests/fixtures/                  repository and protocol fixtures
 ```
 
-## Development
+## Development and proof
 
 ```bash
-export CARGO_BUILD_JOBS=4
 cargo fmt --all --check
-cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 pnpm -C runner install --frozen-lockfile
 pnpm -C runner typecheck
 pnpm -C runner test
+swift test --package-path apps/tagteam-menubar
+./scripts/acceptance-loopback.sh
 ```
 
-The loopback spine is designed to use a fake runner so it spends no Claude tokens. Live Agent SDK tests are opt-in.
+`scripts/acceptance-loopback.sh` runs the execution spine, OS exec and egress confinement, two-node recovery, runner typecheck, and runner tests. These use deterministic runners and spend no model tokens.
 
-## Status
+The live runner acceptance is opt-in because it spends provider tokens and requires a signed-in Claude Agent SDK host:
 
-Current verified boundary as of 2026-10-27:
+```bash
+TAGTEAM_LIVE_SDK=1 ./scripts/acceptance-live-sdk.sh
+```
 
-- **Hub foundations:** SQLite WAL journal, atomic state/event transitions, mTLS invite enrolment, node approval/pause/resume/removal, heartbeat and capacity reporting, CA persistence, blob transport, and the private local API are implemented and covered by Rust tests.
-- **Durable MCP dispatch:** the hub validates 1–8 subtasks at the local-socket boundary, snapshots dirty and untracked work through a private Git index, excludes the secret denylist, reuses one snapshot per base/state pair, schedules against live node capacity and requirements, persists each subtask with a review branch name, and returns explicit placement or queued reasons. This path is covered by focused hub tests, including `.env` exclusion and missing-toolchain reporting.
-- **Workspace preparation:** after placement, the hub creates a full source bundle from the recorded snapshot commit, verifies its Git connectivity, enforces the shared 64 MiB blob ceiling, stores it by SHA-256, and sends a deterministic `PrepareWorkspace` command to the assigned node. The node downloads the bundle through its pinned mTLS channel, validates the declared digest and size while streaming, and runs Git preparation inside the workspace sandbox. The hub moves `preparing → running` only after a positive `Done { ok: true }` result; rejected preparation becomes `failed { Bundle }`, and offline/timeout retries use bounded backoff until the wall-clock budget. This is covered by hub service tests and a real loopback mTLS hub/node test with a 3 MiB repository fixture.
-- **Runner dispatch and remote tools:** after workspace preparation, the hub launches the runner and bridges its JSON Lines protocol to the assigned node. The runner's `ready` tool list must stay within the Tag Team allow-list. `Bash`, `Read`, `Write`, `Edit`, `Glob`, and `Grep` map to bounded node commands; progress, usage, notes, and rate-limit messages are journaled or reported. The hub rechecks subtask state before every remote tool call, and cancellation reaches both the runner and any active node command.
-- **Result collection and review landing:** on `Finish`, the node stages and commits workspace changes (including an empty commit), writes an `--all` result bundle, and returns only its path and size. The node reads the bundle in bounded chunks, enforces the shared 64 MiB limit, deletes the temporary bundle through the sandbox, and uploads it over mTLS. The hub verifies the digest and size, fetches the bundle with connectivity checks, verifies ancestry, creates the review branch idempotently, re-runs `done_when` authoritatively, and moves `running → collecting → done`. Failed checks downgrade completed/no-change work to `partial`. The owner's HEAD, index, working tree, and current branch remain unchanged; nothing merges automatically.
-- **Loopback proof:** `cargo test -p tagteam-node --test execution_spine -- --nocapture` runs the real hub, node, mTLS transport, sandbox, Git blob transfer, and a fake runner. It verifies the review branch, expected file contents, `done_when` recheck, ancestry, untouched owner checkout, no automatic merge, and cancellation before dispatch, before finish, and while an authoritative `done_when` check is active, with no review branch or command side effect. Focused node tests cancel before dispatch, reopen the durable command journal, and prove the replayed command neither executes nor reaches its bundle source. The loopback spine spends no model tokens.
+### Verified in this checkpoint
 
-The fake-runner loopback path is verified. A live Agent SDK runner with real model usage, a live two-machine run, and deployment are still unverified. `ask_main`, steering, reassignment/resume, owner-return policies, managed toolchains, the menu-bar app, and friends' machines remain outside the verified implementation boundary.
+On 2026-10-27, a local macOS arm64 run produced:
+
+- `cargo fmt --all --check`: clean;
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean;
+- `cargo test --workspace`: all tests passed, including the real loopback execution spine, macOS exec and egress confinement, sandbox escape tests, and two-node recovery;
+- `./scripts/acceptance-loopback.sh`: passed in full;
+- `pnpm -C runner typecheck`: passed;
+- `pnpm -C runner test`: 9 passed, 1 live-SDK test skipped by opt-in guard;
+- `swift test --package-path apps/tagteam-menubar`: 8 passed;
+- menu-bar app bundle build, ad-hoc codesign verification, and Info.plist lint: passed.
+
+### Not verified
+
+These are separate proof boundaries, not extensions of the local result:
+
+- a live signed-in Claude Agent SDK/model run (`live-sdk.test.ts` was skipped; provider quota blocked it);
+- two real machines over a tailnet; the recovery proof is a loopback hub with two node identities;
+- Linux runtime and sandbox acceptance; Linux logic is compiled and tested, but this checkpoint ran on macOS;
+- a deployed hub with tailnet-only ingress, service hardening, and production DNS/TLS;
+- interactive menu-bar launch, permission dialogs, and owner click paths;
+- friend-machine account isolation: the per-repo allowlist exists, but the proposed separate `_tagteam` OS user and home-directory isolation do not;
+- platform key storage: the node key is a mode-0600 `identity.json`, not the macOS Keychain;
+- channel push: not implemented;
+- managed toolchain installation: not implemented;
+- persistent per-repository object-cache reuse: not implemented;
+- project `CLAUDE.md` guidance in runner sessions: not loaded, because `settingSources` is intentionally empty and no sanitized project-guidance channel exists yet;
+- an owner history view in the menu bar beyond node status and actions.

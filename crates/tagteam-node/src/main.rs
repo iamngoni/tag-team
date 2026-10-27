@@ -69,7 +69,6 @@ enum ServiceCommand {
     Restart,
     /// Print one stable state word, or a JSON object with `--json`.
     Status {
-        /// Print stable JSON for scripts.
         #[arg(long)]
         json: bool,
     },

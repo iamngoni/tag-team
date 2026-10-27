@@ -58,7 +58,6 @@ enum Command {
     /// List enrolled nodes.
     Nodes,
     /// Show subtask status.
-    /// Print one stable state word, or a JSON object with `--json`.
     Status {
         #[arg(long)]
         id: Vec<SubtaskId>,
@@ -121,8 +120,8 @@ enum ServiceCommand {
     Start,
     Stop,
     Restart,
+    /// Print one stable state word, or a JSON object with `--json`.
     Status {
-        /// Print stable JSON for scripts.
         #[arg(long)]
         json: bool,
     },
@@ -212,6 +211,29 @@ async fn run_hub(config_path: Option<&std::path::Path>) -> Result<()> {
         }
     });
 
+    let retention_service = service.clone();
+    let mut retention_shutdown = shutdown_rx.clone();
+    let retention = tokio::spawn(async move {
+        let interval = Duration::from_secs(60 * 60);
+        let first_tick = tokio::time::Instant::now() + interval;
+        let mut ticker = tokio::time::interval_at(first_tick, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = retention_shutdown.changed() => break,
+                _ = ticker.tick() => {
+                    match retention_service.run_retention().await {
+                        Ok(counts) if counts.events > 0 || counts.blobs > 0 || counts.shards > 0 => {
+                            tracing::info!(events = counts.events, blobs = counts.blobs, shards = counts.shards, "retention sweep completed");
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(%error, "retention sweep failed"),
+                    }
+                }
+            }
+        }
+    });
+
     let grpc_service = service.nodes().clone();
     let grpc_shutdown = shutdown_rx.clone();
     let mut grpc = tokio::spawn(async move {
@@ -252,6 +274,7 @@ async fn run_hub(config_path: Option<&std::path::Path>) -> Result<()> {
     let _ = local.await;
     let _ = expiry.await;
     let _ = reconciler.await;
+    let _ = retention.await;
     Ok(())
 }
 

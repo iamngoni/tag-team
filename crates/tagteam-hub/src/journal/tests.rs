@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
 use super::*;
+use prost::Message as _;
 use tagteam_core::{
     AnsweredBy, Arch, Capacity, Check, DiffStat, GitOid, Limits, MainSessionId, Needs, NodePolicy,
     Os, Outcome, OwnerPresence, Platform, Question, QuestionId, ReassignReason, RepoId,
     ResultSummary, SubtaskSpec, Trust,
 };
+use tagteam_proto::v1 as Proto;
 use tempfile::tempdir;
 
 fn dispatch() -> Dispatch {
@@ -980,6 +982,179 @@ fn cancelling_a_subtasks_commands_prevents_replay_after_reassignment() {
             .state,
         "cancelled"
     );
+}
+
+#[test]
+fn event_retention_prunes_only_old_terminal_subtasks() {
+    let (_dir, mut journal, dispatch, old) = setup();
+    let mut recent = subtask(&dispatch);
+    recent.created = Timestamp(12);
+    journal.create_subtask(&recent).expect("recent task");
+    let mut active = subtask(&dispatch);
+    active.state = SubtaskState::Running;
+    active.created = Timestamp(13);
+    journal.create_subtask(&active).expect("active task");
+
+    journal
+        .transition(
+            old.id,
+            SubtaskInput::Cancel {
+                reason: "old task".into(),
+            },
+            Timestamp(100),
+        )
+        .expect("finish old task");
+    journal
+        .transition(
+            recent.id,
+            SubtaskInput::Cancel {
+                reason: "recent task".into(),
+            },
+            Timestamp(300),
+        )
+        .expect("finish recent task");
+    journal
+        .record_event(
+            active.id,
+            EventKind::Progress {
+                note: "still running".into(),
+                percent: Some(50),
+            },
+            Timestamp(50),
+        )
+        .expect("active progress");
+
+    assert_eq!(
+        journal.prune_events_before(Timestamp(200)).expect("prune"),
+        1
+    );
+    let events = journal.events(EventFilter::default()).expect("events");
+    assert!(events.iter().all(|event| event.subtask != old.id));
+    assert!(events.iter().any(|event| event.subtask == recent.id));
+    assert!(events.iter().any(|event| event.subtask == active.id));
+}
+
+#[test]
+fn blob_references_include_result_rows_and_recoverable_protobuf_commands() {
+    let (_dir, mut journal, dispatch, active) = setup();
+    let assigned = node();
+    journal.create_node(&assigned).expect("node");
+    let active_source = [1; 32];
+    let active_result = [2; 32];
+    let unfinished_command = [3; 32];
+
+    let prepare = Proto::Command {
+        command_id: "prepare-active".into(),
+        subtask_id: active.id.to_string(),
+        workspace: active.id.to_string(),
+        op: Some(Proto::command::Op::Prepare(Proto::PrepareWorkspace {
+            bundle: Some(Proto::BlobRef {
+                sha256: active_source.to_vec(),
+                size: 10,
+            }),
+            ..Proto::PrepareWorkspace::default()
+        })),
+    };
+    journal
+        .store_command(&Command {
+            id: "prepare-active".into(),
+            node_id: assigned.id,
+            subtask_id: active.id,
+            operation: serde_json::json!({
+                "proto_b64": base64::engine::general_purpose::STANDARD
+                    .encode(prepare.encode_to_vec())
+            }),
+            state: "pending".into(),
+            result: None,
+            sent_at: None,
+            done_at: None,
+        })
+        .expect("active prepare command");
+
+    let collected = Proto::CommandResult {
+        command_id: "collect-active".into(),
+        result: Some(Proto::command_result::Result::Collected(Proto::BlobRef {
+            sha256: active_result.to_vec(),
+            size: 11,
+        })),
+    };
+    journal
+        .store_command(&Command {
+            id: "collect-active".into(),
+            node_id: assigned.id,
+            subtask_id: active.id,
+            operation: serde_json::json!({
+                "proto_b64": base64::engine::general_purpose::STANDARD.encode(
+                    Proto::Command {
+                        command_id: "collect-active".into(),
+                        subtask_id: active.id.to_string(),
+                        workspace: active.id.to_string(),
+                        op: Some(Proto::command::Op::Collect(Proto::Collect::default())),
+                    }
+                    .encode_to_vec()
+                )
+            }),
+            state: "complete".into(),
+            result: Some(serde_json::json!({
+                "proto_b64": base64::engine::general_purpose::STANDARD
+                    .encode(collected.encode_to_vec())
+            })),
+            sent_at: None,
+            done_at: Some(Timestamp(20)),
+        })
+        .expect("active collect command");
+    journal.connection.execute(
+        "INSERT INTO results(subtask_id,outcome,summary,bundle_sha256,bundle_size,branch,diffstat,assumptions,checks) VALUES (?1,'success','result',?2,12,NULL,'{}','[]','[]')",
+        params![active.id.to_string(), [4_u8; 32].as_slice()],
+    ).expect("result row");
+
+    let mut completed_task = subtask(&dispatch);
+    completed_task.created = Timestamp(14);
+    journal
+        .create_subtask(&completed_task)
+        .expect("completed task");
+    journal
+        .transition(
+            completed_task.id,
+            SubtaskInput::Cancel {
+                reason: "finished".into(),
+            },
+            Timestamp(100),
+        )
+        .expect("complete task");
+    let pending_on_finished_task = Proto::Command {
+        command_id: "pending-finished-task".into(),
+        subtask_id: completed_task.id.to_string(),
+        workspace: completed_task.id.to_string(),
+        op: Some(Proto::command::Op::Prepare(Proto::PrepareWorkspace {
+            bundle: Some(Proto::BlobRef {
+                sha256: unfinished_command.to_vec(),
+                size: 13,
+            }),
+            ..Proto::PrepareWorkspace::default()
+        })),
+    };
+    journal
+        .store_command(&Command {
+            id: "pending-finished-task".into(),
+            node_id: assigned.id,
+            subtask_id: completed_task.id,
+            operation: serde_json::json!({
+                "proto_b64": base64::engine::general_purpose::STANDARD
+                    .encode(pending_on_finished_task.encode_to_vec())
+            }),
+            state: "pending".into(),
+            result: None,
+            sent_at: None,
+            done_at: None,
+        })
+        .expect("unfinished command");
+
+    let references = journal.referenced_blob_digests().expect("references");
+    assert!(references.contains(&active_source));
+    assert!(references.contains(&active_result));
+    assert!(references.contains(&[4; 32]));
+    assert!(references.contains(&unfinished_command));
 }
 
 #[test]

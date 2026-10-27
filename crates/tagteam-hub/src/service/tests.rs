@@ -27,7 +27,9 @@ use tempfile::TempDir;
 
 use crate::{blobs::BlobStore, config::HubConfig};
 
-use super::{HubService, branch_name, ensure_prepare_succeeded, normalize_and_validate_spec};
+use super::{
+    HubService, branch_name, combined_egress, ensure_prepare_succeeded, normalize_and_validate_spec,
+};
 
 fn config(directory: &TempDir) -> HubConfig {
     HubConfig {
@@ -39,6 +41,8 @@ fn config(directory: &TempDir) -> HubConfig {
         runner_args: Vec::new(),
         limits: Limits::default(),
         heartbeat_timeout: Duration::from_secs(90),
+        default_egress: Vec::new(),
+        retention: crate::config::RetentionConfig::default(),
     }
 }
 
@@ -47,6 +51,58 @@ async fn service(directory: &TempDir) -> HubService {
     HubService::open(&config(directory), ca)
         .await
         .expect("service")
+}
+
+#[tokio::test]
+async fn startup_and_periodic_retention_remove_old_orphaned_blobs() {
+    let directory = TempDir::new().expect("directory");
+    let config = config(&directory);
+    let blob_root = config.data_dir.join("blobs");
+    let store = BlobStore::open(&blob_root).expect("blob store");
+    let startup_blob = store.put(b"startup orphan").expect("startup blob");
+    let startup_path = blob_path(&blob_root, &startup_blob);
+    set_modified_to_epoch(&startup_path);
+
+    let ca = Arc::new(HubCa::generate().expect("CA"));
+    let service = HubService::open(&config, ca).await.expect("service opens");
+    assert!(!startup_path.exists(), "open performs the startup sweep");
+
+    let periodic_blob = store.put(b"periodic orphan").expect("periodic blob");
+    let periodic_path = blob_path(&blob_root, &periodic_blob);
+    set_modified_to_epoch(&periodic_path);
+    let counts = service.run_retention().await.expect("periodic sweep");
+    assert_eq!(counts.blobs, 1);
+    assert!(!periodic_path.exists());
+}
+
+#[test]
+fn workspace_egress_combines_defaults_and_subtask_hosts_once() {
+    let defaults = ["crates.io", "REGISTRY.NPMJS.ORG"]
+        .map(str::to_owned)
+        .to_vec();
+    let extra = ["CRATES.IO.", "git.example", "git.example"]
+        .map(str::to_owned)
+        .to_vec();
+    assert_eq!(
+        combined_egress(&defaults, &extra).expect("egress"),
+        ["crates.io", "registry.npmjs.org", "git.example"]
+    );
+    assert!(combined_egress(&defaults, &["https://bad.example".into()]).is_err());
+}
+
+fn blob_path(root: &Path, reference: &tagteam_core::BlobRef) -> PathBuf {
+    let digest = reference.digest_hex();
+    root.join(&digest[..2]).join(digest)
+}
+
+fn set_modified_to_epoch(path: &Path) {
+    let file = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open blob for timestamp update");
+    file.set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .expect("set old modification time");
 }
 
 fn run_git(repository: &Path, args: &[&str]) -> Output {

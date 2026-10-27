@@ -75,6 +75,7 @@ public struct NodeStatus: Decodable, Sendable, Equatable {
   public let policy: JSONValue?
   public let capacity: JSONValue?
   public let workspaceCount: Int?
+  public let connectionStatus: NodeServiceStatus?
 
   private enum CodingKeys: String, CodingKey {
     case name
@@ -87,6 +88,16 @@ public struct NodeStatus: Decodable, Sendable, Equatable {
     case workspaceCount = "workspace_count"
     case camelWorkspaceCount = "workspaceCount"
     case workspaces
+    case connected
+    case isConnected = "is_connected"
+    case reconnecting
+    case isReconnecting = "is_reconnecting"
+    case serviceRunning = "service_running"
+    case serviceState = "service_state"
+    case connectionState = "connection_state"
+    case serviceStatus = "service_status"
+    case connectionStatus = "connection_status"
+    case service
   }
 
   public init(from decoder: Decoder) throws {
@@ -95,14 +106,45 @@ public struct NodeStatus: Decodable, Sendable, Equatable {
     enrolled = try container.decode(Bool.self, forKey: .enrolled)
     paused = try container.decode(Bool.self, forKey: .paused)
     left = try container.decode(Bool.self, forKey: .left)
-    nodeID = try container.decodeIfPresent(String.self, forKey: .nodeID)
+    let nodeIDValue = try container.decodeIfPresent(JSONValue.self, forKey: .nodeID)
+    if case .string(let value)? = nodeIDValue {
+      nodeID = value
+    } else {
+      nodeID = nil
+    }
     policy = try container.decodeIfPresent(JSONValue.self, forKey: .policy)
     capacity = try container.decodeIfPresent(JSONValue.self, forKey: .capacity)
 
-    let directCount = try container.decodeIfPresent(Int.self, forKey: .workspaceCount)
-    let camelCount = try container.decodeIfPresent(Int.self, forKey: .camelWorkspaceCount)
+    let directCount = try container.decodeIfPresent(JSONValue.self, forKey: .workspaceCount)
+    let camelCount = try container.decodeIfPresent(JSONValue.self, forKey: .camelWorkspaceCount)
     let workspaces = try container.decodeIfPresent(JSONValue.self, forKey: .workspaces)
-    workspaceCount = directCount ?? camelCount ?? workspaces?.countValue
+    workspaceCount = directCount?.countValue ?? camelCount?.countValue ?? workspaces?.countValue
+
+    var connectionFields: [String: JSONValue] = [:]
+    for (name, key) in [
+      ("connected", CodingKeys.connected),
+      ("is_connected", .isConnected),
+      ("reconnecting", .reconnecting),
+      ("is_reconnecting", .isReconnecting),
+      ("service_running", .serviceRunning),
+    ] {
+      if let value = try container.decodeIfPresent(JSONValue.self, forKey: key) {
+        connectionFields[name] = value
+      }
+    }
+    for key in [CodingKeys.serviceState, .connectionState] {
+      if let value = try container.decodeIfPresent(JSONValue.self, forKey: key) {
+        connectionFields["state"] = value
+      }
+    }
+    for key in [CodingKeys.serviceStatus, .connectionStatus, .service] {
+      if let value = try container.decodeIfPresent(JSONValue.self, forKey: key) {
+        connectionFields[key.stringValue] = value
+      }
+    }
+    connectionStatus = connectionFields.isEmpty
+      ? nil
+      : NodeServiceStatus(root: .object(connectionFields))
   }
 
   /// Parses one status document and rejects missing or malformed stable fields.
@@ -182,7 +224,7 @@ public struct NodeServiceStatus: Sendable, Equatable {
   public let state: String?
   private let stateText: String?
 
-  private init(root: JSONValue) {
+  fileprivate init(root: JSONValue) {
     isConnected = root.boolean(matching: ["connected", "is_connected", "online"])
     isReconnecting = root.boolean(matching: ["reconnecting", "is_reconnecting"])
     stateText = root.string(matching: ["state", "status", "connection", "service_state"])

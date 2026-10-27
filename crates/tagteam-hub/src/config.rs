@@ -5,8 +5,9 @@
 //! raw user configuration.
 
 use std::{
+    collections::HashSet,
     fs,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -16,6 +17,15 @@ use tagteam_core::Limits;
 use thiserror::Error;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:7443";
+const DEFAULT_EGRESS: &[&str] = &[
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "proxy.golang.org",
+];
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -38,6 +48,26 @@ pub struct HubConfig {
     pub runner_args: Vec<String>,
     pub limits: Limits,
     pub heartbeat_timeout: Duration,
+    /// Canonical baseline hosts allowed by workspace egress proxies.
+    pub default_egress: Vec<String>,
+    /// Ages after which terminal event history and unreferenced blobs are swept.
+    pub retention: RetentionConfig,
+}
+
+/// Ages after which terminal events and unreferenced blobs become eligible for removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionConfig {
+    pub events: Duration,
+    pub blobs: Duration,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            events: Duration::from_secs(30 * 24 * 60 * 60),
+            blobs: Duration::from_secs(7 * 24 * 60 * 60),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,7 +79,9 @@ struct HubFile {
     max_concurrent_per_account: Option<usize>,
     runner_program: Option<String>,
     runner_args: Option<Vec<String>>,
+    default_egress: Option<Vec<String>>,
     limits: Option<LimitsFile>,
+    retention: Option<RetentionFile>,
     heartbeat_timeout_seconds: Option<u64>,
 }
 
@@ -57,12 +89,31 @@ struct HubFile {
 #[serde(deny_unknown_fields)]
 struct LimitsFile {
     max_turns: Option<u32>,
+    wall_clock: Option<DurationInput>,
     wall_clock_seconds: Option<u64>,
+    command_timeout: Option<DurationInput>,
     command_timeout_seconds: Option<u64>,
     max_output_bytes: Option<u64>,
     model_output_bytes: Option<u64>,
     max_patch_bytes: Option<u64>,
+    question_deadline: Option<DurationInput>,
     question_deadline_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DurationInput {
+    Seconds(u64),
+    Human(String),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetentionFile {
+    events: Option<DurationInput>,
+    events_seconds: Option<u64>,
+    blobs: Option<DurationInput>,
+    blobs_seconds: Option<u64>,
 }
 
 impl HubConfig {
@@ -87,7 +138,9 @@ impl HubConfig {
                 max_concurrent_per_account: None,
                 runner_program: None,
                 runner_args: None,
+                default_egress: None,
                 limits: None,
+                retention: None,
                 heartbeat_timeout_seconds: None,
             },
         };
@@ -133,6 +186,15 @@ impl HubConfig {
                 "runner_program must not be empty".into(),
             ));
         }
+        let default_egress = normalize_and_dedupe_egress(
+            raw.default_egress.unwrap_or_else(|| {
+                DEFAULT_EGRESS
+                    .iter()
+                    .map(|host| (*host).to_owned())
+                    .collect()
+            }),
+            "default_egress",
+        )?;
         let mut limits = Limits::default();
         if let Some(file) = raw.limits {
             if let Some(value) = file.max_turns {
@@ -141,11 +203,17 @@ impl HubConfig {
                 }
                 limits.max_turns = value;
             }
-            if let Some(value) = file.wall_clock_seconds {
-                limits.wall_clock = nonzero_duration(value, "wall_clock_seconds")?;
+            if let Some(value) =
+                duration_override(file.wall_clock, file.wall_clock_seconds, "wall_clock")?
+            {
+                limits.wall_clock = value;
             }
-            if let Some(value) = file.command_timeout_seconds {
-                limits.command_timeout = nonzero_duration(value, "command_timeout_seconds")?;
+            if let Some(value) = duration_override(
+                file.command_timeout,
+                file.command_timeout_seconds,
+                "command_timeout",
+            )? {
+                limits.command_timeout = value;
             }
             if let Some(value) = file.max_output_bytes {
                 limits.max_output = tagteam_core::Bytes(nonzero(value, "max_output_bytes")?);
@@ -156,8 +224,25 @@ impl HubConfig {
             if let Some(value) = file.max_patch_bytes {
                 limits.max_patch = tagteam_core::Bytes(nonzero(value, "max_patch_bytes")?);
             }
-            if let Some(value) = file.question_deadline_seconds {
-                limits.question_deadline = nonzero_duration(value, "question_deadline_seconds")?;
+            if let Some(value) = duration_override(
+                file.question_deadline,
+                file.question_deadline_seconds,
+                "question_deadline",
+            )? {
+                limits.question_deadline = value;
+            }
+        }
+        let mut retention = RetentionConfig::default();
+        if let Some(file) = raw.retention {
+            if let Some(value) =
+                duration_override(file.events, file.events_seconds, "retention.events")?
+            {
+                retention.events = value;
+            }
+            if let Some(value) =
+                duration_override(file.blobs, file.blobs_seconds, "retention.blobs")?
+            {
+                retention.blobs = value;
             }
         }
         Ok(Self {
@@ -169,6 +254,8 @@ impl HubConfig {
             runner_args: raw.runner_args.unwrap_or_default(),
             limits,
             heartbeat_timeout: Duration::from_secs(heartbeat_timeout),
+            default_egress,
+            retention,
         })
     }
 
@@ -232,6 +319,69 @@ fn nonzero_duration(seconds: u64, field: &str) -> Result<Duration, ConfigError> 
     nonzero(seconds, field).map(Duration::from_secs)
 }
 
+fn duration_override(
+    friendly: Option<DurationInput>,
+    legacy_seconds: Option<u64>,
+    field: &str,
+) -> Result<Option<Duration>, ConfigError> {
+    match (friendly, legacy_seconds) {
+        (Some(_), Some(_)) => Err(ConfigError::Invalid(format!(
+            "specify either {field} or its legacy seconds field, not both"
+        ))),
+        (None, None) => Ok(None),
+        (Some(input), None) => {
+            let duration = match input {
+                DurationInput::Seconds(value) => Duration::from_secs(value),
+                DurationInput::Human(value) => tagteam_core::human::parse_duration(&value)
+                    .map_err(|error| ConfigError::Invalid(format!("{field}: {error}")))?,
+            };
+            if duration.is_zero() {
+                return Err(ConfigError::Invalid(format!("{field} must be positive")));
+            }
+            Ok(Some(duration))
+        }
+        (None, Some(seconds)) => Ok(Some(nonzero_duration(seconds, field)?)),
+    }
+}
+
+pub(crate) fn normalize_and_dedupe_egress(
+    hosts: Vec<String>,
+    field: &str,
+) -> Result<Vec<String>, ConfigError> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let host = normalize_egress_host(&host)
+            .map_err(|reason| ConfigError::Invalid(format!("{field} contains {reason}")))?;
+        if seen.insert(host.clone()) {
+            normalized.push(host);
+        }
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn normalize_egress_host(host: &str) -> Result<String, &'static str> {
+    let host = host.trim().strip_suffix('.').unwrap_or(host.trim());
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+        return Err("an invalid hostname");
+    }
+    if host.parse::<IpAddr>().is_ok() {
+        return Err("an IP address; exact DNS hostnames are required");
+    }
+    if !host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.as_bytes()[0].is_ascii_alphanumeric()
+            && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err("an invalid exact DNS hostname");
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
 #[cfg(unix)]
 fn set_private_directory(path: &Path) -> Result<(), ConfigError> {
     use std::os::unix::fs::PermissionsExt;
@@ -242,4 +392,82 @@ fn set_private_directory(path: &Path) -> Result<(), ConfigError> {
 #[cfg(not(unix))]
 fn set_private_directory(_path: &Path) -> Result<(), ConfigError> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_config(text: &str) -> Result<HubConfig, ConfigError> {
+        HubConfig::from_file(toml::from_str(text)?)
+    }
+
+    #[test]
+    fn parses_friendly_hub_limits_retention_and_deduped_default_egress() {
+        let config = parse_config(
+            r#"
+data_dir = "/tmp/tagteam-hub-config-test"
+default_egress = ["CRATES.IO", "crates.io.", "git.example"]
+
+[limits]
+wall_clock = "45m"
+command_timeout = "10m"
+question_deadline = "10m"
+
+[retention]
+events = "30d"
+blobs = "7d"
+"#,
+        )
+        .expect("config parses");
+        assert_eq!(config.limits.wall_clock, Duration::from_secs(45 * 60));
+        assert_eq!(config.limits.command_timeout, Duration::from_secs(10 * 60));
+        assert_eq!(
+            config.limits.question_deadline,
+            Duration::from_secs(10 * 60)
+        );
+        assert_eq!(config.retention.events, Duration::from_secs(30 * 86_400));
+        assert_eq!(config.retention.blobs, Duration::from_secs(7 * 86_400));
+        assert_eq!(config.default_egress, ["crates.io", "git.example"]);
+    }
+
+    #[test]
+    fn legacy_seconds_fields_and_default_retention_remain_supported() {
+        let config = parse_config(
+            "data_dir='/tmp/tagteam-hub-config-test'\n[limits]\nwall_clock_seconds=90\ncommand_timeout_seconds=30\nquestion_deadline_seconds=60\n",
+        )
+        .expect("legacy config parses");
+        assert_eq!(config.limits.wall_clock, Duration::from_secs(90));
+        assert_eq!(config.limits.command_timeout, Duration::from_secs(30));
+        assert_eq!(config.limits.question_deadline, Duration::from_secs(60));
+        assert_eq!(config.retention, RetentionConfig::default());
+    }
+
+    #[test]
+    fn invalid_or_conflicting_duration_fields_are_rejected() {
+        for text in [
+            "[limits]\nwall_clock='0m'",
+            "[limits]\nwall_clock='1.5h'",
+            "[limits]\nwall_clock='18446744073709551615w'",
+            "[limits]\nwall_clock='45m'\nwall_clock_seconds=2700",
+            "[retention]\nevents='0d'",
+            "[retention]\nblobs='1.5d'",
+        ] {
+            assert!(parse_config(text).is_err(), "accepted {text:?}");
+        }
+    }
+
+    #[test]
+    fn default_egress_requires_exact_dns_hostnames() {
+        for host in [
+            "",
+            "*.example.org",
+            "https://example.org",
+            "127.0.0.1",
+            "bad..host",
+        ] {
+            let text = format!("default_egress=['{host}']");
+            assert!(parse_config(&text).is_err(), "accepted host {host:?}");
+        }
+    }
 }

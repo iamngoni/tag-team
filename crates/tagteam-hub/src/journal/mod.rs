@@ -3,8 +3,9 @@
 //! This module owns persistence only. Subtask transitions always pass through
 //! `tagteam_core::state::step`, and the resulting state/event share a transaction.
 
-use std::{fs, path::Path, str::FromStr};
+use std::{collections::HashSet, fs, path::Path, str::FromStr};
 
+use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,6 +18,7 @@ use tagteam_core::{
     runner_proto::HubToRunnerMessage,
     state::{self, IllegalTransition, SubtaskInput},
 };
+use tagteam_proto::v1 as Proto;
 use thiserror::Error;
 
 const SCHEMA_VERSION: i64 = 3;
@@ -1550,6 +1552,82 @@ impl Journal {
         }
         Ok(events)
     }
+
+    /// Deletes events for terminal subtasks finished strictly before `cutoff`.
+    ///
+    /// Candidate state is decoded and checked inside the same transaction, so
+    /// an old timestamp alone can never prune an unfinished subtask's events.
+    pub fn prune_events_before(&mut self, cutoff: Timestamp) -> Result<u64, JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidates = {
+            let mut statement = transaction.prepare(
+                "SELECT id,state FROM subtasks WHERE finished_at IS NOT NULL AND finished_at < ?1",
+            )?;
+            let rows = statement.query_map([cutoff.0], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut deleted = 0_u64;
+        for (id, encoded_state) in candidates {
+            let state: SubtaskState = serde_json::from_str(&encoded_state)?;
+            if state.is_terminal() {
+                let count = transaction.execute("DELETE FROM events WHERE subtask_id=?1", [id])?;
+                deleted = deleted
+                    .checked_add(u64::try_from(count).map_err(|_| JournalError::IntegerRange)?)
+                    .ok_or(JournalError::IntegerRange)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(deleted)
+    }
+
+    /// Returns every blob digest still reachable from results or recoverable
+    /// command payloads for unfinished subtasks and commands.
+    pub fn referenced_blob_digests(&self) -> Result<HashSet<[u8; 32]>, JournalError> {
+        let mut referenced = HashSet::new();
+        {
+            let mut statement = self
+                .connection
+                .prepare("SELECT bundle_sha256 FROM results WHERE bundle_sha256 IS NOT NULL")?;
+            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            for digest in rows {
+                referenced.insert(digest_from_bytes(&digest?)?);
+            }
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT c.op,c.result FROM commands AS c \
+             JOIN subtasks AS s ON s.id=c.subtask_id \
+             WHERE s.finished_at IS NULL OR c.state NOT IN ('complete','cancelled')",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (operation, result) = row?;
+            let operation: Value = serde_json::from_str(&operation)?;
+            let command: Proto::Command = decode_proto_b64(&operation, "command")?;
+            if let Some(Proto::command::Op::Prepare(prepare)) = command.op
+                && let Some(bundle) = prepare.bundle
+            {
+                referenced.insert(digest_from_proto(&bundle.sha256)?);
+            }
+            if let Some(result) = result {
+                let result: Value = serde_json::from_str(&result)?;
+                let command_result: Proto::CommandResult =
+                    decode_proto_b64(&result, "command result")?;
+                if let Some(Proto::command_result::Result::Collected(bundle)) =
+                    command_result.result
+                {
+                    referenced.insert(digest_from_proto(&bundle.sha256)?);
+                }
+            }
+        }
+        Ok(referenced)
+    }
 }
 
 fn store_result(
@@ -1696,6 +1774,31 @@ fn read_question(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredQuestion> {
 
 fn parse_json<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T, serde_json::Error> {
     serde_json::from_str(value)
+}
+
+fn decode_proto_b64<M>(value: &Value, kind: &str) -> Result<M, JournalError>
+where
+    M: prost::Message + Default,
+{
+    let encoded = value
+        .get("proto_b64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| JournalError::Invalid(format!("stored {kind} payload has no proto_b64")))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| JournalError::Invalid(format!("stored {kind} payload is not base64")))?;
+    M::decode(bytes.as_slice())
+        .map_err(|_| JournalError::Invalid(format!("stored {kind} payload is invalid protobuf")))
+}
+
+fn digest_from_proto(bytes: &[u8]) -> Result<[u8; 32], JournalError> {
+    digest_from_bytes(bytes)
+}
+
+fn digest_from_bytes(bytes: &[u8]) -> Result<[u8; 32], JournalError> {
+    bytes
+        .try_into()
+        .map_err(|_| JournalError::Invalid("stored blob reference digest is not 32 bytes".into()))
 }
 
 fn enum_text(value: &impl Serialize) -> Result<String, JournalError> {

@@ -8,7 +8,10 @@ use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     fs,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -38,11 +41,14 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     blobs::BlobStore,
-    config::{DataPaths, HubConfig},
+    config::{
+        DataPaths, HubConfig, RetentionConfig, normalize_and_dedupe_egress, normalize_egress_host,
+    },
     journal::{
         AnswerDeliveryIntent, EventFilter, EventScope, Journal, JournalError, RunnerDelivery,
     },
     nodes::{NodePlane, NodePlaneError},
+    retention::{self, RetentionCounts, RetentionError},
     runner::{RunnerProcess, RunnerStart},
 };
 
@@ -81,6 +87,13 @@ pub enum ServiceError {
     Internal,
 }
 
+struct DriverEntry {
+    generation: u64,
+    node: tagteam_core::NodeId,
+    attempt: u16,
+    abort: tokio::task::AbortHandle,
+}
+
 #[derive(Debug, Clone)]
 struct NodeObservation {
     online: bool,
@@ -101,10 +114,13 @@ pub struct HubService {
     runner_program: String,
     runner_args: Vec<String>,
     heartbeat_timeout: Duration,
+    default_egress: Vec<String>,
+    retention: RetentionConfig,
     runners: Arc<AsyncMutex<HashMap<SubtaskId, tokio::sync::mpsc::Sender<HubToRunnerMessage>>>>,
     active_commands: Arc<AsyncMutex<HashMap<SubtaskId, (tagteam_core::NodeId, String)>>>,
     node_observations: Arc<AsyncMutex<HashMap<tagteam_core::NodeId, NodeObservation>>>,
-    drivers: Arc<AsyncMutex<HashSet<SubtaskId>>>,
+    drivers: Arc<AsyncMutex<HashMap<SubtaskId, DriverEntry>>>,
+    driver_generation: Arc<AtomicU64>,
     landing: Arc<AsyncMutex<()>>,
     placement: Arc<AsyncMutex<()>>,
     max_concurrent_per_account: usize,
@@ -113,12 +129,27 @@ pub struct HubService {
 impl HubService {
     /// Opens the durable data directory, journal and shared CA-backed node plane.
     pub async fn open(config: &HubConfig, ca: Arc<HubCa>) -> Result<Self, ServiceError> {
+        let default_egress =
+            normalize_and_dedupe_egress(config.default_egress.clone(), "default_egress")?;
         let paths = config.prepare_data_dir()?;
         let journal_path = paths.journal.clone();
         let journal = tokio::task::spawn_blocking(move || Journal::open(journal_path))
             .await
             .map_err(|_| ServiceError::Worker)??;
         let journal = Arc::new(Mutex::new(journal));
+        let retention_journal = Arc::clone(&journal);
+        let retention_blob_path = paths.blobs.clone();
+        let retention_policy = config.retention;
+        tokio::task::spawn_blocking(move || {
+            let mut journal = retention_journal
+                .lock()
+                .map_err(|_| ServiceError::Internal)?;
+            let blobs = BlobStore::open(retention_blob_path)?;
+            retention::sweep(&mut journal, &blobs, retention_policy, Timestamp::now())
+                .map_err(retention_service_error)
+        })
+        .await
+        .map_err(|_| ServiceError::Worker)??;
         let started = Timestamp::now();
         let initial_nodes = {
             let store = journal.lock().map_err(|_| ServiceError::Internal)?;
@@ -149,14 +180,32 @@ impl HubService {
             runner_program: config.runner_program.clone(),
             runner_args: config.runner_args.clone(),
             heartbeat_timeout: config.heartbeat_timeout,
+            default_egress,
+            retention: config.retention,
             runners: Arc::new(AsyncMutex::new(HashMap::new())),
             active_commands: Arc::new(AsyncMutex::new(HashMap::new())),
             node_observations: Arc::new(AsyncMutex::new(node_observations)),
-            drivers: Arc::new(AsyncMutex::new(HashSet::new())),
+            drivers: Arc::new(AsyncMutex::new(HashMap::new())),
+            driver_generation: Arc::new(AtomicU64::new(0)),
             landing: Arc::new(AsyncMutex::new(())),
             placement: Arc::new(AsyncMutex::new(())),
             max_concurrent_per_account: config.max_concurrent_per_account,
         })
+    }
+
+    /// Runs the configured event and blob retention policies outside the async executor.
+    pub async fn run_retention(&self) -> Result<RetentionCounts, ServiceError> {
+        let journal = Arc::clone(&self.journal);
+        let blob_path = self.paths.blobs.clone();
+        let policy = self.retention;
+        tokio::task::spawn_blocking(move || {
+            let mut journal = journal.lock().map_err(|_| ServiceError::Internal)?;
+            let blobs = BlobStore::open(blob_path)?;
+            retention::sweep(&mut journal, &blobs, policy, Timestamp::now())
+                .map_err(retention_service_error)
+        })
+        .await
+        .map_err(|_| ServiceError::Worker)?
     }
 
     /// Stable data paths for daemon sockets, journal and CA material.
@@ -702,15 +751,54 @@ impl HubService {
     }
 
     /// Starts at most one process-local driver for a durable subtask attempt.
+    ///
+    /// A driver left over from an earlier node attempt is aborted before the
+    /// replacement starts. The generation check prevents the old task's
+    /// cleanup from removing the new driver after a race.
     async fn ensure_driver(&self, id: SubtaskId, node: tagteam_core::NodeId) -> bool {
-        if !self.drivers.lock().await.insert(id) {
+        let Some(task) = self
+            .journal(move |journal| journal.load_subtask(id))
+            .await
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        if task.node != Some(node) {
             return false;
         }
+        let generation = self.driver_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut drivers = self.drivers.lock().await;
+        if let Some(existing) = drivers.get(&id)
+            && existing.node == node
+            && existing.attempt == task.attempt
+            && !existing.abort.is_finished()
+        {
+            return false;
+        }
+        if let Some(previous) = drivers.remove(&id) {
+            previous.abort.abort();
+        }
         let service = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             service.supervise_driver(id, node).await;
-            service.drivers.lock().await.remove(&id);
+            let mut drivers = service.drivers.lock().await;
+            if drivers
+                .get(&id)
+                .is_some_and(|driver| driver.generation == generation)
+            {
+                drivers.remove(&id);
+            }
         });
+        drivers.insert(
+            id,
+            DriverEntry {
+                generation,
+                node,
+                attempt: task.attempt,
+                abort: handle.abort_handle(),
+            },
+        );
         true
     }
 
@@ -781,6 +869,18 @@ impl HubService {
         let _ = self
             .journal(move |journal| journal.cancel_subtask_commands(id).map(|_| ()))
             .await;
+        // The bridge may itself be awaiting a remote command and therefore
+        // unable to observe the runner cancellation. The durable state has
+        // already moved, so detach that process-local driver before another
+        // node attempt is scheduled.
+        self.stop_driver(id).await;
+    }
+
+    /// Aborts and forgets the process-local driver for a subtask.
+    async fn stop_driver(&self, id: SubtaskId) {
+        if let Some(driver) = self.drivers.lock().await.remove(&id) {
+            driver.abort.abort();
+        }
     }
 
     /// Best-effort removal of a terminal workspace and its process-local
@@ -1018,7 +1118,7 @@ impl HubService {
                 profile: Some(Proto::SandboxProfile {
                     writable: Vec::new(),
                     readable: Vec::new(),
-                    egress: task.spec.egress.clone(),
+                    egress: combined_egress(&self.default_egress, &task.spec.egress)?,
                     cpu_cores: f32::from(task.spec.needs.cores),
                     memory: task.spec.needs.memory.0,
                     pids: 64,
@@ -2275,6 +2375,29 @@ struct ResolvedSnapshot {
 /// Resolve and validate direct daemon input. The MCP shim rejects malformed
 /// schemas first, but the local socket is also a trust boundary: callers cannot
 /// smuggle in a different repository, empty checks, or unbounded limits.
+fn combined_egress(defaults: &[String], extra: &[String]) -> Result<Vec<String>, ServiceError> {
+    let mut seen = HashSet::new();
+    let mut hosts = Vec::with_capacity(defaults.len() + extra.len());
+    for host in defaults.iter().chain(extra) {
+        let host = normalize_egress_host(host)
+            .map_err(|reason| ServiceError::Invalid(format!("egress host is invalid: {reason}")))?;
+        if seen.insert(host.clone()) {
+            hosts.push(host);
+        }
+    }
+    Ok(hosts)
+}
+
+fn retention_service_error(error: RetentionError) -> ServiceError {
+    match error {
+        RetentionError::Journal(error) => ServiceError::Journal(error),
+        RetentionError::Blob(error) => ServiceError::Blob(error),
+        RetentionError::CutoffRange => ServiceError::Invalid(
+            "configured retention age exceeds the supported timestamp range".into(),
+        ),
+    }
+}
+
 fn normalize_and_validate_spec(
     spec: &mut SubtaskSpec,
     repository: &Path,

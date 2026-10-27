@@ -1,5 +1,6 @@
 //! Shared durable types and protocol contracts for the hub, node and runner.
 
+pub mod human;
 pub mod local_api;
 pub mod render;
 pub mod runner_proto;

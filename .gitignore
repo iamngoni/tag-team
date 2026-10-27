@@ -12,3 +12,4 @@ coverage/
 .tagteam/
 **/.build/
 **/.swiftpm/
+apps/tagteam-menubar/dist/
