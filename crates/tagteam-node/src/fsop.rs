@@ -197,6 +197,7 @@ fn relay_proxy_stream(mut client: TcpStream, socket: PathBuf) {
     let _ = writer.join();
 }
 
+#[cfg(not(target_os = "linux"))]
 fn normalize_proxy_url(value: &str) -> Result<String, String> {
     let address = value
         .strip_prefix("http://")
@@ -815,6 +816,7 @@ mod tests {
         assert_eq!(values.get("BUILD_FLAG").map(String::as_str), Some("kept"));
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn proxy_url_must_resolve_to_a_nonzero_loopback_endpoint() {
         assert_eq!(
